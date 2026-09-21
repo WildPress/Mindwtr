@@ -2,12 +2,13 @@
 // Loads/saves per-namespace config via /v1/webhook-config (stored on the server,
 // not in the synced document). Only rendered when self-hosted sync is configured.
 //
-// "Mirror on-device notifications" copies the local reminder/digest settings into
-// the webhook config so they need not be entered twice; the mirrored values are
-// persisted on save (the server stores concrete values, not a live mirror).
+// Auto-saves on every change, like the other settings (no Save button). "Mirror
+// on-device notifications" copies the local reminder/digest settings into the
+// webhook config so they need not be entered twice, and stays in step with them
+// while mirroring is on (the server stores concrete values, not a live mirror).
 
 import { Bell } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { useTaskStore, type AppData } from '@mindwtr/core';
 
@@ -24,7 +25,6 @@ import { TimeInput } from '../../ui/TimeInput';
 import { SettingRow } from './SettingRow';
 
 type WeekdayOption = { value: number; label: string };
-type Status = 'loading' | 'idle' | 'saving' | 'saved' | 'error';
 
 const inputClass = 'bg-muted px-2 py-1 rounded text-sm border border-border disabled:opacity-50 disabled:cursor-not-allowed';
 
@@ -46,64 +46,78 @@ function mirroredFromSettings(settings: AppData['settings']): Pick<WebhookUiConf
     };
 }
 
-export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: WeekdayOption[] }) {
+export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOptions: WeekdayOption[]; showSaved: () => void }) {
     const [available] = useState(() => isWebhookConfigAvailable());
     const settings = useTaskStore((state) => state.settings) ?? ({} as AppData['settings']);
     const [config, setConfig] = useState<WebhookUiConfig>(DEFAULT_WEBHOOK_UI_CONFIG);
-    const [status, setStatus] = useState<Status>('loading');
+    const [ready, setReady] = useState(false);
     const [error, setError] = useState('');
+    // Serialised payload last sent, so an unchanged value (e.g. a re-render or a
+    // blur with no edit) never fires a redundant PUT or "Saved" toast.
+    const lastPersisted = useRef('');
+
+    const buildPayload = (next: WebhookUiConfig): WebhookUiConfig =>
+        (next.mirror ? { ...next, ...mirroredFromSettings(settings) } : next);
+
+    const persist = (next: WebhookUiConfig) => {
+        const payload = buildPayload(next);
+        const key = JSON.stringify(payload);
+        if (key === lastPersisted.current) return;
+        lastPersisted.current = key;
+        saveWebhookConfig(payload)
+            .then(() => { setError(''); showSaved(); })
+            .catch((saveError) => {
+                lastPersisted.current = '';
+                setError(saveError instanceof Error ? saveError.message : String(saveError));
+            });
+    };
+
+    const update = (next: WebhookUiConfig) => {
+        setConfig(next);
+        persist(next);
+    };
 
     useEffect(() => {
         if (!available) return;
         let active = true;
         fetchWebhookConfig()
             .then((loaded) => {
-                if (active) {
-                    setConfig(loaded);
-                    setStatus('idle');
-                }
+                if (!active) return;
+                setConfig(loaded);
+                // Seed the dedupe key with what the server already holds, so simply
+                // opening the page never triggers a save.
+                lastPersisted.current = JSON.stringify(loaded.mirror ? { ...loaded, ...mirroredFromSettings(settings) } : loaded);
+                setReady(true);
             })
             .catch((loadError) => {
                 if (!active) return;
                 reportError('Failed to load server webhook config', loadError);
                 setConfig(DEFAULT_WEBHOOK_UI_CONFIG);
-                setStatus('idle');
+                setReady(true);
             });
         return () => {
             active = false;
         };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [available]);
+
+    // Keep the stored snapshot in step with the on-device settings while mirroring.
+    const mirrorKey = JSON.stringify(mirroredFromSettings(settings));
+    useEffect(() => {
+        if (!ready || !config.enabled || !config.mirror) return;
+        persist(config);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [ready, config.enabled, config.mirror, mirrorKey]);
 
     if (!available) return null;
 
     const mirror = config.mirror;
-    const mirrored = mirroredFromSettings(settings);
-    // Values shown in the kind/digest controls: the device settings when mirroring,
-    // otherwise the webhook's own stored values.
-    const view: WebhookUiConfig = mirror ? { ...config, ...mirrored } : config;
-    // Everything under the enable switch is disabled when the webhook is off;
-    // kinds/digest are additionally locked while mirroring.
+    const view: WebhookUiConfig = mirror ? { ...config, ...mirroredFromSettings(settings) } : config;
     const off = !config.enabled;
     const locked = off || mirror;
 
-    const patch = (updates: Partial<WebhookUiConfig>) => setConfig((prev) => ({ ...prev, ...updates }));
-    const patchDigest = (updates: Partial<WebhookUiConfig['digest']>) =>
-        setConfig((prev) => ({ ...prev, digest: { ...prev.digest, ...updates } }));
-
-    const save = async () => {
-        setStatus('saving');
-        setError('');
-        // Persist concrete values: when mirroring, snapshot the device settings.
-        const payload: WebhookUiConfig = mirror ? { ...config, ...mirrored } : config;
-        try {
-            setConfig(await saveWebhookConfig(payload));
-            setStatus('saved');
-            window.setTimeout(() => setStatus((s) => (s === 'saved' ? 'idle' : s)), 2000);
-        } catch (saveError) {
-            setError(saveError instanceof Error ? saveError.message : String(saveError));
-            setStatus('error');
-        }
-    };
+    const patchKinds = (updates: Partial<WebhookUiConfig['kinds']>) => update({ ...config, kinds: { ...config.kinds, ...updates } });
+    const patchDigest = (updates: Partial<WebhookUiConfig['digest']>) => update({ ...config, digest: { ...config.digest, ...updates } });
 
     return (
         <section className="space-y-3">
@@ -121,7 +135,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                 <SettingRow settingsKey="serverWebhookEnabled" title="Enable server webhook">
                     <Switch
                         checked={config.enabled}
-                        onCheckedChange={(enabled) => patch({ enabled })}
+                        onCheckedChange={(enabled) => update({ ...config, enabled })}
                         aria-label="Enable server webhook"
                     />
                 </SettingRow>
@@ -132,7 +146,8 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                         value={config.url}
                         disabled={off}
                         placeholder="https://…"
-                        onChange={(event) => patch({ url: event.target.value })}
+                        onChange={(event) => setConfig((prev) => ({ ...prev, url: event.target.value }))}
+                        onBlur={() => persist(config)}
                         className={`${inputClass} w-64`}
                         aria-label="Webhook URL"
                     />
@@ -146,7 +161,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                     <Switch
                         checked={mirror}
                         disabled={off}
-                        onCheckedChange={(value) => patch({ mirror: value })}
+                        onCheckedChange={(value) => update({ ...config, mirror: value })}
                         aria-label="Mirror on-device notifications"
                     />
                 </SettingRow>
@@ -155,7 +170,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                     <Switch
                         checked={view.kinds.start}
                         disabled={locked}
-                        onCheckedChange={(start) => patch({ kinds: { ...config.kinds, start } })}
+                        onCheckedChange={(start) => patchKinds({ start })}
                         aria-label="Start date reminders"
                     />
                 </SettingRow>
@@ -163,7 +178,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                     <Switch
                         checked={view.kinds.due}
                         disabled={locked}
-                        onCheckedChange={(due) => patch({ kinds: { ...config.kinds, due } })}
+                        onCheckedChange={(due) => patchKinds({ due })}
                         aria-label="Due date reminders"
                     />
                 </SettingRow>
@@ -171,7 +186,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                     <Switch
                         checked={view.kinds.review}
                         disabled={locked}
-                        onCheckedChange={(review) => patch({ kinds: { ...config.kinds, review } })}
+                        onCheckedChange={(review) => patchKinds({ review })}
                         aria-label="Review date reminders"
                     />
                 </SettingRow>
@@ -242,18 +257,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                     </SettingRow>
                 </div>
 
-                <div className="flex items-center gap-3">
-                    <button
-                        type="button"
-                        onClick={save}
-                        disabled={status === 'loading' || status === 'saving'}
-                        className="px-3 py-1 rounded text-sm border border-border bg-muted hover:bg-muted/80 disabled:opacity-50"
-                    >
-                        {status === 'saving' ? 'Saving…' : 'Save'}
-                    </button>
-                    {status === 'saved' && <span className="text-xs text-muted-foreground">Saved</span>}
-                    {status === 'error' && <span className="text-xs text-red-500">{error}</span>}
-                </div>
+                {error && <p className="text-xs text-red-500">{error}</p>}
             </div>
         </section>
     );

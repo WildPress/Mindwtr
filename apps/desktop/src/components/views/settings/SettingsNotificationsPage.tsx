@@ -215,7 +215,7 @@ export function SettingsNotificationsPage({
             </div>
             </div>
 
-            <ServerWebhookSection weekdayOptions={weekdayOptions} />
+            <ServerWebhookSection weekdayOptions={weekdayOptions} showSaved={showSaved} />
         </div>
     );
 }
