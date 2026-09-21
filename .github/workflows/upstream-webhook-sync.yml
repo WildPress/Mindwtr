@@ -166,3 +166,24 @@ jobs:
             ${{ steps.img.outputs.name }}:${{ steps.rel.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The web/PWA app carries the fork's UI (the Server reminders section), so it
+      # is built and published alongside the cloud. A broken app fails its own build,
+      # so no untested UI is published.
+      - name: Lowercase app image name
+        id: appimg
+        if: steps.gate.outcome == 'success'
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/mindwtr-app" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the app image
+        if: steps.gate.outcome == 'success'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.appimg.outputs.name }}:latest
+            ${{ steps.appimg.outputs.name }}:${{ steps.rel.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
