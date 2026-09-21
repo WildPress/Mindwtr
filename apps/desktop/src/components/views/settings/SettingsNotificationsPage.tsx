@@ -77,7 +77,8 @@ export function SettingsNotificationsPage({
     };
 
     return (
-        <div className="bg-card border border-border rounded-lg p-6 space-y-4">
+        <div className="space-y-4">
+            <div className="bg-card border border-border rounded-lg p-6 space-y-4">
             <p className="text-sm text-muted-foreground">{t.notificationsDesc}</p>
 
             <SettingRow settingsKey="notificationsEnable" title={t.notificationsEnable}>
@@ -211,6 +212,7 @@ export function SettingsNotificationsPage({
                         aria-label={t.dailyDigestEvening}
                     />
                 </SettingRow>
+            </div>
             </div>
 
             <ServerWebhookSection weekdayOptions={weekdayOptions} />

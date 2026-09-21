@@ -70,12 +70,13 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
     const busy = status === 'loading' || status === 'saving';
 
     return (
-        <div data-settings-key="serverWebhook" className="space-y-3">
+        <div data-settings-key="serverWebhook" className="bg-card border border-border rounded-lg p-6 space-y-4">
             <div>
-                <p className="text-sm font-medium">Server reminders (webhook)</p>
-                <p className="text-xs text-muted-foreground mt-1">
+                <p className="text-base font-semibold">Server reminders</p>
+                <p className="text-sm text-muted-foreground mt-1">
                     Fire reminders and digests from the self-hosted server as a webhook, so they arrive
-                    even when no device is open. Stored on the server, separate from local notifications.
+                    even when no device is open. Stored on the server, separate from the on-device
+                    notifications above.
                 </p>
             </div>
 
