@@ -16,6 +16,7 @@ const KEY = 'a'.repeat(64);
 const validConfig: StoredWebhookConfig = {
     enabled: true,
     url: 'http://xyops:5522/api/app/run_event?id=e1&api_key=k',
+    mirror: false,
     kinds: { start: false, due: true, review: false },
     digest: {
         morning: { enabled: true, time: '8:30' },

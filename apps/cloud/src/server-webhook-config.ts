@@ -18,6 +18,9 @@ const configFileName = (key: string): string => `${key}.webhook-config.json`;
 export type StoredWebhookConfig = {
     enabled: boolean;
     url: string;
+    // UI convenience flag (kinds/digest mirror the device notification settings).
+    // The emitter ignores it and uses the concrete kinds/digest as stored.
+    mirror: boolean;
     kinds: { start: boolean; due: boolean; review: boolean };
     digest: {
         morning: { enabled: boolean; time: string };
@@ -29,6 +32,7 @@ export type StoredWebhookConfig = {
 export const DEFAULT_WEBHOOK_CONFIG: StoredWebhookConfig = Object.freeze({
     enabled: false,
     url: '',
+    mirror: true,
     kinds: { start: true, due: true, review: true },
     digest: {
         morning: { enabled: false, time: '09:00' },
@@ -63,6 +67,7 @@ export const parseWebhookConfig = (body: unknown): { config: StoredWebhookConfig
     if (!isBool(body.enabled)) return { error: '`enabled` must be a boolean.' };
     if (!isWebhookUrl(body.url)) return { error: '`url` must be an http(s) URL or empty.' };
     if (body.enabled && body.url === '') return { error: '`url` is required when `enabled` is true.' };
+    if (body.mirror !== undefined && !isBool(body.mirror)) return { error: '`mirror` must be a boolean.' };
 
     const kinds = body.kinds;
     if (!isObj(kinds) || !isBool(kinds.start) || !isBool(kinds.due) || !isBool(kinds.review)) {
@@ -91,6 +96,7 @@ export const parseWebhookConfig = (body: unknown): { config: StoredWebhookConfig
         config: {
             enabled: body.enabled,
             url: body.url,
+            mirror: body.mirror === undefined ? true : body.mirror,
             kinds: { start: kinds.start, due: kinds.due, review: kinds.review },
             digest: {
                 morning: { enabled: morning.enabled, time: morning.time },

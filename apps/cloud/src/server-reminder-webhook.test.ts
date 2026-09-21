@@ -358,6 +358,7 @@ describe('startReminderWebhookPoller', () => {
         webhookConfigTesting.writeWebhookConfig(dataDir, KEY, {
             enabled: true,
             url: 'https://sidecar.test/hook',
+            mirror: false,
             kinds: { start: false, due: true, review: false },
             digest: {
                 morning: { enabled: false, time: '09:00' },

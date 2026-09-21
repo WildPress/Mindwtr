@@ -7,6 +7,8 @@ import { getCloudConfigLocal } from './sync-service-config';
 export type WebhookUiConfig = {
     enabled: boolean;
     url: string;
+    /** When true, kinds/digest mirror the on-device notification settings. */
+    mirror: boolean;
     kinds: { start: boolean; due: boolean; review: boolean };
     digest: {
         morning: { enabled: boolean; time: string };
@@ -18,6 +20,7 @@ export type WebhookUiConfig = {
 export const DEFAULT_WEBHOOK_UI_CONFIG: WebhookUiConfig = {
     enabled: false,
     url: '',
+    mirror: true,
     kinds: { start: true, due: true, review: true },
     digest: {
         morning: { enabled: false, time: '09:00' },
