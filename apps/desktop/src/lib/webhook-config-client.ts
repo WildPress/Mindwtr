@@ -72,3 +72,18 @@ export const saveWebhookConfig = async (config: WebhookUiConfig): Promise<Webhoo
     }
     return res.json() as Promise<WebhookUiConfig>;
 };
+
+export type WebhookTestResult = { ok: boolean; status?: number; error?: string };
+
+/** Ask the server to POST a one-off test payload to the stored webhook URL. */
+export const testWebhookConfig = async (): Promise<WebhookTestResult> => {
+    const creds = cloudCreds();
+    if (!creds) throw new Error('Self-hosted sync is not configured.');
+    const res = await fetch(creds.endpoint, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${creds.token}` },
+    });
+    const body = (await res.json().catch(() => ({}))) as WebhookTestResult;
+    if (!res.ok && body.error === undefined) return { ok: false, error: `Test failed (${res.status}).` };
+    return body;
+};

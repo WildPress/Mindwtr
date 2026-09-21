@@ -18,6 +18,8 @@ import {
     fetchWebhookConfig,
     isWebhookConfigAvailable,
     saveWebhookConfig,
+    testWebhookConfig,
+    type WebhookTestResult,
     type WebhookUiConfig,
 } from '../../../lib/webhook-config-client';
 import { Switch } from '../../ui/Switch';
@@ -52,9 +54,23 @@ export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOpt
     const [config, setConfig] = useState<WebhookUiConfig>(DEFAULT_WEBHOOK_UI_CONFIG);
     const [ready, setReady] = useState(false);
     const [error, setError] = useState('');
+    const [testing, setTesting] = useState(false);
+    const [testResult, setTestResult] = useState<WebhookTestResult | null>(null);
     // Serialised payload last sent, so an unchanged value (e.g. a re-render or a
     // blur with no edit) never fires a redundant PUT or "Saved" toast.
     const lastPersisted = useRef('');
+
+    const runTest = async () => {
+        setTesting(true);
+        setTestResult(null);
+        try {
+            setTestResult(await testWebhookConfig());
+        } catch (testError) {
+            setTestResult({ ok: false, error: testError instanceof Error ? testError.message : String(testError) });
+        } finally {
+            setTesting(false);
+        }
+    };
 
     const buildPayload = (next: WebhookUiConfig): WebhookUiConfig =>
         (next.mirror ? { ...next, ...mirroredFromSettings(settings) } : next);
@@ -257,7 +273,20 @@ export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOpt
                     </SettingRow>
                 </div>
 
-                {error && <p className="text-xs text-red-500">{error}</p>}
+                <div className="flex items-center gap-3">
+                    <button
+                        type="button"
+                        onClick={runTest}
+                        disabled={testing || !config.url}
+                        className="px-3 py-1 rounded text-sm border border-border bg-muted hover:bg-muted/80 disabled:opacity-50"
+                    >
+                        {testing ? 'Testing…' : 'Send test'}
+                    </button>
+                    {testResult && (testResult.ok
+                        ? <span className="text-xs text-muted-foreground">Sent{testResult.status ? ` (${testResult.status})` : ''}</span>
+                        : <span className="text-xs text-red-500">{testResult.error ?? 'Failed'}</span>)}
+                    {error && <span className="text-xs text-red-500">{error}</span>}
+                </div>
             </div>
         </section>
     );

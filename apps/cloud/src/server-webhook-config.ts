@@ -141,11 +141,24 @@ export type WebhookConfigRequestOptions = {
     dataDir: string;
     key: string;
     maxBodyBytes: number;
+    /** Injectable for tests; defaults to the global fetch. */
+    fetchImpl?: typeof fetch;
 };
+
+const buildTestPayload = (key: string) => ({
+    event: 'reminder' as const,
+    kind: 'task-reminder' as const,
+    test: true,
+    title: 'Mindwtr webhook test',
+    message: 'Test delivery from the server reminders settings.',
+    firedAt: new Date().toISOString(),
+    namespace: key,
+});
 
 /**
  * GET returns the namespace's stored config (defaults when unset).
  * PUT validates and stores the config, returning what was saved.
+ * POST sends a one-off test payload to the stored URL and reports the result.
  */
 export const handleWebhookConfigRequest = async (
     req: Request,
@@ -172,7 +185,28 @@ export const handleWebhookConfigRequest = async (
         return json(result.config);
     }
 
-    return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET, PUT' } });
+    if (req.method === 'POST') {
+        const url = readWebhookConfig(dataDir, key)?.url ?? '';
+        if (!url) return json({ ok: false, error: 'No webhook URL configured. Save a URL first.' }, 400);
+        const fetchImpl = options.fetchImpl ?? fetch;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10_000);
+        try {
+            const res = await fetchImpl(url, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(buildTestPayload(key)),
+                signal: controller.signal,
+            });
+            return json({ ok: res.ok, status: res.status });
+        } catch {
+            return json({ ok: false, error: 'Could not reach the webhook (network error or timeout).' });
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET, PUT, POST' } });
 };
 
 export const __testing = { configFileName, writeWebhookConfig };

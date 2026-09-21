@@ -106,4 +106,35 @@ describe('handleWebhookConfigRequest', () => {
         const res = await handleWebhookConfigRequest(req('DELETE'), { dataDir, key: KEY, maxBodyBytes: 100000 });
         expect(res.status).toBe(405);
     });
+
+    test('POST returns 400 when no URL is configured', async () => {
+        dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-whc-'));
+        const res = await handleWebhookConfigRequest(req('POST'), { dataDir, key: KEY, maxBodyBytes: 100000 });
+        expect(res.status).toBe(400);
+        expect((await res.json()).ok).toBe(false);
+    });
+
+    test('POST sends a test payload to the stored URL', async () => {
+        dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-whc-'));
+        await handleWebhookConfigRequest(req('PUT', validConfig), { dataDir, key: KEY, maxBodyBytes: 100000 });
+        const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+        const fetchStub = (async (url: string | URL | Request, init?: RequestInit) => {
+            calls.push({ url: String(url), body: JSON.parse(String(init?.body ?? '{}')) });
+            return new Response(null, { status: 200 });
+        }) as unknown as typeof fetch;
+
+        const res = await handleWebhookConfigRequest(req('POST'), { dataDir, key: KEY, maxBodyBytes: 100000, fetchImpl: fetchStub });
+        expect(await res.json()).toEqual({ ok: true, status: 200 });
+        expect(calls[0].url).toBe(validConfig.url);
+        expect(calls[0].body.test as boolean).toBe(true);
+    });
+
+    test('POST reports failure when the webhook cannot be reached', async () => {
+        dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-whc-'));
+        await handleWebhookConfigRequest(req('PUT', validConfig), { dataDir, key: KEY, maxBodyBytes: 100000 });
+        const fetchStub = (async () => { throw new Error('boom'); }) as unknown as typeof fetch;
+
+        const res = await handleWebhookConfigRequest(req('POST'), { dataDir, key: KEY, maxBodyBytes: 100000, fetchImpl: fetchStub });
+        expect((await res.json()).ok).toBe(false);
+    });
 });
