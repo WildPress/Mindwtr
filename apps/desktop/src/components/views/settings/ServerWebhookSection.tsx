@@ -2,6 +2,7 @@
 // Loads/saves per-namespace config via /v1/webhook-config (stored on the server,
 // not in the synced document). Only rendered when self-hosted sync is configured.
 
+import { Bell } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import { reportError } from '../../../lib/report-error';
@@ -70,15 +71,17 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
     const busy = status === 'loading' || status === 'saving';
 
     return (
-        <div data-settings-key="serverWebhook" className="bg-card border border-border rounded-lg p-6 space-y-4">
-            <div>
-                <p className="text-base font-semibold">Server reminders</p>
-                <p className="text-sm text-muted-foreground mt-1">
+        <section className="space-y-3">
+            <h2 data-settings-key="serverWebhook" className="text-lg font-semibold flex items-center gap-2">
+                <Bell className="w-5 h-5" />
+                Server reminders
+            </h2>
+            <div className="bg-card border border-border rounded-lg p-6 space-y-4">
+                <p className="text-sm text-muted-foreground">
                     Fire reminders and digests from the self-hosted server as a webhook, so they arrive
                     even when no device is open. Stored on the server, separate from the on-device
                     notifications above.
                 </p>
-            </div>
 
             <SettingRow settingsKey="serverWebhookEnabled" title="Enable server webhook">
                 <Switch
@@ -188,6 +191,7 @@ export function ServerWebhookSection({ weekdayOptions }: { weekdayOptions: Weekd
                 {status === 'saved' && <span className="text-xs text-muted-foreground">Saved</span>}
                 {status === 'error' && <span className="text-xs text-red-500">{error}</span>}
             </div>
-        </div>
+            </div>
+        </section>
     );
 }
