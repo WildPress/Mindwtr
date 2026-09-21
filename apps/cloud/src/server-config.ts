@@ -59,6 +59,11 @@ export const CLOUD_LOG_MESSAGES = [
     'cloud server listening',
     'failed to prune some orphaned calendar feed sidecars',
     'pruned orphaned calendar feed sidecars',
+    'reminder webhook delivered',
+    'reminder webhook delivery failed',
+    'reminder webhook emitter enabled',
+    'reminder webhook namespace load failed',
+    'reminder webhook state persistence failed',
     'request completed',
     'request failed',
     'shutdown signal received',
@@ -79,10 +84,14 @@ type CloudOperationalLogContext = Partial<Record<
     | 'hint'
     | 'maxNamespaces'
     | 'method'
+    | 'namespace'
     | 'operation'
     | 'outcome'
+    | 'pollIntervalMs'
     | 'port'
     | 'releaseCheck'
+    | 'reminderKey'
+    | 'reminderKind'
     | 'retentionReason'
     | 'requestId'
     | 'route'

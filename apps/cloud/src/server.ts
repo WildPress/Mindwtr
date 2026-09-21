@@ -118,6 +118,11 @@ import {
     rotateCalendarFeed,
     type CalendarFeedRecord,
 } from './server-calendar-feed';
+import {
+    resolveReminderWebhookConfig,
+    startReminderWebhookPoller,
+    type ReminderWebhookPoller,
+} from './server-reminder-webhook';
 
 const NAMESPACE_ADMISSION_LOCK_KEY = '__namespace_admission__';
 const createEmptyCloudData = (): AppData => ({
@@ -1240,6 +1245,22 @@ export async function startCloudServer(options: CloudServerOptions = {}): Promis
         cleanupTimer.unref();
     }
 
+    // Optional outbound reminder webhook: an always-on push of due task reminders
+    // and digests to an external endpoint, independent of any client being awake.
+    // Inert unless MINDWTR_CLOUD_REMINDER_WEBHOOK_ENABLED is set (config throws on a
+    // bad value, so a misconfigured deployment fails loudly here at startup).
+    const reminderWebhookConfig = resolveReminderWebhookConfig(process.env);
+    let reminderWebhookPoller: ReminderWebhookPoller | null = null;
+    if (reminderWebhookConfig.enabled) {
+        reminderWebhookPoller = startReminderWebhookPoller({
+            dataDir,
+            config: reminderWebhookConfig,
+        });
+        logInfo('reminder webhook emitter enabled', {
+            pollIntervalMs: String(reminderWebhookConfig.pollIntervalMs),
+        });
+    }
+
     const usingLegacyTokenVar = options.allowedAuthTokens === undefined
         && !String(process.env.MINDWTR_CLOUD_AUTH_TOKENS || '').trim()
         && !String(process.env.MINDWTR_CLOUD_AUTH_TOKENS_FILE || '').trim()
@@ -1854,6 +1875,7 @@ export async function startCloudServer(options: CloudServerOptions = {}): Promis
         if (stopped) return;
         stopped = true;
         clearInterval(cleanupTimer);
+        reminderWebhookPoller?.stop();
         try {
             await Promise.resolve((server as { stop?: (closeIdleConnections?: boolean) => void | Promise<void> }).stop?.(true));
         } catch {
