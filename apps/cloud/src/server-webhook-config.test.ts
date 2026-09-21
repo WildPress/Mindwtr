@@ -129,6 +129,19 @@ describe('handleWebhookConfigRequest', () => {
         expect(calls[0].body.test as boolean).toBe(true);
     });
 
+    test('POST uses a valid requested kind in the payload', async () => {
+        dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-whc-'));
+        await handleWebhookConfigRequest(req('PUT', validConfig), { dataDir, key: KEY, maxBodyBytes: 100000 });
+        const calls: Array<{ body: Record<string, unknown> }> = [];
+        const fetchStub = (async (_url: string | URL | Request, init?: RequestInit) => {
+            calls.push({ body: JSON.parse(String(init?.body ?? '{}')) });
+            return new Response(null, { status: 200 });
+        }) as unknown as typeof fetch;
+
+        await handleWebhookConfigRequest(req('POST', { kind: 'digest-morning' }), { dataDir, key: KEY, maxBodyBytes: 100000, fetchImpl: fetchStub });
+        expect(calls[0].body.kind as string).toBe('digest-morning');
+    });
+
     test('POST reports failure when the webhook cannot be reached', async () => {
         dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-whc-'));
         await handleWebhookConfigRequest(req('PUT', validConfig), { dataDir, key: KEY, maxBodyBytes: 100000 });

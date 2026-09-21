@@ -75,13 +75,24 @@ export const saveWebhookConfig = async (config: WebhookUiConfig): Promise<Webhoo
 
 export type WebhookTestResult = { ok: boolean; status?: number; error?: string };
 
-/** Ask the server to POST a one-off test payload to the stored webhook URL. */
-export const testWebhookConfig = async (): Promise<WebhookTestResult> => {
+/** Notification kinds a test can impersonate, with their labels for the dropdown. */
+export const WEBHOOK_TEST_KINDS: ReadonlyArray<{ value: string; label: string }> = [
+    { value: 'task-reminder', label: 'Task reminder (due/start)' },
+    { value: 'task-review', label: 'Review reminder' },
+    { value: 'project-review', label: 'Project review' },
+    { value: 'digest-morning', label: 'Morning briefing' },
+    { value: 'digest-evening', label: 'Evening review' },
+    { value: 'weekly-review', label: 'Weekly review' },
+];
+
+/** Ask the server to POST a one-off test payload (of the given kind) to the stored URL. */
+export const testWebhookConfig = async (kind: string): Promise<WebhookTestResult> => {
     const creds = cloudCreds();
     if (!creds) throw new Error('Self-hosted sync is not configured.');
     const res = await fetch(creds.endpoint, {
         method: 'POST',
-        headers: { authorization: `Bearer ${creds.token}` },
+        headers: { authorization: `Bearer ${creds.token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ kind }),
     });
     const body = (await res.json().catch(() => ({}))) as WebhookTestResult;
     if (!res.ok && body.error === undefined) return { ok: false, error: `Test failed (${res.status}).` };

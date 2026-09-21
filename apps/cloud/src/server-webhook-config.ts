@@ -145,12 +145,24 @@ export type WebhookConfigRequestOptions = {
     fetchImpl?: typeof fetch;
 };
 
-const buildTestPayload = (key: string) => ({
+// Kinds a test can impersonate (matches the emitter's ReminderWebhookEventKind,
+// minus the niche due-repeat). Used to validate the requested test kind.
+export const TEST_WEBHOOK_KINDS = [
+    'task-reminder',
+    'task-review',
+    'project-review',
+    'digest-morning',
+    'digest-evening',
+    'weekly-review',
+] as const;
+const TEST_WEBHOOK_KIND_SET: ReadonlySet<string> = new Set(TEST_WEBHOOK_KINDS);
+
+const buildTestPayload = (key: string, kind: string) => ({
     event: 'reminder' as const,
-    kind: 'task-reminder' as const,
+    kind,
     test: true,
     title: 'Mindwtr webhook test',
-    message: 'Test delivery from the server reminders settings.',
+    message: `Test delivery (${kind}) from the server reminders settings.`,
     firedAt: new Date().toISOString(),
     namespace: key,
 });
@@ -188,6 +200,18 @@ export const handleWebhookConfigRequest = async (
     if (req.method === 'POST') {
         const url = readWebhookConfig(dataDir, key)?.url ?? '';
         if (!url) return json({ ok: false, error: 'No webhook URL configured. Save a URL first.' }, 400);
+        // Optional { kind } picks which notification type the test impersonates.
+        let kind = 'task-reminder';
+        const raw = await req.text();
+        if (raw.length > maxBodyBytes) return json({ ok: false, error: 'Body too large.' }, 413);
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw) as { kind?: unknown };
+                if (typeof parsed.kind === 'string' && TEST_WEBHOOK_KIND_SET.has(parsed.kind)) kind = parsed.kind;
+            } catch {
+                // Ignore a malformed body; fall back to the default kind.
+            }
+        }
         const fetchImpl = options.fetchImpl ?? fetch;
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10_000);
@@ -195,7 +219,7 @@ export const handleWebhookConfigRequest = async (
             const res = await fetchImpl(url, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(buildTestPayload(key)),
+                body: JSON.stringify(buildTestPayload(key, kind)),
                 signal: controller.signal,
             });
             return json({ ok: res.ok, status: res.status });

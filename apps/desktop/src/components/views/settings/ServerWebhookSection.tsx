@@ -19,6 +19,7 @@ import {
     isWebhookConfigAvailable,
     saveWebhookConfig,
     testWebhookConfig,
+    WEBHOOK_TEST_KINDS,
     type WebhookTestResult,
     type WebhookUiConfig,
 } from '../../../lib/webhook-config-client';
@@ -55,6 +56,7 @@ export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOpt
     const [ready, setReady] = useState(false);
     const [error, setError] = useState('');
     const [testing, setTesting] = useState(false);
+    const [testKind, setTestKind] = useState<string>(WEBHOOK_TEST_KINDS[0].value);
     const [testResult, setTestResult] = useState<WebhookTestResult | null>(null);
     // Serialised payload last sent, so an unchanged value (e.g. a re-render or a
     // blur with no edit) never fires a redundant PUT or "Saved" toast.
@@ -64,7 +66,7 @@ export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOpt
         setTesting(true);
         setTestResult(null);
         try {
-            setTestResult(await testWebhookConfig());
+            setTestResult(await testWebhookConfig(testKind));
         } catch (testError) {
             setTestResult({ ok: false, error: testError instanceof Error ? testError.message : String(testError) });
         } finally {
@@ -274,6 +276,17 @@ export function ServerWebhookSection({ weekdayOptions, showSaved }: { weekdayOpt
                 </div>
 
                 <div className="flex items-center gap-3">
+                    <select
+                        value={testKind}
+                        disabled={testing || !config.url}
+                        onChange={(event) => setTestKind(event.target.value)}
+                        className={inputClass}
+                        aria-label="Test notification type"
+                    >
+                        {WEBHOOK_TEST_KINDS.map((option) => (
+                            <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                    </select>
                     <button
                         type="button"
                         onClick={runTest}
