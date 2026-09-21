@@ -123,6 +123,7 @@ import {
     startReminderWebhookPoller,
     type ReminderWebhookPoller,
 } from './server-reminder-webhook';
+import { WEBHOOK_CONFIG_ROUTE_PATH, handleWebhookConfigRequest } from './server-webhook-config';
 
 const NAMESPACE_ADMISSION_LOCK_KEY = '__namespace_admission__';
 const createEmptyCloudData = (): AppData => ({
@@ -1221,6 +1222,13 @@ export async function startCloudServer(options: CloudServerOptions = {}): Promis
     const attachmentServerConfig: ServerConfig = { ...baseServerConfig, maxPerWindow: maxAttachmentPerWindow };
     // The one route a capture-only token (#1178) may use.
     const captureServerConfig: ServerConfig = { ...baseServerConfig, acceptsCaptureTokens: true };
+    // Per-namespace webhook config (fork): a full-token-only sidecar, independent of
+    // the sync document, so it neither reserves nor requires an empty namespace.
+    const webhookConfigServerConfig: ServerConfig = {
+        ...baseServerConfig,
+        initializeNamespace: () => undefined,
+        guardMethods: () => false,
+    };
     // /v1/attachments/orphans previously checked "is this POST or DELETE" *before*
     // ever consulting the namespace guard, so an unsupported method (e.g. PATCH)
     // fell straight through to 405 regardless of cap state; only guard POST/DELETE
@@ -1245,21 +1253,20 @@ export async function startCloudServer(options: CloudServerOptions = {}): Promis
         cleanupTimer.unref();
     }
 
-    // Optional outbound reminder webhook: an always-on push of due task reminders
-    // and digests to an external endpoint, independent of any client being awake.
-    // Inert unless MINDWTR_CLOUD_REMINDER_WEBHOOK_ENABLED is set (config throws on a
-    // bad value, so a misconfigured deployment fails loudly here at startup).
+    // Outbound reminder webhook: an always-on push of due task reminders and digests
+    // to an external endpoint, independent of any client being awake. The poll loop
+    // always runs; each namespace's own config (set via /v1/webhook-config) decides
+    // whether and where to emit, falling back to the MINDWTR_CLOUD_REMINDER_* env
+    // config when a namespace has none. resolveReminderWebhookConfig throws on a bad
+    // env value, so a misconfigured deployment fails loudly here at startup.
     const reminderWebhookConfig = resolveReminderWebhookConfig(process.env);
-    let reminderWebhookPoller: ReminderWebhookPoller | null = null;
-    if (reminderWebhookConfig.enabled) {
-        reminderWebhookPoller = startReminderWebhookPoller({
-            dataDir,
-            config: reminderWebhookConfig,
-        });
-        logInfo('reminder webhook emitter enabled', {
-            pollIntervalMs: String(reminderWebhookConfig.pollIntervalMs),
-        });
-    }
+    const reminderWebhookPoller: ReminderWebhookPoller = startReminderWebhookPoller({
+        dataDir,
+        config: reminderWebhookConfig,
+    });
+    logInfo('reminder webhook emitter enabled', {
+        pollIntervalMs: String(reminderWebhookConfig.pollIntervalMs),
+    });
 
     const usingLegacyTokenVar = options.allowedAuthTokens === undefined
         && !String(process.env.MINDWTR_CLOUD_AUTH_TOKENS || '').trim()
@@ -1533,6 +1540,13 @@ export async function startCloudServer(options: CloudServerOptions = {}): Promis
                         })
                     ), requestAbortController.signal);
                     if (captureResponse) return captureResponse;
+                }
+
+                if (pathname === WEBHOOK_CONFIG_ROUTE_PATH) {
+                    const webhookConfigResponse = await withNamespace(req, url, webhookConfigServerConfig, async (ctx) => (
+                        handleWebhookConfigRequest(req, { dataDir, key: ctx.key, maxBodyBytes })
+                    ), requestAbortController.signal);
+                    if (webhookConfigResponse) return webhookConfigResponse;
                 }
 
                 // Capture-token management (#1178): full token only; withNamespace

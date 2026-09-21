@@ -13,6 +13,7 @@ import {
     startReminderWebhookPoller,
     __testing,
 } from './server-reminder-webhook';
+import { __testing as webhookConfigTesting } from './server-webhook-config';
 
 const BASE_ENV = {
     MINDWTR_CLOUD_REMINDER_WEBHOOK_ENABLED: 'true',
@@ -345,5 +346,38 @@ describe('startReminderWebhookPoller', () => {
 
         const state = JSON.parse(readFileSync(join(dataDir, __testing.STATE_FILE_NAME), 'utf8'));
         expect(state[KEY]).toBe(nowMs);
+    });
+
+    test('a namespace sidecar overrides the global config (url + kinds)', async () => {
+        dataDir = mkdtempSync(join(tmpdir(), 'mindwtr-reminder-'));
+        writeNamespace(dataDir, KEY, {
+            tasks: [makeTask({ id: 't1', title: 'Due', dueDate: '2026-09-18T19:00:00.000Z' })],
+        });
+        // Global fallback OFF: nothing would fire without a sidecar.
+        const config = resolveReminderWebhookConfig({});
+        webhookConfigTesting.writeWebhookConfig(dataDir, KEY, {
+            enabled: true,
+            url: 'https://sidecar.test/hook',
+            kinds: { start: false, due: true, review: false },
+            digest: {
+                morning: { enabled: false, time: '09:00' },
+                evening: { enabled: false, time: '20:00' },
+                weekly: { enabled: false, day: 1, time: '18:00' },
+            },
+        });
+        const calls: Call[] = [];
+        let nowMs = Date.parse('2026-09-18T18:59:00.000Z');
+        const poller = startReminderWebhookPoller({ dataDir, config, fetchImpl: recordingFetch(calls), now: () => nowMs });
+
+        await poller.runOnce(); // arm
+        expect(calls).toHaveLength(0);
+
+        nowMs = Date.parse('2026-09-18T19:00:30.000Z');
+        await poller.runOnce();
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe('https://sidecar.test/hook');
+        expect(calls[0].body.taskId).toBe('t1');
+
+        poller.stop();
     });
 });

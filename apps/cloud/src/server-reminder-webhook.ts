@@ -25,6 +25,7 @@ import {
 } from '@mindwtr/core';
 import { loadAppData } from './server-data-cache';
 import { logInfo, logWarn } from './server-config';
+import { readWebhookConfig } from './server-webhook-config';
 
 // Namespace data files are `<sha256(token)>.json`; the poll loop scans for them
 // exactly like server-request.ts does for the namespace quota count.
@@ -409,6 +410,21 @@ export const startReminderWebhookPoller = (options: ReminderWebhookPollerOptions
     const fetchImpl = options.fetchImpl ?? fetch;
     const now = options.now ?? Date.now;
 
+    // A namespace's stored webhook config (set via the UI / /v1/webhook-config)
+    // overrides the enabled/url/kinds/digest of the global env fallback, while the
+    // operational params (poll interval, look-back, timeout, auth token) stay global.
+    const resolveNamespaceConfig = (key: string): ReminderWebhookConfig => {
+        const stored = readWebhookConfig(dataDir, key);
+        if (!stored) return config;
+        return {
+            ...config,
+            enabled: stored.enabled,
+            url: stored.url,
+            kinds: stored.kinds,
+            digest: stored.digest,
+        };
+    };
+
     const state = readState(dataDir);
     let running = false;
 
@@ -424,26 +440,30 @@ export const startReminderWebhookPoller = (options: ReminderWebhookPollerOptions
             let stateChanged = false;
 
             for (const key of listNamespaceKeys(dataDir)) {
+                const nsConfig = resolveNamespaceConfig(key);
+                const active = nsConfig.enabled && nsConfig.url !== '';
+
                 // First time we see a namespace, arm from `now` so we never backfill
-                // its entire history of past-due reminders on first run.
+                // its entire history of past-due reminders on first run. We advance
+                // the checkpoint even while inactive, so enabling it later never dumps
+                // a backlog.
                 const lastMs = state[key];
                 const fromMs = lastMs === undefined ? toMs : Math.max(lastMs, earliestFromMs);
 
-                let data;
-                try {
-                    data = loadAppData(join(dataDir, `${key}.json`));
-                } catch {
-                    // Leave the checkpoint untouched so a transient read error is
-                    // retried next cycle (the lookback cap bounds the catch-up).
-                    logWarn('reminder webhook namespace load failed', { namespace: key });
-                    continue;
-                }
-
-                if (fromMs < toMs) {
-                    const due = collectDueReminders(data, config, { from: new Date(fromMs), to });
+                if (active && fromMs < toMs) {
+                    let data;
+                    try {
+                        data = loadAppData(join(dataDir, `${key}.json`));
+                    } catch {
+                        // Leave the checkpoint untouched so a transient read error is
+                        // retried next cycle (the lookback cap bounds the catch-up).
+                        logWarn('reminder webhook namespace load failed', { namespace: key });
+                        continue;
+                    }
+                    const due = collectDueReminders(data, nsConfig, { from: new Date(fromMs), to });
                     for (const request of due) {
                         const payload = buildReminderWebhookPayload(request, key);
-                        const delivered = await deliverReminder(fetchImpl, config, payload);
+                        const delivered = await deliverReminder(fetchImpl, nsConfig, payload);
                         const context = { namespace: key, reminderKind: payload.kind, reminderKey: payload.key };
                         if (delivered) {
                             logInfo('reminder webhook delivered', context);

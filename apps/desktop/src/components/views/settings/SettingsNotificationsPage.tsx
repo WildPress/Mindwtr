@@ -5,6 +5,7 @@ import { requestDesktopNotificationPermission } from '../../../lib/notification-
 import { Switch } from '../../ui/Switch';
 import { TimeInput } from '../../ui/TimeInput';
 import { SettingRow } from './SettingRow';
+import { ServerWebhookSection } from './ServerWebhookSection';
 
 type Labels = {
     notificationsDesc: string;
@@ -211,6 +212,8 @@ export function SettingsNotificationsPage({
                     />
                 </SettingRow>
             </div>
+
+            <ServerWebhookSection weekdayOptions={weekdayOptions} />
         </div>
     );
 }
