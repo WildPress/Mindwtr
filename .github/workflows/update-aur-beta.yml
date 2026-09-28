@@ -1,0 +1,283 @@
+name: Update AUR Beta
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'RC or stable tag to publish to mindwtr-beta-bin (e.g., v1.0.5-rc.1 or v1.0.5)'
+        required: true
+        type: string
+    secrets:
+      AUR_SSH_PRIVATE_KEY:
+        required: true
+      AUR_USERNAME:
+        required: false
+      AUR_EMAIL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'RC or stable tag to publish to mindwtr-beta-bin (e.g., v1.0.5-rc.1 or v1.0.5)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: update-aur-beta-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  update-aur-beta:
+    # Pinned on purpose: this job builds or packages with tools from the runner image,
+    # and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19. Bump CI first, then this.
+    runs-on: ubuntu-24.04
+    name: Update mindwtr-beta-bin
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: mindwtr-beta-bin
+            directory: aur-mindwtr-beta-bin
+            template: aur/PKGBUILD-beta-bin.template
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          scripts/ci/resolve-release-version.sh "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate beta release tag
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Stable tags are allowed too: every stable release also lands in the
+          # beta channels so beta users never have to hop back to stay current.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Mindwtr beta AUR packages must be updated from an RC or stable tag like v1.0.5-rc.1 or v1.0.5; got: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Configure SSH for AUR
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_PRIVATE_KEY:-}" ]; then
+            echo "Missing AUR_SSH_PRIVATE_KEY secret." >&2
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            HostKeyAlgorithms ssh-ed25519
+            StrictHostKeyChecking yes
+          EOF
+
+          : > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$RUNNER_TEMP/aur-known-hosts" 2>/dev/null
+          ACTUAL_FINGERPRINT="$(ssh-keygen -lf "$RUNNER_TEMP/aur-known-hosts" -E sha256 | awk '{print $2}')"
+          EXPECTED_FINGERPRINT='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "AUR SSH host fingerprint mismatch: expected ${EXPECTED_FINGERPRINT}, got ${ACTUAL_FINGERPRINT:-missing}." >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/aur-known-hosts" ~/.ssh/known_hosts
+
+      - name: Clone existing AUR beta repo
+        shell: bash
+        env:
+          AUR_PACKAGE: ${{ matrix.package }}
+          PACKAGE_DIR: ${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          case "${AUR_PACKAGE}:${PACKAGE_DIR}" in
+            mindwtr-beta-bin:aur-mindwtr-beta-bin|mindwtr-bin-beta:aur-mindwtr-bin-beta) ;;
+            *) echo "Unexpected beta package matrix entry." >&2; exit 1 ;;
+          esac
+          rm -rf "$PACKAGE_DIR"
+          AUR_URL="ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git"
+          for attempt in 1 2 3; do
+            if git clone "$AUR_URL" "$PACKAGE_DIR" \
+              && git -C "$PACKAGE_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
+              exit 0
+            fi
+            echo "AUR ${AUR_PACKAGE} clone attempt ${attempt} failed or returned no history; retrying..." >&2
+            rm -rf "$PACKAGE_DIR"
+            sleep 3
+          done
+
+          echo "Could not clone existing ${AUR_PACKAGE}; refusing to initialize over a transition identity." >&2
+          exit 1
+
+      - name: Generate beta PKGBUILD
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ matrix.directory }}
+          PACKAGE_TEMPLATE: ${{ matrix.template }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+            PKGVER="${BASH_REMATCH[1]}rc${BASH_REMATCH[2]}"
+          else
+            PKGVER="${VERSION//-/_}"
+          fi
+          export PACKAGE_DIR PACKAGE_TEMPLATE TAG VERSION PKGVER
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          template = Path(os.environ['PACKAGE_TEMPLATE']).read_text(encoding='utf-8')
+          text = (template
+              .replace('__PKGVER__', os.environ['PKGVER'])
+              .replace('__RELEASE_TAG__', os.environ['TAG'])
+              .replace('__ASSET_VERSION__', os.environ['VERSION']))
+          Path(os.environ['PACKAGE_DIR'], 'PKGBUILD').write_text(text, encoding='utf-8')
+          PY
+
+      - name: Wait for release assets
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          URL_DEB="https://github.com/${{ github.repository }}/releases/download/${TAG}/mindwtr_${VERSION}_amd64.deb"
+          echo "Waiting for release assets to become available..."
+          for attempt in $(seq 1 10); do
+            if curl -fsI "$URL_DEB" >/dev/null; then
+              echo "Release assets are available."
+              exit 0
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "Release asset not available after waiting: $URL_DEB" >&2
+              exit 1
+            fi
+            echo "Release asset not available yet (attempt ${attempt}/10); retrying..." >&2
+            sleep 15
+          done
+
+      - name: Update .SRCINFO and smoke package
+        shell: bash
+        env:
+          PACKAGE_DIR: ${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          HOST_UID="$(id -u)"
+          HOST_GID="$(id -g)"
+          docker run --rm \
+            -e HOST_UID="$HOST_UID" \
+            -e HOST_GID="$HOST_GID" \
+            -v "$PWD/$PACKAGE_DIR:/aur" \
+            -w /aur \
+            archlinux:latest \
+            bash -lc '
+              set -euo pipefail
+              pacman -Sy --noconfirm --needed base-devel git pacman-contrib
+              getent group "$HOST_GID" >/dev/null 2>&1 || groupadd -g "$HOST_GID" builder
+              id -u builder >/dev/null 2>&1 || useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+              chown -R builder:builder /aur
+              su builder -c "updpkgsums"
+              su builder -c "makepkg --verifysource --noconfirm"
+              su builder -c "makepkg --cleanbuild --clean --nodeps --noconfirm"
+              su builder -c "makepkg --printsrcinfo > /aur/.SRCINFO"
+            '
+
+      - name: Validate AUR package contents
+        shell: bash
+        env:
+          AUR_PACKAGE: ${{ matrix.package }}
+          PACKAGE_DIR: ${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          node scripts/ci/validate-aur-package.mjs \
+            --package-dir "$PACKAGE_DIR" \
+            --package "$AUR_PACKAGE"
+
+      - name: Verify AUR package ownership before push
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/ci/audit-aur-state.mjs
+
+      - name: Commit and push beta package
+        id: publish
+        shell: bash
+        working-directory: ${{ matrix.directory }}
+        env:
+          AUR_PACKAGE: ${{ matrix.package }}
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- PKGBUILD .SRCINFO)" ]; then
+            echo "No AUR beta package changes to publish."
+            echo "status=already-current" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config --local user.name "${AUR_USERNAME:-mindwtr-bot}"
+          git config --local user.email "${AUR_EMAIL:-actions@github.com}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.version.outputs.tag }}"
+
+          PUSH_LOG="$RUNNER_TEMP/aur-${AUR_PACKAGE}-push.log"
+          if git push origin master 2>&1 | tee "$PUSH_LOG"; then
+            echo "status=published" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Eqi 'AUR is down due to maintenance|disabled (all )?AUR pushes|pushes (are|have been) disabled' "$PUSH_LOG"; then
+            echo "::warning::AUR beta publication delayed by Arch maintenance/security controls. Re-dispatch once pushes are restored."
+            echo "status=delayed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Failed to push ${AUR_PACKAGE} to AUR." >&2
+          exit 1
+
+      - name: Verify published AUR package
+        if: ${{ steps.publish.outputs.status == 'published' }}
+        shell: bash
+        env:
+          AUR_PACKAGE: ${{ matrix.package }}
+          PACKAGE_DIR: ${{ matrix.directory }}
+        run: |
+          set -euo pipefail
+          LOCAL_HEAD="$(git -C "$PACKAGE_DIR" rev-parse HEAD)"
+          REMOTE_HEAD="$(git ls-remote "https://aur.archlinux.org/${AUR_PACKAGE}.git" refs/heads/master | awk '{print $1}')"
+          if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+            echo "Published ${AUR_PACKAGE} head mismatch: local ${LOCAL_HEAD}, remote ${REMOTE_HEAD:-missing}." >&2
+            exit 1
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if node scripts/ci/audit-aur-state.mjs; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 6 ]; then
+              echo "::warning::AUR RPC has not indexed ${AUR_PACKAGE} yet; its public Git head matches the exact pushed commit. The next update will require the normal full ownership audit."
+              exit 0
+            fi
+            sleep 5
+          done

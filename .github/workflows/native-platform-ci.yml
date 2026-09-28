@@ -1,0 +1,886 @@
+name: Native Platform CI
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        type: string
+        default: ios
+      source_sha:
+        type: string
+        required: true
+  pull_request:
+    branches: [main, master]
+    paths:
+      - ".github/workflows/native-platform-ci.yml"
+      - "apps/desktop/src-tauri/**"
+      - "apps/desktop/widgets-macos/**"
+      - "scripts/build-macos-widget.sh"
+      - "scripts/ci/test-build-macos-widget.sh"
+      - "apps/mobile/modules/**/android/**"
+      - "apps/android-native/**"
+      - "apps/mobile/modules/**/expo-module.config.json"
+      - "apps/mobile/ios-app-intents/**"
+      - "apps/mobile/widgets-ios/**"
+      - "apps/mobile/targets/watch/**"
+      - "apps/mobile/modules/**/ios/**"
+      - "apps/mobile/modules/cloudkit-sync/Package.swift"
+      - "apps/mobile/modules/cloudkit-sync/tests/**"
+      - "apps/mobile/modules/watch-connectivity/Package.swift"
+      - "apps/mobile/modules/watch-connectivity/tests/**"
+      - "apps/mobile/modules/ios-widget/Package.swift"
+      - "apps/mobile/modules/ios-widget/tests/**"
+      - "apps/mobile/modules/ios-scene-lifecycle/**"
+      - "apps/mobile/modules/ios-siri-actions/**"
+      - "scripts/ci/select-apple-sdk.test.js"
+      - "scripts/ci/select-apple-sdk.sh"
+      - "scripts/ci/probe-apple-sdk.sh"
+      - "apps/mobile/modules/apple-image-capture/ios/Tests/**"
+      - "apps/mobile/modules/apple-image-capture/Package.swift"
+      - "apps/mobile/modules/apple-foundation-models/Tests/**"
+      - "apps/mobile/modules/apple-foundation-models/Package.swift"
+      - "apps/mobile/modules/apple-task-search/Package.swift"
+      - "apps/mobile/modules/apple-task-search/tests/**"
+      - "apps/mobile/plugins/**"
+      - "apps/mobile/hooks/use-ios-scene-diagnostics.ts"
+      - "apps/mobile/app/_layout.tsx"
+      - "apps/mobile/app.config.ts"
+      - "apps/mobile/app.json"
+      - "apps/mobile/package.json"
+      - "packages/core/src/**"
+      - "packages/core/package.json"
+      - "scripts/check-synced-field-parity.ts"
+      - "scripts/ci/setup-android-sdk.sh"
+      - "scripts/ci/setup-ruby.sh"
+      - "scripts/ci/dispatch-macmini.sh"
+      - "scripts/ci/prepare-apple-cache.sh"
+      - "scripts/ci/collect-ios27-environment.sh"
+      - "scripts/ci/select-ios27-simulator.sh"
+      - "scripts/ci/smoke-ios27-simulator.sh"
+      - "scripts/ci/validate-ios-scene-lifecycle.js"
+      - "scripts/ci/validate-ios-scene-lifecycle.test.js"
+      - "package.json"
+      - "bun.lock"
+  push:
+    branches: [main, master, fix/ios27-1193]
+    paths:
+      - ".github/workflows/native-platform-ci.yml"
+      - "apps/desktop/src-tauri/**"
+      - "apps/desktop/widgets-macos/**"
+      - "scripts/build-macos-widget.sh"
+      - "scripts/ci/test-build-macos-widget.sh"
+      - "apps/mobile/modules/**/android/**"
+      - "apps/android-native/**"
+      - "apps/mobile/modules/**/expo-module.config.json"
+      - "apps/mobile/ios-app-intents/**"
+      - "apps/mobile/widgets-ios/**"
+      - "apps/mobile/targets/watch/**"
+      - "apps/mobile/modules/**/ios/**"
+      - "apps/mobile/modules/cloudkit-sync/Package.swift"
+      - "apps/mobile/modules/cloudkit-sync/tests/**"
+      - "apps/mobile/modules/watch-connectivity/Package.swift"
+      - "apps/mobile/modules/watch-connectivity/tests/**"
+      - "apps/mobile/modules/ios-widget/Package.swift"
+      - "apps/mobile/modules/ios-widget/tests/**"
+      - "apps/mobile/modules/ios-scene-lifecycle/**"
+      - "apps/mobile/modules/ios-siri-actions/**"
+      - "scripts/ci/select-apple-sdk.test.js"
+      - "scripts/ci/select-apple-sdk.sh"
+      - "scripts/ci/probe-apple-sdk.sh"
+      - "apps/mobile/modules/apple-image-capture/ios/Tests/**"
+      - "apps/mobile/modules/apple-image-capture/Package.swift"
+      - "apps/mobile/modules/apple-foundation-models/Tests/**"
+      - "apps/mobile/modules/apple-foundation-models/Package.swift"
+      - "apps/mobile/modules/apple-task-search/Package.swift"
+      - "apps/mobile/modules/apple-task-search/tests/**"
+      - "apps/mobile/plugins/**"
+      - "apps/mobile/hooks/use-ios-scene-diagnostics.ts"
+      - "apps/mobile/app/_layout.tsx"
+      - "apps/mobile/app.config.ts"
+      - "apps/mobile/app.json"
+      - "apps/mobile/package.json"
+      - "packages/core/src/**"
+      - "packages/core/package.json"
+      - "scripts/check-synced-field-parity.ts"
+      - "scripts/ci/setup-android-sdk.sh"
+      - "scripts/ci/setup-ruby.sh"
+      - "scripts/ci/dispatch-macmini.sh"
+      - "scripts/ci/prepare-apple-cache.sh"
+      - "scripts/ci/collect-ios27-environment.sh"
+      - "scripts/ci/select-ios27-simulator.sh"
+      - "scripts/ci/smoke-ios27-simulator.sh"
+      - "scripts/ci/validate-ios-scene-lifecycle.js"
+      - "scripts/ci/validate-ios-scene-lifecycle.test.js"
+      - "package.json"
+      - "bun.lock"
+  workflow_dispatch:
+    inputs:
+      apple_runner:
+        description: Override Apple routing for a hosted benchmark
+        type: choice
+        default: auto
+        options: [auto, github]
+      platform:
+        description: Native platform to validate
+        type: choice
+        default: all
+        options: [all, ios, android, macos, windows, apple-api]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.platform == 'apple-api' && 'apple-api' || 'native' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  apple-api:
+    if: github.event_name == 'workflow_dispatch' && inputs.platform == 'apple-api'
+    runs-on: xcode-27
+    name: Apple SDK API preflight
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Select Xcode 27
+        run: bash scripts/ci/select-apple-sdk.sh 27
+      - name: Typecheck actual Apple evaluation engines against the SDK
+        run: bash scripts/ci/probe-apple-sdk.sh
+
+  changes:
+    runs-on: ubuntu-latest
+    name: Detect native changes
+    outputs:
+      ios_matrix: ${{ steps.routing.outputs.matrix }}
+      macmini: ${{ steps.routing.outputs.macmini }}
+      android: ${{ steps.filter.outputs.android }}
+      android_client: ${{ steps.filter.outputs.android_client }}
+      ios: ${{ steps.filter.outputs.ios }}
+      macos: ${{ steps.filter.outputs.macos }}
+      windows: ${{ steps.filter.outputs.windows }}
+    steps:
+      - name: Validate private runner request
+        if: github.repository == 'dongdongbh/Mindwtr-native-ci'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$CALLER_REF" = refs/heads/main
+          test "$CALLER_EVENT" = workflow_dispatch
+
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: dongdongbh/Mindwtr
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require a commit already merged into public main
+        if: github.repository == 'dongdongbh/Mindwtr-native-ci'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+
+      - name: Route Apple validation
+        id: routing
+        env:
+          PRIVATE_MACMINI: ${{ github.repository == 'dongdongbh/Mindwtr-native-ci' }}
+          USE_MACMINI: ${{ vars.MACMINI_NATIVE_CI == 'true' && github.repository == 'dongdongbh/Mindwtr' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.apple_runner != 'github' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          apple = dict(lane='xcode27', label='Xcode 27 validation', runner='xcode-27')
+          private = os.environ['PRIVATE_MACMINI'] == 'true'
+          dispatch = os.environ['USE_MACMINI'] == 'true' and not private
+          if private:
+              apple['runner'] = ['self-hosted', 'macOS', 'ARM64', 'mindwtr-apple']
+          lanes = [apple]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps({'include': lanes}) + '\n')
+              output.write('macmini=' + str(dispatch).lower() + '\n')
+          PY
+
+      - name: Filter changed paths
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.sha }}
+          DISPATCH_PLATFORM: ${{ inputs.platform || 'all' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            for platform in android ios macos windows; do
+              enabled=false
+              if [ "$DISPATCH_PLATFORM" = "all" ] || [ "$DISPATCH_PLATFORM" = "$platform" ]; then
+                enabled=true
+              fi
+              echo "$platform=$enabled" >> "$GITHUB_OUTPUT"
+              if [ "$platform" = android ]; then
+                echo "android_client=$enabled" >> "$GITHUB_OUTPUT"
+              fi
+            done
+            exit 0
+          fi
+
+          if [ -z "${BASE_SHA:-}" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            BASE_SHA="$(git rev-parse "${HEAD_SHA}^")"
+          fi
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            # A force-push removed the old tip ("bad object", run 36272580872), so what changed is unknown: run every lane.
+            echo "Base $BASE_SHA is gone (force-push); running every native lane."
+            for output in android android_client ios macos windows; do
+              echo "$output=true" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          fi
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/native-changed-paths.txt"
+
+          android=false
+          android_client=false
+          ios=false
+          macos=false
+          windows=false
+          while IFS= read -r path; do
+            case "$path" in
+              apps/desktop/src-tauri/*|apps/desktop/widgets-macos/*|scripts/build-macos-widget.sh|scripts/ci/test-build-macos-widget.sh|packages/core/src/*|scripts/check-synced-field-parity.ts|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+                macos=true
+                ;;
+            esac
+            case "$path" in
+              apps/desktop/src-tauri/*|.github/workflows/native-platform-ci.yml)
+                windows=true
+                ;;
+            esac
+            case "$path" in
+              apps/mobile/modules/*/android/*|apps/mobile/modules/*/expo-module.config.json|apps/mobile/plugins/*|apps/mobile/app.config.ts|apps/mobile/app.json|apps/mobile/package.json|scripts/ci/setup-android-sdk.sh|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+                android=true
+                ;;
+            esac
+            case "$path" in
+              apps/android-native/*|packages/core/src/*|packages/core/package.json|scripts/ci/setup-android-sdk.sh|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+                android_client=true
+                ;;
+            esac
+            case "$path" in
+              apps/mobile/ios-app-intents/*|apps/mobile/widgets-ios/*|apps/mobile/targets/watch/*|apps/mobile/modules/*/ios/*|apps/mobile/modules/*/expo-module.config.json|apps/mobile/modules/cloudkit-sync/Package.swift|apps/mobile/modules/cloudkit-sync/tests/*|apps/mobile/modules/watch-connectivity/Package.swift|apps/mobile/modules/watch-connectivity/tests/*|apps/mobile/modules/ios-widget/Package.swift|apps/mobile/modules/ios-widget/tests/*|apps/mobile/modules/ios-scene-lifecycle/*|apps/mobile/modules/ios-siri-actions/*|apps/mobile/modules/apple-foundation-models/Package.swift|apps/mobile/modules/apple-task-search/Package.swift|apps/mobile/modules/apple-task-search/tests/*|apps/mobile/modules/apple-foundation-models/Tests/*|apps/mobile/modules/apple-image-capture/Package.swift|apps/mobile/modules/apple-image-capture/ios/Tests/*|scripts/ci/select-apple-sdk.sh|scripts/ci/probe-apple-sdk.sh|scripts/ci/select-apple-sdk.test.js|apps/mobile/plugins/*|apps/mobile/hooks/use-ios-scene-diagnostics.ts|apps/mobile/app/_layout.tsx|apps/mobile/app.config.ts|apps/mobile/app.json|apps/mobile/package.json|scripts/ci/prepare-apple-cache.sh|scripts/ci/dispatch-macmini.sh|scripts/ci/setup-ruby.sh|scripts/ci/collect-ios27-environment.sh|scripts/ci/select-ios27-simulator.sh|scripts/ci/smoke-ios27-simulator.sh|scripts/ci/validate-ios-scene-lifecycle.js|scripts/ci/validate-ios-scene-lifecycle.test.js|package.json|bun.lock|.github/workflows/native-platform-ci.yml)
+                ios=true
+                ;;
+            esac
+          done < "$RUNNER_TEMP/native-changed-paths.txt"
+
+          echo "android=$android" >> "$GITHUB_OUTPUT"
+          echo "android_client=$android_client" >> "$GITHUB_OUTPUT"
+          echo "ios=$ios" >> "$GITHUB_OUTPUT"
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+          echo "windows=$windows" >> "$GITHUB_OUTPUT"
+
+  macos-rust:
+    if: needs.changes.outputs.macos == 'true'
+    needs: changes
+    runs-on: macos-15
+    name: macOS Rust check and tests
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Check macOS Rust and Objective-C bridge
+        run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Link release macOS Rust and Swift bridges
+        run: cargo build --release --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          APPLE_TEAM_ID: DEVTEAM
+
+      - name: Run macOS native library tests
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib
+
+      - name: Load release macOS library with the system Swift runtime
+        run: |
+          set -euo pipefail
+          LIBRARY="apps/desktop/src-tauri/target/release/libapp_lib.dylib"
+          LOAD_COMMANDS="$(otool -l "$LIBRARY")"
+          grep -F 'path /usr/lib/swift (offset' <<< "$LOAD_COMMANDS"
+          env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH python3 - "$LIBRARY" <<'PY'
+          import ctypes
+          import sys
+          ctypes.CDLL(sys.argv[1])
+          print("Release library loaded with the system Swift runtime")
+          PY
+
+      - name: Link Intel macOS widget and extract App Intents metadata
+        run: |
+          set -euo pipefail
+          VALIDATION_APP="$RUNNER_TEMP/Mindwtr.app"
+          mkdir -p "$VALIDATION_APP/Contents/MacOS"
+          cat > "$VALIDATION_APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleShortVersionString</key>
+            <string>1.3.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+          </dict>
+          </plist>
+          PLIST
+          MINDWTR_WIDGET_METADATA_ONLY=1 \
+            bash scripts/build-macos-widget.sh \
+              "$VALIDATION_APP" \
+              DEVTEAM \
+              '' \
+              x86_64-apple-darwin
+
+      - name: Exercise macOS widget packaging and signing order
+        run: bash scripts/ci/test-build-macos-widget.sh
+
+  windows-rust:
+    if: needs.changes.outputs.windows == 'true'
+    needs: changes
+    runs-on: windows-latest
+    name: Windows Rust check and tests
+    timeout-minutes: 35
+    env:
+      # Packaged Windows builds keep the repo-wide static CRT setting, but
+      # cargo test links whisper-rs-sys objects that use the dynamic CRT.
+      # Match the proven Windows native-test job in ci.yml so the linker does
+      # not leave unresolved __imp_* CRT symbols.
+      RUSTFLAGS: -C target-feature=-crt-static
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Check Windows Rust
+        run: cargo check --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Run Windows native library tests
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --lib
+
+  android-native:
+    if: needs.changes.outputs.android == 'true'
+    needs: changes
+    # Pinned on purpose: this job builds or packages with tools from the runner image,
+    # and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19. Bump CI first, then this.
+    runs-on: ubuntu-24.04
+    name: Android native compile
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        run: bash scripts/ci/setup-android-sdk.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run Android compatibility-lock process regression
+        run: |
+          set -euo pipefail
+          c++ \
+            -std=c++17 \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -I apps/mobile/modules/sync-file-lock/android/src/main/cpp \
+            apps/mobile/modules/sync-file-lock/android/src/main/cpp/file_compat_lock.cpp \
+            apps/mobile/modules/sync-file-lock/android/src/test/cpp/file_compat_lock_test.cpp \
+            -o "$RUNNER_TEMP/file-compat-lock-test"
+          "$RUNNER_TEMP/file-compat-lock-test"
+
+      - name: Run Android exact-directory retirement regression
+        run: |
+          set -euo pipefail
+          c++ \
+            -std=c++17 \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -I apps/mobile/modules/attachment-file-installer/android/src/main/cpp \
+            apps/mobile/modules/attachment-file-installer/android/src/main/cpp/exact_directory_retirement.cpp \
+            apps/mobile/modules/attachment-file-installer/android/src/test/cpp/exact_directory_retirement_test.cpp \
+            -o "$RUNNER_TEMP/exact-directory-retirement-test"
+          "$RUNNER_TEMP/exact-directory-retirement-test"
+
+      - name: Generate Android native project
+        working-directory: apps/mobile
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+          NODE_ENV: development
+        run: |
+          "$GITHUB_WORKSPACE/node_modules/.bin/expo" prebuild \
+            --clean \
+            --platform android \
+            --no-install
+
+      - name: Compile Android Java, Kotlin, and JNI sources
+        working-directory: apps/mobile/android
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+          NODE_ENV: development
+        run: |
+          ./gradlew \
+            :app:compileDebugKotlin \
+            :app:compileDebugJavaWithJavac \
+            :attachment-file-installer:assembleDebug \
+            :sync-file-lock:assembleDebug \
+            :android-widget:assembleDebug \
+            --no-daemon \
+            -PreactNativeArchitectures=arm64-v8a
+
+      - name: Verify packaged Android lock JNI symbols
+        working-directory: apps/mobile/android
+        run: |
+          set -euo pipefail
+          LOCK_AAR="$(find ../modules/sync-file-lock/android/build/outputs/aar -name '*debug.aar' -print -quit)"
+          if [ -z "${LOCK_AAR:-}" ]; then
+            echo "::error::sync-file-lock debug AAR was not produced"
+            exit 1
+          fi
+          unzip -l "$LOCK_AAR" | grep -F 'jni/arm64-v8a/libsync-file-lock.so'
+          unzip -p "$LOCK_AAR" jni/arm64-v8a/libsync-file-lock.so > "$RUNNER_TEMP/libsync-file-lock.so"
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libsync-file-lock.so" \
+            | grep -F 'Java_tech_dongdongbh_mindwtr_syncfilelock_StableRootLockNative_tryLock'
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libsync-file-lock.so" \
+            | grep -F 'Java_tech_dongdongbh_mindwtr_syncfilelock_StableRootLockNative_tryOfdLock'
+
+      - name: Verify packaged Android attachment JNI symbols
+        working-directory: apps/mobile/android
+        run: |
+          set -euo pipefail
+          ATTACHMENT_AAR="$(find ../modules/attachment-file-installer/android/build/outputs/aar -name '*debug.aar' -print -quit)"
+          if [ -z "${ATTACHMENT_AAR:-}" ]; then
+            echo "::error::attachment-file-installer debug AAR was not produced"
+            exit 1
+          fi
+          unzip -l "$ATTACHMENT_AAR" | grep -F 'jni/arm64-v8a/libattachment-file-installer.so'
+          unzip -p "$ATTACHMENT_AAR" jni/arm64-v8a/libattachment-file-installer.so \
+            > "$RUNNER_TEMP/libattachment-file-installer.so"
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libattachment-file-installer.so" \
+            | grep -F 'Java_tech_dongdongbh_mindwtr_attachmentfileinstaller_ExactAttachmentPublisherNative_publishRelativeNoReplace'
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libattachment-file-installer.so" \
+            | grep -F 'Java_tech_dongdongbh_mindwtr_attachmentfileinstaller_ExactAttachmentPublisherNative_retireEmptyDirectoryIfIdentity'
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libattachment-file-installer.so" \
+            | grep -F 'Java_tech_dongdongbh_mindwtr_attachmentfileinstaller_ExactAttachmentPublisherNative_retireReservedPrivateStage'
+
+      - name: Run Android native recovery and system bar tests
+        working-directory: apps/mobile/android
+        run: ./gradlew :attachment-file-installer:testDebugUnitTest :sync-file-lock:testDebugUnitTest :android-widget:testDebugUnitTest :system-bars:testDebugUnitTest --no-daemon
+
+  android-client:
+    if: needs.changes.outputs.android_client == 'true'
+    needs: changes
+    runs-on: ubuntu-24.04
+    name: Android Compose client build
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        env:
+          ANDROID_SDK_PACKAGES: "platform-tools platforms;android-36 build-tools;36.0.0"
+        run: bash scripts/ci/setup-android-sdk.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Android Compose client
+        working-directory: apps/android-native/android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+  ios-native:
+    if: needs.changes.outputs.ios == 'true' && needs.changes.outputs.macmini != 'true'
+    needs: changes
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.ios_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    name: iOS Swift compile (${{ matrix.label }})
+    timeout-minutes: 75
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: dongdongbh/Mindwtr
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
+          clean: ${{ github.repository != 'dongdongbh/Mindwtr-native-ci' }}
+
+      - name: Select the requested Apple SDK
+        if: runner.environment != 'self-hosted'
+        run: bash scripts/ci/select-apple-sdk.sh 27
+
+      - name: Prepare persistent Apple build caches
+        run: bash scripts/ci/prepare-apple-cache.sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Setup Ruby
+        run: bash scripts/ci/setup-ruby.sh 3.3
+
+      - name: Install pinned CocoaPods
+        run: gem install cocoapods --version 1.16.2 --no-document
+
+      - name: Capture and validate Xcode 27 environment
+        if: matrix.lane == 'xcode27'
+        run: bash scripts/ci/collect-ios27-environment.sh "$RUNNER_TEMP/ios27-artifacts"
+
+      - name: Preflight Apple evaluation SDK APIs
+        if: matrix.lane == 'xcode27'
+        run: bash scripts/ci/probe-apple-sdk.sh
+
+      - name: Check App Intents availability and native plugin contracts
+        run: |
+          node scripts/ci/validate-ios-app-intents-availability.js
+          bun test scripts/ci/select-apple-sdk.test.js
+          bun test apps/mobile/plugins/ios-widgets-and-shortcuts.test.js
+
+      - name: Typecheck iOS widgets at the minimum deployment target
+        run: |
+          xcrun swiftc \
+            -typecheck \
+            -parse-as-library \
+            -swift-version 5 \
+            -application-extension \
+            -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -target "$(uname -m)-apple-ios15.1-simulator" \
+            apps/mobile/widgets-ios/*.swift \
+            apps/mobile/modules/ios-widget/ios/MindwtrWidgetActionStore.swift
+
+      - name: Typecheck Watch receiver against the iOS SDK
+        run: |
+          xcrun swiftc \
+            -typecheck \
+            -parse-as-library \
+            -swift-version 5 \
+            -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
+            -target "$(uname -m)-apple-ios16.4-simulator" \
+            apps/mobile/modules/watch-connectivity/ios/MindwtrCanonicalWave.swift \
+            apps/mobile/modules/watch-connectivity/ios/MindwtrWatchAudioPathResolver.swift \
+            apps/mobile/modules/watch-connectivity/ios/MindwtrWatchPayloadValidator.swift \
+            apps/mobile/modules/watch-connectivity/ios/MindwtrWatchReceiptStateMachine.swift \
+            apps/mobile/modules/watch-connectivity/ios/MindwtrWatchConnectivityReceiver.swift
+
+      - name: Run attachment installer Swift recovery tests
+        run: swift test --package-path apps/mobile/modules/attachment-file-installer/ios --scratch-path "$MINDWTR_SWIFT_CACHE/attachment-file-installer"
+
+      - name: Run File Sync stable-lock Swift tests
+        run: swift test --package-path apps/mobile/modules/sync-file-lock/ios --scratch-path "$MINDWTR_SWIFT_CACHE/sync-file-lock"
+
+      - name: Run CloudKit attachment error classifier tests
+        run: swift test --package-path apps/mobile/modules/cloudkit-sync --scratch-path "$MINDWTR_SWIFT_CACHE/cloudkit-sync"
+
+      - name: Run Watch payload and receipt recovery tests
+        run: swift test --package-path apps/mobile/modules/watch-connectivity --scratch-path "$MINDWTR_SWIFT_CACHE/watch-connectivity"
+
+      - name: Test iOS widget durable action queue
+        run: swift test --package-path apps/mobile/modules/ios-widget --scratch-path "$MINDWTR_SWIFT_CACHE/ios-widget"
+
+      - name: Test iOS Siri durable action transport
+        run: swift test --package-path apps/mobile/modules/ios-siri-actions --scratch-path "$MINDWTR_SWIFT_CACHE/ios-siri-actions"
+
+      - name: Test Apple clarification request cancellation
+        run: swift test --package-path apps/mobile/modules/apple-foundation-models --scratch-path "$MINDWTR_SWIFT_CACHE/apple-foundation-models"
+
+      - name: Test Apple search result completion
+        run: swift test --package-path apps/mobile/modules/apple-task-search --scratch-path "$MINDWTR_SWIFT_CACHE/apple-task-search"
+
+      - name: Test Apple image input bounds
+        run: swift test --package-path apps/mobile/modules/apple-image-capture --scratch-path "$MINDWTR_SWIFT_CACHE/apple-image-capture"
+
+      - name: Run Watch outbox retry tests
+        run: swift test --package-path apps/mobile/targets/watch --scratch-path "$MINDWTR_SWIFT_CACHE/watch"
+
+      - name: Generate iOS native project
+        working-directory: apps/mobile
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+          NODE_ENV: development
+          MINDWTR_WATCH_ENABLED: "true"
+        run: |
+          "$GITHUB_WORKSPACE/node_modules/.bin/expo" prebuild \
+            --clean \
+            --platform ios \
+            --no-install
+
+      - name: Validate generated iOS scene lifecycle
+        run: node scripts/ci/validate-ios-scene-lifecycle.js apps/mobile/ios
+
+      - name: Validate generated Watch Xcode project
+        run: |
+          ruby -rxcodeproj - apps/mobile/ios/Mindwtr.xcodeproj <<'RUBY'
+          project = Xcodeproj::Project.open(ARGV.fetch(0))
+          %w[MindwtrWatch MindwtrWatchWidgets].each do |name|
+            target = project.targets.find { |candidate| candidate.name == name }
+            abort("Missing Watch target: #{name}") unless target
+            target.source_build_phase.files.each do |file|
+              abort("Missing source for #{name}: #{file.display_name}") unless file.file_ref&.real_path&.file?
+            end
+          end
+          watch = project.targets.find { |target| target.name == 'MindwtrWatch' }
+          embedded = watch.copy_files_build_phases.flat_map(&:files).map { |file| file.file_ref.path }
+          abort("Wrong Watch embedded products: #{embedded.inspect}") unless embedded == ['MindwtrWatchWidgets.appex']
+          project.save
+          puts 'Watch targets and source references survive Xcodeproj serialization'
+          RUBY
+
+      - name: Install CocoaPods dependencies
+        working-directory: apps/mobile/ios
+        run: pod install
+
+      - name: Preserve resolved iOS dependencies
+        if: matrix.lane == 'xcode27'
+        run: cp apps/mobile/ios/Podfile.lock "$RUNNER_TEMP/ios27-artifacts/Podfile.lock"
+
+      - name: Select an available iOS 27 simulator
+        if: matrix.lane == 'xcode27'
+        id: ios27_simulator
+        run: bash scripts/ci/select-ios27-simulator.sh "$RUNNER_TEMP/ios27-artifacts"
+
+      - name: Compile Watch app and complications
+        run: |
+          xcodebuild \
+            -project apps/mobile/ios/Mindwtr.xcodeproj \
+            -target MindwtrWatch \
+            -jobs 4 \
+            -configuration Debug \
+            -sdk watchsimulator \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Build bundled Release app for the iOS 27 simulator
+        if: matrix.lane == 'xcode27'
+        id: ios27_release_simulator
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+          NODE_ENV: production
+          RCT_NO_LAUNCH_PACKAGER: "1"
+          # The smoke launch below runs a Release build; without this every CI run
+          # counted as a new iOS install (and now a new profile) in analytics.
+          ANALYTICS_HEARTBEAT_DISABLED: "1"
+        run: |
+          set -euo pipefail
+          ARTIFACTS_DIR="$RUNNER_TEMP/ios27-artifacts"
+          DERIVED_DATA="$MINDWTR_NATIVE_CACHE/simulator"
+          BUILD_LOG="$ARTIFACTS_DIR/release-simulator-build.log"
+          mkdir -p "$ARTIFACTS_DIR"
+
+          # Repackage the app from current resources while retaining compiled dependencies.
+          rm -rf "$DERIVED_DATA/Build/Products/Release-iphonesimulator/Mindwtr.app"
+          set +e
+          xcodebuild \
+            -workspace apps/mobile/ios/Mindwtr.xcworkspace \
+            -scheme Mindwtr \
+            -configuration Release \
+            -destination 'platform=iOS Simulator,id=${{ steps.ios27_simulator.outputs.simulator_udid }}' \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            -jobs 4 \
+            build > "$BUILD_LOG" 2>&1
+          BUILD_STATUS=$?
+          set -e
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            grep -E '(^| )error:|\\*\\* BUILD FAILED \\*\\*|The following build commands failed' "$BUILD_LOG" | tail -n 200 || true
+            tail -n 200 "$BUILD_LOG" || true
+            exit "$BUILD_STATUS"
+          fi
+
+          APP_PATH="$(find "$DERIVED_DATA/Build/Products/Release-iphonesimulator" -maxdepth 1 -type d -name 'Mindwtr.app' -print -quit)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Xcode did not produce Mindwtr.app for the selected iOS 27 simulator."
+            exit 1
+          fi
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test cold and warm links on the iOS 27 simulator
+        if: matrix.lane == 'xcode27'
+        run: |
+          bash scripts/ci/smoke-ios27-simulator.sh \
+            '${{ steps.ios27_simulator.outputs.simulator_udid }}' \
+            '${{ steps.ios27_release_simulator.outputs.app_path }}' \
+            "$RUNNER_TEMP/ios27-artifacts"
+
+      - name: Create unsigned Release device archive with Xcode 27
+        if: matrix.lane == 'xcode27'
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+          NODE_ENV: production
+          RCT_NO_LAUNCH_PACKAGER: "1"
+        run: |
+          set -euo pipefail
+          ARTIFACTS_DIR="$RUNNER_TEMP/ios27-artifacts"
+          ARCHIVE_PATH="$ARTIFACTS_DIR/Mindwtr-unsigned.xcarchive"
+          ARCHIVE_LOG="$ARTIFACTS_DIR/unsigned-device-archive.log"
+          mkdir -p "$ARTIFACTS_DIR"
+
+          set +e
+          xcodebuild \
+            -workspace apps/mobile/ios/Mindwtr.xcworkspace \
+            -scheme Mindwtr \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$ARCHIVE_PATH" \
+            -derivedDataPath "$MINDWTR_NATIVE_CACHE/archive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            -jobs 4 \
+            archive > "$ARCHIVE_LOG" 2>&1
+          ARCHIVE_STATUS=$?
+          set -e
+          if [ "$ARCHIVE_STATUS" -ne 0 ]; then
+            grep -E '(^| )error:|\\*\\* ARCHIVE FAILED \\*\\*|The following build commands failed|CodeSign|Provisioning' "$ARCHIVE_LOG" | tail -n 200 || true
+            tail -n 200 "$ARCHIVE_LOG" || true
+            exit "$ARCHIVE_STATUS"
+          fi
+
+          ARCHIVED_APP="$ARCHIVE_PATH/Products/Applications/Mindwtr.app"
+          if [ ! -d "$ARCHIVED_APP" ]; then
+            echo "::error::Unsigned archive did not contain Mindwtr.app."
+            exit 1
+          fi
+          if [ -d "$ARCHIVED_APP/_CodeSignature" ]; then
+            echo "::error::The validation archive's host app is signed; this lane must remain an unsigned compile/archive check."
+            exit 1
+          fi
+          echo "Created unsigned validation archive at $ARCHIVE_PATH"
+
+      - name: Upload Xcode 27 validation evidence
+        if: ${{ always() && matrix.lane == 'xcode27' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ios27-native-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios27-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Delete the disposable Mac mini simulator
+        if: ${{ always() && runner.environment == 'self-hosted' && steps.ios27_simulator.outputs.simulator_udid != '' }}
+        env:
+          SIMULATOR_UDID: ${{ steps.ios27_simulator.outputs.simulator_udid }}
+        run: |
+          xcrun simctl shutdown "$SIMULATOR_UDID" >/dev/null 2>&1 || true
+          xcrun simctl delete "$SIMULATOR_UDID"
+
+      - name: Record archive validation limits
+        if: matrix.lane == 'xcode27'
+        run: |
+          echo 'Unsigned Release archive compiled. Signing, AppIntentsTesting in the built app, Siri, and on-device model quality remain separate validation gates.' >> "$GITHUB_STEP_SUMMARY"
+
+  ios-macmini:
+    if: needs.changes.outputs.ios == 'true' && needs.changes.outputs.macmini == 'true'
+    needs: changes
+    runs-on: ubuntu-latest
+    name: iOS Swift compile (Mac mini Xcode 27)
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Dispatch trusted commit to the private runner repository
+        env:
+          GH_TOKEN: ${{ secrets.MACMINI_CI_DISPATCH_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: bash scripts/ci/dispatch-macmini.sh
+      - name: Upload Mac mini validation evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ios27-native-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios27-artifacts
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,343 @@
+name: Release Linux
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.3)'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.3)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  APPIMAGETOOL_VERSION: "1.9.1"
+  APPIMAGETOOL_X86_64_SHA256: "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+  APPIMAGE_RUNTIME_COMMIT: "75849dce7cc37e4319b633df1f116ca895c71a12"
+  APPIMAGE_RUNTIME_ASSET_ID: "456065460"
+  APPIMAGE_RUNTIME_X86_64_SHA256: "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: release-linux-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    name: Linux Build + Snap
+    timeout-minutes: 90
+    env:
+      VITE_DROPBOX_APP_KEY: ${{ vars.VITE_DROPBOX_APP_KEY || secrets.VITE_DROPBOX_APP_KEY }}
+      VITE_FEEDBACK_ENDPOINT_URL: ${{ vars.VITE_FEEDBACK_ENDPOINT_URL || 'https://feedback.mindwtr.app' }}
+      VITE_DONATION_PROMPT_ENABLED: "true"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.event.inputs.tag || github.ref }}
+
+      # D3: fail fast, before the ~90min build, when the AppStream metainfo's top
+      # <release> entry wasn't bumped for this release (rc.2 once shipped with the
+      # rc.1 entry still in place). Only enforced when a real release tag resolved;
+      # an ad-hoc workflow_dispatch with no tag falls back to the unsuffixed base
+      # version and must not be held to the tag's version.
+      - name: Validate AppStream metainfo version for tagged releases
+        run: |
+          set -euo pipefail
+          TAG_INPUT="${{ inputs.tag || github.event.inputs.tag }}"
+          TAG="${TAG_INPUT:-${GITHUB_REF#refs/tags/}}"
+          if [[ "${TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            python3 scripts/ci/validate-appstream-locales.py --expected-version "${TAG#v}"
+          else
+            echo "No release tag resolved; skipping AppStream metainfo version check."
+          fi
+        shell: bash
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          WEBKIT_DEV_PKG="libwebkit2gtk-4.0-dev"
+          if apt-cache show libwebkit2gtk-4.1-dev >/dev/null 2>&1; then
+            WEBKIT_DEV_PKG="libwebkit2gtk-4.1-dev"
+          fi
+          sudo apt-get install -y \
+            "$WEBKIT_DEV_PKG" \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libasound2-dev \
+            libssl-dev
+        shell: bash
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build Tauri app
+        timeout-minutes: 35
+        run: |
+          cd apps/desktop
+          bunx tauri build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_ANALYTICS_HEARTBEAT_URL: ${{ secrets.ANALYTICS_HEARTBEAT_URL }}
+          VITE_ANALYTICS_RELEASE_VERSION: ${{ inputs.tag || github.event.inputs.tag || github.ref_name }}
+
+      - name: Repair AppImage metadata
+        run: |
+          set -euo pipefail
+
+          mapfile -t APPIMAGES < <(find apps/desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | sort)
+          if [ "${#APPIMAGES[@]}" -eq 0 ]; then
+            echo "No AppImage found, skipping repair."
+            exit 0
+          fi
+
+          RUNNER_ARCH="$(uname -m)"
+          case "$RUNNER_ARCH" in
+            amd64) RUNNER_ARCH="x86_64" ;;
+            arm64) RUNNER_ARCH="aarch64" ;;
+          esac
+
+          TOOL_URL="https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          RUNTIME_URL="https://api.github.com/repos/AppImage/type2-runtime/releases/assets/${APPIMAGE_RUNTIME_ASSET_ID}"
+          TOOL_WORKDIR="$(mktemp -d)"
+          TOOL_PATH="$TOOL_WORKDIR/appimagetool.AppImage"
+          RUNTIME_PATH="$TOOL_WORKDIR/runtime-x86_64"
+          METAINFO_SOURCE="$GITHUB_WORKSPACE/apps/desktop/src-tauri/linux/Mindwtr.metainfo.xml"
+          curl -fsSL "$TOOL_URL" -o "$TOOL_PATH"
+          printf '%s  appimagetool.AppImage\n' "$APPIMAGETOOL_X86_64_SHA256" \
+            > "$TOOL_WORKDIR/appimagetool.sha256"
+          (
+            cd "$TOOL_WORKDIR"
+            sha256sum --check --strict appimagetool.sha256
+          )
+          echo "Downloading AppImage type2 runtime from release commit ${APPIMAGE_RUNTIME_COMMIT} (asset ${APPIMAGE_RUNTIME_ASSET_ID})"
+          curl -fsSL \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$RUNTIME_URL" \
+            -o "$RUNTIME_PATH"
+          printf '%s  runtime-x86_64\n' "$APPIMAGE_RUNTIME_X86_64_SHA256" \
+            > "$TOOL_WORKDIR/runtime.sha256"
+          (
+            cd "$TOOL_WORKDIR"
+            sha256sum --check --strict runtime.sha256
+          )
+          chmod +x "$TOOL_PATH"
+          (
+            cd "$TOOL_WORKDIR"
+            ./appimagetool.AppImage --appimage-extract >/dev/null
+          )
+          APPIMAGETOOL="$TOOL_WORKDIR/squashfs-root/AppRun"
+
+          for APPIMAGE_PATH in "${APPIMAGES[@]}"; do
+            echo "Checking AppImage: $APPIMAGE_PATH"
+            APP_WORKDIR="$(mktemp -d)"
+            cp "$APPIMAGE_PATH" "$APP_WORKDIR/original.AppImage"
+            chmod +x "$APP_WORKDIR/original.AppImage"
+
+            (
+              cd "$APP_WORKDIR"
+              ./original.AppImage --appimage-extract >/dev/null
+              mv squashfs-root appdir
+
+              # Some Tauri builds emit .DirIcon as an absolute symlink into the CI workspace.
+              # That symlink is broken for downstream users and AppImageHub lint.
+              if [ -L appdir/.DirIcon ]; then
+                DIRICON_TARGET="$(readlink appdir/.DirIcon || true)"
+                if [[ "$DIRICON_TARGET" = /* ]] || [ ! -e appdir/.DirIcon ]; then
+                  rm -f appdir/.DirIcon
+                  cp "$GITHUB_WORKSPACE/apps/desktop/src-tauri/icons/128x128.png" appdir/.DirIcon
+                  echo "Replaced broken/absolute .DirIcon symlink with regular file"
+                else
+                  echo ".DirIcon symlink is relative and valid"
+                fi
+              elif [ ! -e appdir/.DirIcon ]; then
+                cp "$GITHUB_WORKSPACE/apps/desktop/src-tauri/icons/128x128.png" appdir/.DirIcon
+                echo "Injected missing .DirIcon"
+              else
+                echo ".DirIcon already present"
+              fi
+
+              # Keep AppStream metadata under usr/share/metainfo (not AppDir root),
+              # and ensure filenames match the component id to satisfy appstreamcli.
+              if [ -f "$METAINFO_SOURCE" ]; then
+                mkdir -p appdir/usr/share/metainfo
+                rm -f appdir/usr/share/metainfo/*.xml
+                cp "$METAINFO_SOURCE" appdir/usr/share/metainfo/tech.dongdongbh.mindwtr.metainfo.xml
+                # appdir-lint in AppImageHub looks for *.appdata.xml specifically.
+                cp "$METAINFO_SOURCE" appdir/usr/share/metainfo/tech.dongdongbh.mindwtr.appdata.xml
+                rm -f appdir/*.metainfo.xml appdir/*.appdata.xml || true
+                echo "Injected AppStream metainfo/appdata in usr/share/metainfo"
+              fi
+
+              # Tauri can emit an empty Categories= entry, which fails AppStream checks.
+              if [ -d appdir/usr/share/applications ]; then
+                for DESKTOP_FILE in appdir/usr/share/applications/*.desktop; do
+                  [ -f "$DESKTOP_FILE" ] || continue
+                  if grep -q '^Categories=$' "$DESKTOP_FILE"; then
+                    sed -i 's/^Categories=$/Categories=Office;Utility;/' "$DESKTOP_FILE"
+                    echo "Patched empty categories in $DESKTOP_FILE"
+                  fi
+                done
+              fi
+
+              # libwayland-client must come from the host Mesa/EGL stack. If the
+              # AppImage bundles the build host copy, newer distros can fail on
+              # startup with EGL_BAD_PARAMETER before the webview is created.
+              while IFS= read -r WAYLAND_CLIENT_LIB; do
+                rm -f "$WAYLAND_CLIENT_LIB"
+                echo "Removed bundled Wayland client library: $WAYLAND_CLIENT_LIB"
+              done < <(find appdir \( -type f -o -type l \) -name 'libwayland-client.so*' | sort)
+
+              # Some Tauri/linuxdeploy builds can leave AppRun.wrapped as 770.
+              # AppImageHub runs the app as an unprivileged user and fails with:
+              # "AppRun.wrapped: Permission denied". Normalize to world-executable.
+              if [ -e appdir/AppRun ]; then
+                chmod 0755 appdir/AppRun
+              fi
+              if [ -e appdir/AppRun.wrapped ]; then
+                chmod 0755 appdir/AppRun.wrapped
+              fi
+
+              ARCH="$RUNNER_ARCH" "$APPIMAGETOOL" \
+                --runtime-file "$RUNTIME_PATH" \
+                appdir fixed.AppImage
+            )
+
+            cp "$APP_WORKDIR/fixed.AppImage" "$APPIMAGE_PATH"
+            chmod +x "$APPIMAGE_PATH"
+            rm -rf "$APP_WORKDIR"
+          done
+
+          rm -rf "$TOOL_WORKDIR"
+        shell: bash
+
+      - name: Normalize deb filename for packaging
+        run: |
+          DEB_PATH=$(find apps/desktop/src-tauri/target/release/bundle/deb -name "*.deb" | head -1)
+          if [ -n "$DEB_PATH" ]; then
+            DIR=$(dirname "$DEB_PATH")
+            BASE=$(basename "$DEB_PATH")
+            LOWER=$(echo "$BASE" | tr 'A-Z' 'a-z')
+            if [ "$BASE" != "$LOWER" ]; then
+              cp "$DEB_PATH" "$DIR/$LOWER"
+            fi
+          fi
+        shell: bash
+
+      - name: Collect Linux artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+
+          TAG_INPUT="${{ inputs.tag || github.event.inputs.tag }}"
+          TAG="${TAG_INPUT:-${GITHUB_REF#refs/tags/}}"
+          VERSION="${TAG#v}"
+          BASE_VERSION="$(python3 -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json", encoding="utf-8"))["version"])')"
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            VERSION="${BASE_VERSION}"
+          fi
+
+          release_asset_name() {
+            local raw="$1"
+            local name
+            name="$(echo "$raw" | tr 'A-Z' 'a-z')"
+            name="${name//_${BASE_VERSION}_/_${VERSION}_}"
+            name="${name//-${BASE_VERSION}-/-${VERSION}-}"
+            printf '%s\n' "$name"
+          }
+
+          APPIMAGE_PATH="$(find apps/desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1 || true)"
+          if [ -n "${APPIMAGE_PATH:-}" ]; then
+            if [ -z "${VERSION:-}" ]; then
+              echo "Failed to resolve AppImage version for naming." >&2
+              exit 1
+            fi
+
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              amd64) ARCH="x86_64" ;;
+              arm64) ARCH="aarch64" ;;
+            esac
+
+            cp "$APPIMAGE_PATH" "release-artifacts/Mindwtr-${VERSION}-${ARCH}.AppImage"
+          fi
+
+          find apps/desktop/src-tauri/target -type f \( -name "*.deb" -o -name "*.rpm" \) -print0 | while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            target="$(release_asset_name "$base")"
+            cp "$f" "release-artifacts/$target"
+          done
+
+          ls -la release-artifacts/ || true
+        shell: bash
+
+      - name: Build Snap
+        timeout-minutes: 15
+        id: snap_build
+        continue-on-error: true
+        run: bash scripts/ci/build-snap.sh
+
+      - name: Report Snap build failure
+        if: steps.snap_build.outcome == 'failure'
+        run: echo "::warning::Snap build failed; continuing with AppImage, deb, and rpm artifacts."
+
+      - name: Add Snap to artifacts
+        if: steps.snap_build.outcome == 'success' && steps.snap_build.outputs.snap != ''
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          TAG_INPUT="${{ inputs.tag || github.event.inputs.tag }}"
+          TAG="${TAG_INPUT:-${GITHUB_REF#refs/tags/}}"
+          VERSION="${TAG#v}"
+          BASE_VERSION="$(python3 -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json", encoding="utf-8"))["version"])')"
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            VERSION="${BASE_VERSION}"
+          fi
+          target="$(basename "${{ steps.snap_build.outputs.snap }}" | tr 'A-Z' 'a-z')"
+          target="${target//_${BASE_VERSION}_/_${VERSION}_}"
+          target="${target//-${BASE_VERSION}-/-${VERSION}-}"
+          cp "${{ steps.snap_build.outputs.snap }}" "release-artifacts/${target}"
+          ls -la release-artifacts/ || true
+        shell: bash
+
+      - name: Publish Snap (stable)
+        if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' && !contains(github.ref_name, '-') && steps.snap_build.outcome == 'success' && steps.snap_build.outputs.snap != ''
+        timeout-minutes: 10
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
+        run: bash scripts/ci/publish-snap.sh "${{ steps.snap_build.outputs.snap }}" stable
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-linux
+          path: release-artifacts/*
+          if-no-files-found: warn
+          retention-days: 28

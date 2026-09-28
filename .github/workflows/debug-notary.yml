@@ -1,0 +1,35 @@
+name: Debug Apple Notarization
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: 'Optional Apple notarization submission id to inspect'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-status:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check Notary History
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SUBMISSION_ID: ${{ github.event.inputs.submission_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SUBMISSION_ID:-}" ]; then
+            xcrun notarytool info "$SUBMISSION_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
+            LOG_PATH="${RUNNER_TEMP}/notary-log-${SUBMISSION_ID}.json"
+            xcrun notarytool log "$SUBMISSION_ID" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" "$LOG_PATH"
+            cat "$LOG_PATH"
+          else
+            xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          fi

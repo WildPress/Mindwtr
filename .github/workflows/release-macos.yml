@@ -1,0 +1,634 @@
+name: Release macOS
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.3)'
+        required: false
+        type: string
+    secrets:
+      APPLE_ID:
+        required: false
+      APPLE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_CERTIFICATE:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_PROVISIONING_PROFILE:
+        required: false
+      VITE_DROPBOX_APP_KEY:
+        required: false
+      ANALYTICS_HEARTBEAT_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.3)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14
+            rust_target: aarch64-apple-darwin
+            artifact_name: release-macos-arm64
+          - platform: macos-15
+            rust_target: x86_64-apple-darwin
+            artifact_name: release-macos-x64
+    runs-on: ${{ matrix.platform }}
+    name: macOS Build (${{ matrix.rust_target }})
+    timeout-minutes: 90
+    env:
+      VITE_DROPBOX_APP_KEY: ${{ vars.VITE_DROPBOX_APP_KEY || secrets.VITE_DROPBOX_APP_KEY }}
+      VITE_FEEDBACK_ENDPOINT_URL: ${{ vars.VITE_FEEDBACK_ENDPOINT_URL || 'https://feedback.mindwtr.app' }}
+      VITE_DONATION_PROMPT_ENABLED: "true"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.event.inputs.tag || github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Ensure macOS SetFile is on PATH
+        run: |
+          if [ -z "$DEVELOPER_DIR" ]; then
+            DEVELOPER_DIR="$(xcode-select -p)"
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          fi
+          export DEVELOPER_DIR
+          SETFILE_PATH="$(xcrun --find SetFile || true)"
+          if [ -n "$SETFILE_PATH" ]; then
+            echo "$(dirname "$SETFILE_PATH")" >> "$GITHUB_PATH"
+          fi
+          which SetFile || true
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "::warning::APPLE_CERTIFICATE secret not set; skipping explicit keychain import."
+            if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+              echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/mindwtr-dev-id.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/mindwtr-dev-id.p12"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+          if [ -f "$LOGIN_KEYCHAIN" ]; then
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN" "/Library/Keychains/System.keychain"
+          else
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "/Library/Keychains/System.keychain"
+          fi
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          if ! printf '%s' "$APPLE_CERTIFICATE" | tr -d '\r' | base64 --decode > "$CERT_PATH" 2>/dev/null; then
+            printf '%s' "$APPLE_CERTIFICATE" | tr -d '\r' | base64 -D > "$CERT_PATH"
+          fi
+
+          if ! openssl pkcs12 -in "$CERT_PATH" -passin "pass:${APPLE_CERTIFICATE_PASSWORD:-}" -nokeys -clcerts >/dev/null 2>&1; then
+            echo "::error::Unable to open APPLE_CERTIFICATE with the provided APPLE_CERTIFICATE_PASSWORD."
+            exit 1
+          fi
+
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "${APPLE_CERTIFICATE_PASSWORD:-}" -A -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,security: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+
+          RESOLVED_IDENTITY="${APPLE_SIGNING_IDENTITY:-}"
+          if [ -z "${RESOLVED_IDENTITY}" ] || [ "${RESOLVED_IDENTITY}" = "Developer ID Application" ]; then
+            RESOLVED_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | sed -n 's/.*"\(Developer ID Application:.*\)".*/\1/p' | head -n 1)"
+          fi
+
+          if [ -z "${RESOLVED_IDENTITY}" ]; then
+            echo "::error::Failed to resolve a Developer ID Application identity from the imported certificate."
+            exit 1
+          fi
+
+          echo "Resolved macOS signing identity: ${RESOLVED_IDENTITY}"
+          echo "APPLE_SIGNING_IDENTITY=${RESOLVED_IDENTITY}" >> "$GITHUB_ENV"
+
+      - name: Install Developer ID provisioning profile
+        env:
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          PROFILE_PATH="$RUNNER_TEMP/mindwtr-dev-id.provisionprofile"
+          PROFILE_PLIST="$RUNNER_TEMP/mindwtr-dev-id-profile.plist"
+          EXPECTED_BUNDLE_ID="tech.dongdongbh.mindwtr"
+          EXPECTED_ICLOUD_CONTAINER="iCloud.tech.dongdongbh.mindwtr"
+
+          rm -f apps/desktop/src-tauri/embedded.provisionprofile
+
+          if [ -z "${APPLE_PROVISIONING_PROFILE:-}" ]; then
+            echo "HAS_APPLE_PROVISIONING_PROFILE=0" >> "$GITHUB_ENV"
+            echo "Developer ID provisioning profile not configured."
+            exit 0
+          fi
+
+          if ! printf '%s' "$APPLE_PROVISIONING_PROFILE" | tr -d '\r' | base64 --decode > "$PROFILE_PATH" 2>/dev/null; then
+            printf '%s' "$APPLE_PROVISIONING_PROFILE" | tr -d '\r' | base64 -D > "$PROFILE_PATH"
+          fi
+
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+
+          profile_field() {
+            local plist_path="$1"
+            local key_path="$2"
+            /usr/libexec/PlistBuddy -c "Print :${key_path}" "$plist_path" 2>/dev/null || true
+          }
+
+          profile_field_fallback() {
+            local plist_path="$1"
+            shift
+            local key_path=""
+            local value=""
+            for key_path in "$@"; do
+              value="$(profile_field "$plist_path" "$key_path")"
+              if [ -n "$value" ]; then
+                printf '%s' "$value"
+                return 0
+              fi
+            done
+            return 0
+          }
+
+          verify_profile_bundle() {
+            local app_id="$1"
+            local expected_bundle_id="$2"
+            local profile_label="$3"
+            local expected_id=""
+            local wildcard_id=""
+            if [ -n "${APPLE_TEAM_ID:-}" ]; then
+              expected_id="${APPLE_TEAM_ID}.${expected_bundle_id}"
+              wildcard_id="${APPLE_TEAM_ID}.*"
+            fi
+
+            if [ -n "$expected_id" ] && [ "$app_id" != "$expected_id" ] && [ "$app_id" != "$wildcard_id" ]; then
+              echo "::error::${profile_label} application-identifier (${app_id}) does not match expected (${expected_id}) or wildcard (${wildcard_id})."
+              exit 1
+            fi
+          }
+
+          PROFILE_NAME="$(profile_field "$PROFILE_PLIST" "Name")"
+          PROFILE_TEAM_ID="$(profile_field_fallback "$PROFILE_PLIST" "TeamIdentifier:0" "Entitlements:com.apple.developer.team-identifier")"
+          PROFILE_APP_ID="$(profile_field_fallback "$PROFILE_PLIST" "Entitlements:application-identifier" "Entitlements:com.apple.application-identifier")"
+          PROFILE_ICLOUD_SERVICES="$(profile_field "$PROFILE_PLIST" "Entitlements:com.apple.developer.icloud-services")"
+          PROFILE_ICLOUD_CONTAINERS="$(profile_field "$PROFILE_PLIST" "Entitlements:com.apple.developer.icloud-container-identifiers")"
+          PROFILE_APS_ENV="$(profile_field "$PROFILE_PLIST" "Entitlements:com.apple.developer.aps-environment")"
+
+          if [ -z "$PROFILE_APP_ID" ]; then
+            echo "::error::Developer ID provisioning profile (${PROFILE_NAME:-unknown}) is missing an application identifier entitlement. Checked Entitlements:application-identifier and Entitlements:com.apple.application-identifier."
+            exit 1
+          fi
+
+          if [ -n "${APPLE_TEAM_ID:-}" ] && [ "$PROFILE_TEAM_ID" != "$APPLE_TEAM_ID" ]; then
+            echo "::error::Developer ID provisioning profile TeamIdentifier (${PROFILE_TEAM_ID}) does not match expected team (${APPLE_TEAM_ID})."
+            exit 1
+          fi
+
+          verify_profile_bundle "$PROFILE_APP_ID" "$EXPECTED_BUNDLE_ID" "Developer ID provisioning profile"
+
+          if ! printf '%s\n' "$PROFILE_ICLOUD_SERVICES" | grep -Eq '(^CloudKit$|^[[:space:]]*CloudKit$|^\*$|^[[:space:]]*\*$)'; then
+            echo "::error::Developer ID provisioning profile (${PROFILE_NAME:-unknown}) is missing the CloudKit entitlement."
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$PROFILE_ICLOUD_CONTAINERS" | grep -Fq "$EXPECTED_ICLOUD_CONTAINER" \
+            && ! printf '%s\n' "$PROFILE_ICLOUD_CONTAINERS" | grep -Eq '^[[:space:]]*\\*[[:space:]]*$'; then
+            echo "::error::Developer ID provisioning profile (${PROFILE_NAME:-unknown}) does not include iCloud container ${EXPECTED_ICLOUD_CONTAINER}."
+            exit 1
+          fi
+
+          if [ "$PROFILE_APS_ENV" != "production" ]; then
+            echo "::error::Developer ID provisioning profile (${PROFILE_NAME:-unknown}) has com.apple.developer.aps-environment='${PROFILE_APS_ENV:-}'. Expected 'production'. APPLE_PROVISIONING_PROFILE may be set to a development profile instead of a Developer ID profile."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/mindwtr-dev-id.provisionprofile"
+          cp "$PROFILE_PATH" apps/desktop/src-tauri/embedded.provisionprofile
+          echo "HAS_APPLE_PROVISIONING_PROFILE=1" >> "$GITHUB_ENV"
+          echo "Installed Developer ID provisioning profile: ${PROFILE_NAME:-unknown}"
+
+      - name: Validate macOS Developer ID entitlements
+        env:
+          APPLE_PROVISIONING_PROFILE: ${{ secrets.APPLE_PROVISIONING_PROFILE }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          path = Path("apps/desktop/src-tauri/Entitlements.mac.plist")
+          entitlements = plistlib.loads(path.read_bytes())
+          expected_values = {
+              "com.apple.application-identifier": "5X9JC5PL7T.tech.dongdongbh.mindwtr",
+              "com.apple.developer.team-identifier": "5X9JC5PL7T",
+              "com.apple.developer.icloud-container-environment": "Production",
+          }
+
+          if "aps-environment" in entitlements:
+              raise SystemExit("Invalid macOS entitlement: use com.apple.developer.aps-environment, not aps-environment")
+
+          advanced_keys = [
+              "com.apple.developer.icloud-services",
+              "com.apple.developer.icloud-container-identifiers",
+              "com.apple.developer.aps-environment",
+          ]
+          requested_advanced = [key for key in advanced_keys if key in entitlements]
+          has_profile = bool(os.environ.get("APPLE_PROVISIONING_PROFILE", "").strip())
+
+          if requested_advanced and not has_profile:
+              raise SystemExit(
+                  "Entitlements.mac.plist requests advanced capabilities "
+                  f"({', '.join(requested_advanced)}) but APPLE_PROVISIONING_PROFILE is not configured. "
+                  "Developer ID builds with CloudKit/push entitlements require an embedded provisioning profile."
+              )
+
+          aps_env = entitlements.get("com.apple.developer.aps-environment")
+          if aps_env not in (None, "production"):
+              raise SystemExit(
+                  f"Invalid com.apple.developer.aps-environment in {path}: expected 'production' or unset, got {aps_env!r}"
+              )
+
+          for key, expected in expected_values.items():
+              actual = entitlements.get(key)
+              if actual != expected:
+                  raise SystemExit(
+                      f"Invalid {key} in {path}: expected {expected!r}, got {actual!r}"
+                  )
+
+          print(f"Validated Developer ID entitlements in {path}")
+          PY
+
+      - name: Prepare macOS release Tauri config
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("apps/desktop/src-tauri/tauri.conf.json")
+          config = json.loads(path.read_text(encoding="utf-8"))
+          mac = config.setdefault("bundle", {}).setdefault("macOS", {})
+          files = mac.get("files")
+          if not isinstance(files, dict):
+            files = {}
+          files.pop("Info.plist", None)
+          if Path("apps/desktop/src-tauri/embedded.provisionprofile").exists():
+            files["embedded.provisionprofile"] = "./embedded.provisionprofile"
+          else:
+            files.pop("embedded.provisionprofile", None)
+          if files:
+            mac["files"] = files
+          else:
+            mac.pop("files", None)
+          mac["infoPlist"] = "./Info.plist"
+          path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+          print("Prepared tauri.conf.json for notarized macOS build")
+          PY
+          grep -n '"infoPlist"\|"files"' apps/desktop/src-tauri/tauri.conf.json || true
+        shell: bash
+
+      - name: Build App
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -n "${KEYCHAIN_PASSWORD:-}" ]; then
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+            if [ -f "$LOGIN_KEYCHAIN" ]; then
+              security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN" "/Library/Keychains/System.keychain"
+            else
+              security list-keychains -d user -s "$KEYCHAIN_PATH" "/Library/Keychains/System.keychain"
+            fi
+            security default-keychain -s "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,security: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          fi
+          cd apps/desktop
+
+          cleanup_dmg_mounts() {
+            # Detach stale Mindwtr DMG mounts that can make hdiutil report "Resource busy".
+            local devices
+            devices="$(hdiutil info | awk '
+              /^\/dev\// { dev=$1 }
+              /\/Volumes\/Mindwtr/ { if (dev != "") print dev }
+            ' | sort -u)"
+            if [ -n "${devices}" ]; then
+              while IFS= read -r dev; do
+                [ -n "${dev}" ] || continue
+                hdiutil detach "${dev}" -force || true
+              done <<< "${devices}"
+            fi
+          }
+
+          for attempt in 1 2 3; do
+            log_file="${RUNNER_TEMP}/tauri-macos-build-${{ matrix.rust_target }}-${attempt}.log"
+            echo "Running macOS bundle build (attempt ${attempt}/3)..."
+            # `--bundles app` only: the widget is embedded into this app below by
+            # "Build and embed macOS widget", and the DMG is then built BY HAND
+            # via scripts/build-macos-dmg.sh -- NOT `tauri bundle --bundles dmg`,
+            # which regenerates and re-signs the .app from the compiled binary,
+            # discarding whatever was embedded into it. Running `tauri bundle`
+            # here, or at any point after the widget step, would silently ship
+            # without the widget (#1054).
+            if bunx tauri build --target ${{ matrix.rust_target }} --bundles app 2>&1 | tee "${log_file}"; then
+              exit 0
+            fi
+
+            if grep -q "hdiutil: create failed - Resource busy" "${log_file}"; then
+              echo "Detected transient hdiutil resource-busy failure. Cleaning stale mounts and retrying..."
+              cleanup_dmg_mounts
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            echo "Non-retryable macOS build failure."
+            exit 1
+          done
+
+          echo "::error::macOS bundle build failed after retries."
+          exit 1
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_ANALYTICS_HEARTBEAT_URL: ${{ secrets.ANALYTICS_HEARTBEAT_URL }}
+          VITE_ANALYTICS_RELEASE_VERSION: ${{ inputs.tag || github.event.inputs.tag || github.ref_name }}
+          TAURI_LOG_LEVEL: "debug"
+          RUST_LOG: "tauri=debug,tauri_bundler=debug,tauri_cli=debug"
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          # Keep bundled whisper bindings on macOS release builds.
+          WHISPER_DONT_GENERATE_BINDINGS: "1"
+          DEVELOPER_DIR: ${{ env.DEVELOPER_DIR }}
+          # build.rs bakes this into the binary as the widget's App Group ID
+          # (team-ID-prefixed). Without it here the shipped binary bakes the
+          # DEVTEAM dev placeholder while the widget step's own entitlements
+          # injection uses the real team ID, and the widget silently never
+          # sees data (#1054).
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Build and embed macOS widget
+        if: env.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found in $APP_DIR"
+            exit 1
+          fi
+          bash scripts/build-macos-widget.sh "$APP_PATH" "$APPLE_TEAM_ID" "$APPLE_SIGNING_IDENTITY" "${{ matrix.rust_target }}"
+        shell: bash
+
+      - name: Verify macOS app signature
+        run: |
+          set -euo pipefail
+          APP_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found in $APP_DIR"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=4 "$APP_PATH"
+          codesign -dvv "$APP_PATH/Contents/MacOS/mindwtr"
+          # A successful link/signature does not prove dyld can resolve Swift.
+          # Check the actual packaged executable for both release architectures.
+          LOAD_COMMANDS="$(otool -l "$APP_PATH/Contents/MacOS/mindwtr")"
+          grep -F 'path /usr/lib/swift (offset' <<< "$LOAD_COMMANDS"
+          ENTITLEMENTS_PATH="$RUNNER_TEMP/macos-app-entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS_PATH" 2>/dev/null || true
+          if ! grep -Fq '<key>com.apple.security.personal-information.calendars</key>' "$ENTITLEMENTS_PATH"; then
+            echo "::error::Signed macOS app is missing the calendar entitlement."
+            echo "Resolved entitlements:"
+            cat "$ENTITLEMENTS_PATH" || true
+            exit 1
+          fi
+          expect_entitlement_value() {
+            local key="$1"
+            local expected="$2"
+            local actual=""
+            actual="$(/usr/libexec/PlistBuddy -c "Print :${key}" "$ENTITLEMENTS_PATH" 2>/dev/null || true)"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Signed macOS app has invalid ${key}. Expected '${expected}', got '${actual}'."
+              echo "Resolved entitlements:"
+              cat "$ENTITLEMENTS_PATH" || true
+              exit 1
+            fi
+          }
+          if [ "${HAS_APPLE_PROVISIONING_PROFILE:-0}" = "1" ]; then
+            if [ ! -f "$APP_PATH/Contents/embedded.provisionprofile" ]; then
+              echo "::error::Signed macOS app is missing embedded.provisionprofile."
+              exit 1
+            fi
+            expect_entitlement_value "com.apple.application-identifier" "5X9JC5PL7T.tech.dongdongbh.mindwtr"
+            expect_entitlement_value "com.apple.developer.team-identifier" "5X9JC5PL7T"
+            expect_entitlement_value "com.apple.developer.icloud-container-environment" "Production"
+            for key in \
+              com.apple.developer.icloud-services \
+              com.apple.developer.icloud-container-identifiers \
+              com.apple.developer.aps-environment; do
+              if ! grep -Fq "<key>${key}</key>" "$ENTITLEMENTS_PATH"; then
+                echo "::error::Signed macOS app is missing expected entitlement ${key}."
+                echo "Resolved entitlements:"
+                cat "$ENTITLEMENTS_PATH" || true
+                exit 1
+              fi
+            done
+          fi
+        shell: bash
+
+      - name: Bundle macOS DMG
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          APP_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found in $APP_DIR"
+            exit 1
+          fi
+          # Packages the exact app built (and widget-embedded, re-signed) above,
+          # unmodified, into a DMG. `tauri bundle --bundles dmg` would instead
+          # regenerate and re-sign the .app from the compiled binary, discarding
+          # the widget embedded into it by "Build and embed macOS widget" (#1054).
+          bash scripts/build-macos-dmg.sh "$APP_PATH" "${{ matrix.rust_target }}" "${APPLE_SIGNING_IDENTITY:-}"
+        shell: bash
+
+      - name: Verify DMG contains the widget
+        if: env.APPLE_SIGNING_IDENTITY != ''
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          DMG_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg"
+          DMG_PATH="$(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' | head -n 1)"
+          if [ -z "${DMG_PATH:-}" ]; then
+            echo "::error::No DMG found in $DMG_DIR to verify."
+            exit 1
+          fi
+          MOUNT_POINT="$RUNNER_TEMP/mindwtr-dmg"
+          mkdir -p "$MOUNT_POINT"
+          trap 'hdiutil detach "$MOUNT_POINT" -force >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$DMG_PATH"
+          APPEX_BINARY="$MOUNT_POINT/Mindwtr.app/Contents/PlugIns/MindwtrWidgets.appex/Contents/MacOS/MindwtrWidgets"
+          if [ ! -f "$APPEX_BINARY" ]; then
+            echo "::error::$DMG_PATH does not contain the widget appex at Contents/PlugIns/MindwtrWidgets.appex -- the widget was dropped from the DMG (#1054)."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$MOUNT_POINT/Mindwtr.app"
+          echo "Verified widget appex is present and signed in $DMG_PATH."
+        shell: bash
+
+      - name: Notarize DMG
+        timeout-minutes: 25
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "Notarization secrets not set; skipping."
+            exit 0
+          fi
+          set -euo pipefail
+          DMG_DIR="apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg"
+          if [ ! -d "$DMG_DIR" ]; then
+            echo "No dmg directory found at $DMG_DIR"
+            exit 1
+          fi
+          found=0
+          for dmg in "$DMG_DIR"/*.dmg; do
+            if [ ! -f "$dmg" ]; then
+              continue
+            fi
+            found=1
+            echo "Submitting $dmg for notarization"
+            submit_output="${RUNNER_TEMP}/$(basename "$dmg").notary.json"
+            xcrun notarytool submit "$dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait \
+              --output-format json | tee "$submit_output"
+
+            submission_id="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("id", ""))' "$submit_output")"
+            submission_status="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("status", ""))' "$submit_output")"
+
+            if [ "$submission_status" != "Accepted" ]; then
+              echo "::error::Notarization failed for $dmg with status: ${submission_status:-unknown}"
+              if [ -n "$submission_id" ]; then
+                log_output="${RUNNER_TEMP}/$(basename "$dmg").notary-log.json"
+                xcrun notarytool log "$submission_id" \
+                  --apple-id "$APPLE_ID" \
+                  --password "$APPLE_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" \
+                  "$log_output" || true
+                if [ -f "$log_output" ]; then
+                  echo "Apple notary log for $dmg:"
+                  cat "$log_output"
+                fi
+              fi
+              exit 1
+            fi
+
+            echo "Stapling $dmg"
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "No dmg files found in $DMG_DIR"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Collect macOS artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          TAG_INPUT="${{ inputs.tag || github.event.inputs.tag }}"
+          TAG="${TAG_INPUT:-${GITHUB_REF#refs/tags/}}"
+          VERSION="${TAG#v}"
+          BASE_VERSION="$(python3 -c 'import json; print(json.load(open("apps/desktop/src-tauri/tauri.conf.json", encoding="utf-8"))["version"])')"
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            VERSION="${BASE_VERSION}"
+          fi
+
+          release_asset_name() {
+            local raw="$1"
+            local name
+            name="$(echo "$raw" | tr 'A-Z' 'a-z')"
+            name="${name//_${BASE_VERSION}_/_${VERSION}_}"
+            name="${name//-${BASE_VERSION}-/-${VERSION}-}"
+            printf '%s\n' "$name"
+          }
+
+          find "apps/desktop/src-tauri/target/${{ matrix.rust_target }}/release/bundle" -type f \( -name "*.dmg" -o -name "*.app.tar.gz" \) -print0 \
+            | while IFS= read -r -d '' f; do
+                base="$(basename "$f")"
+                target="$(release_asset_name "$base")"
+                cp "$f" "release-artifacts/$target"
+              done
+          ls -la release-artifacts/ || true
+        shell: bash
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release-artifacts/*
+          if-no-files-found: warn
+          retention-days: 28

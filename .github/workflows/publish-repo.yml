@@ -1,0 +1,284 @@
+name: Update Linux Repos
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.6.3)"
+        required: true
+        type: string
+      channel:
+        description: "Repo channel to publish into (stable = deb/rpm, beta = deb-beta/rpm-beta)"
+        required: false
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.6.3)"
+        required: false
+        type: string
+      channel:
+        description: "Repo channel to publish into (stable = deb/rpm, beta = deb-beta/rpm-beta)"
+        required: false
+        default: stable
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# All repo publishes serialize on one group regardless of tag: every run pushes
+# to the same gh-pages branch, and two runs on different refs (an RC and a
+# hotfix, say) would otherwise race the push.
+concurrency:
+  group: publish-repo-gh-pages
+  cancel-in-progress: false
+
+jobs:
+  build-repo:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      REPO_CHANNEL: ${{ (github.event_name == 'release' && github.event.release.prerelease || inputs.channel == 'beta') && 'beta' || 'stable' }}
+      REPO_DIR_SUFFIX: ${{ (github.event_name == 'release' && github.event.release.prerelease || inputs.channel == 'beta') && '-beta' || '' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Import GPG Key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Set release tag (release event)
+        if: github.event_name == 'release'
+        run: echo "RELEASE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+
+      - name: Set release tag (manual)
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "RELEASE_TAG=${{ inputs.tag }}" >> $GITHUB_ENV
+      
+      - name: Set release tag (workflow call)
+        if: github.event_name == 'workflow_call'
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Set release tag (push)
+        if: github.event_name == 'push'
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download Release Assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          MAX_RETRIES=5
+          for attempt in $(seq 1 "${MAX_RETRIES}"); do
+            echo "Downloading release assets for ${TAG} (attempt ${attempt}/${MAX_RETRIES})"
+            if gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "*" \
+              --clobber; then
+              echo "Release assets downloaded successfully."
+              break
+            fi
+            if [ "${attempt}" -eq "${MAX_RETRIES}" ]; then
+              echo "Failed to download release assets after ${MAX_RETRIES} attempts." >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+      - name: Prepare Repo Directories
+        run: |
+          set -euo pipefail
+          # Beta packages live in sibling deb-beta/rpm-beta trees so RC installs
+          # are opt-in; the stable deb/rpm trees are never touched by RC runs.
+          mkdir -p "build_repo/deb${REPO_DIR_SUFFIX}" "build_repo/rpm${REPO_DIR_SUFFIX}"
+          shopt -s nullglob
+          debs=( *.deb )
+          rpms=( *.rpm )
+          if (( ${#debs[@]} > 0 )); then mv -- "${debs[@]}" "build_repo/deb${REPO_DIR_SUFFIX}/"; fi
+          if (( ${#rpms[@]} > 0 )); then mv -- "${rpms[@]}" "build_repo/rpm${REPO_DIR_SUFFIX}/"; fi
+          gpg --armor --export > build_repo/mindwtr.gpg.key
+
+      - name: Normalize prerelease package versions
+        run: |
+          set -euo pipefail
+          # RC packages carry the stable base version in their metadata (store
+          # rules keep tauri.conf.json pinned to e.g. 1.1.0), so an RC and its
+          # final stable advertise the same Version to apt/dnf and beta-repo
+          # users would never be offered the stable upgrade. Rewrite the
+          # packaging version to base~rc.N: the tilde sorts below the bare base
+          # version for both dpkg and rpm, so stable supersedes every RC.
+          TAG="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          VERSION="${TAG#v}"
+          case "$VERSION" in
+            *-*) PKG_VERSION="${VERSION/-/\~}" ;;
+            *)
+              echo "Stable release ${VERSION}; package versions stay as built."
+              exit 0
+              ;;
+          esac
+          echo "Prerelease ${VERSION}: rewriting package versions to ${PKG_VERSION}"
+          shopt -s nullglob
+          debs=( build_repo/deb*/*.deb )
+          rpms=( build_repo/rpm*/*.rpm )
+          for deb in "${debs[@]}"; do
+            workdir="$(mktemp -d)"
+            dpkg-deb -R "$deb" "$workdir"
+            sed -i "s/^Version:.*/Version: ${PKG_VERSION}/" "$workdir/DEBIAN/control"
+            dpkg-deb -b --root-owner-group "$workdir" "$deb"
+            rm -rf "$workdir"
+            echo "Stamped $(basename "$deb") as Version ${PKG_VERSION}"
+          done
+          if (( ${#rpms[@]} > 0 )); then
+            docker run --rm \
+              -e "PKG_VERSION=${PKG_VERSION}" \
+              -v "$PWD:/work" \
+              -w /work \
+              fedora@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814 \
+              bash -lc '
+                set -euo pipefail
+                dnf -q install -y rpmrebuild >/dev/null
+                shopt -s nullglob
+                rpms=( /work/build_repo/rpm*/*.rpm )
+                for rpmfile in "${rpms[@]}"; do
+                  outdir="$(mktemp -d)"
+                  rpmrebuild --notest-install --directory="$outdir" \
+                    --change-spec-preamble="sed -e '\''s/^Version:.*/Version: ${PKG_VERSION}/'\''" \
+                    -p "$rpmfile"
+                  rebuilt="$(find "$outdir" -name "*.rpm" -type f | head -n 1)"
+                  if [ -z "$rebuilt" ]; then
+                    echo "rpmrebuild produced no package for $rpmfile" >&2
+                    exit 1
+                  fi
+                  mv "$rebuilt" "$rpmfile"
+                  rm -rf "$outdir"
+                  echo "Stamped $(basename "$rpmfile") as Version ${PKG_VERSION}"
+                done
+              '
+          fi
+
+      - name: Build DEB Repo
+        working-directory: build_repo/deb${{ env.REPO_DIR_SUFFIX }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils
+          apt-ftparchive packages . > Packages
+          apt-ftparchive release . > Release
+          gpg --batch --yes --clearsign -o InRelease Release
+          gpg --batch --yes -abs -o Release.gpg Release
+
+      - name: Build RPM Repo
+        working-directory: build_repo/rpm${{ env.REPO_DIR_SUFFIX }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y createrepo-c
+          createrepo_c .
+          if [ -f repodata/repomd.xml ]; then
+            gpg --batch --yes --armor --detach-sign -o repodata/repomd.xml.asc repodata/repomd.xml
+          else
+            echo "repodata/repomd.xml not found after createrepo_c" >&2
+            exit 1
+          fi
+
+      - name: Deploy to GitHub Pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          pages_dir="$(mktemp -d)"
+
+          cleanup() {
+            git worktree remove --force "$pages_dir" >/dev/null 2>&1 || true
+            rm -rf "$pages_dir"
+          }
+
+          trap cleanup EXIT
+
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages >/dev/null 2>&1 || true
+
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add --track -B gh-pages "$pages_dir" origin/gh-pages
+          else
+            git worktree add --detach "$pages_dir"
+            git -C "$pages_dir" checkout --orphan gh-pages
+            find "$pages_dir" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+          fi
+
+          git -C "$pages_dir" config user.name "GitHub Actions"
+          git -C "$pages_dir" config user.email "actions@github.com"
+
+          stage_repo() {
+            # Each publish regenerates its channel's index from scratch, so the
+            # channel dir must mirror this release exactly: --delete drops
+            # superseded pool packages and stale repodata that would otherwise
+            # accumulate unindexed forever. Other channels' dirs and root files
+            # (GPG key) are left untouched.
+            local channel_dir name
+            for channel_dir in ./build_repo/*/; do
+              name="$(basename "$channel_dir")"
+              mkdir -p "$pages_dir/$name"
+              rsync -a --delete "$channel_dir" "$pages_dir/$name/"
+            done
+            rsync -a --exclude='*/' ./build_repo/ "$pages_dir"/
+            touch "$pages_dir/.nojekyll"
+          }
+
+          for attempt in 1 2 3; do
+            if [ "$attempt" -gt 1 ]; then
+              echo "Retrying gh-pages publish (attempt ${attempt}/3) on the latest branch tip"
+              sleep $((attempt * 5))
+              if git fetch origin gh-pages:refs/remotes/origin/gh-pages 2>/dev/null; then
+                git -C "$pages_dir" reset --hard origin/gh-pages
+              fi
+            fi
+
+            stage_repo
+            git -C "$pages_dir" add -A
+
+            tree="$(git -C "$pages_dir" write-tree)"
+
+            if git -C "$pages_dir" rev-parse --verify --quiet refs/remotes/origin/gh-pages >/dev/null \
+              && [ "$tree" = "$(git -C "$pages_dir" rev-parse "refs/remotes/origin/gh-pages^{tree}")" ]; then
+              echo "gh-pages already up to date."
+              exit 0
+            fi
+
+            # gh-pages holds generated output only, so it is published as a
+            # single parentless commit and force-pushed. Keeping history would
+            # retain every superseded .deb/.rpm forever (~35 MB per release,
+            # 1.5 GB by v1.1.5) in a branch every `git clone` fetches. The
+            # concurrency group serializes publishes, and the retry below
+            # re-fetches before restaging, so the force-push cannot clobber a
+            # concurrent one.
+            commit="$(git -C "$pages_dir" commit-tree "$tree" \
+              -m "Publish Linux ${REPO_CHANNEL} repos for ${RELEASE_TAG:-${GITHUB_REF_NAME}}")"
+
+            if git -C "$pages_dir" push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$commit:refs/heads/gh-pages"; then
+              exit 0
+            fi
+          done
+
+          echo "Failed to publish gh-pages after 3 attempts." >&2
+          exit 1

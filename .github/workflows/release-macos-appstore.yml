@@ -1,0 +1,1050 @@
+name: Release macOS App Store
+
+on:
+  workflow_call:
+    inputs:
+      phased_release:
+        description: Release App Store updates gradually over seven days
+        required: false
+        type: boolean
+        default: true
+      tag:
+        description: Release tag (e.g., v1.0.5 or v1.0.5-rc.1)
+        required: false
+        type: string
+      upload:
+        description: Upload to App Store Connect
+        required: false
+        type: boolean
+        default: true
+      submit_for_review:
+        description: Submit build for review after upload
+        required: false
+        type: boolean
+        default: true
+      distribute_testflight:
+        description: Distribute the uploaded build to the configured TestFlight external group without App Store review submission
+        required: false
+        type: boolean
+        default: false
+      testflight_group:
+        description: TestFlight external group for review-blocked uploads
+        required: false
+        type: string
+        default: 'external_testing'
+      skip_screenshots:
+        description: Skip App Store screenshot upload
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      phased_release:
+        description: Release App Store updates gradually over seven days
+        required: false
+        type: boolean
+        default: true
+      tag:
+        description: Release tag (e.g., v1.0.5 or v1.0.5-rc.1)
+        required: false
+        type: string
+      upload:
+        description: Upload to App Store Connect
+        required: false
+        type: boolean
+        default: true
+      submit_for_review:
+        description: Submit build for review after upload
+        required: false
+        type: boolean
+        default: true
+      distribute_testflight:
+        description: Distribute the uploaded build to the configured TestFlight external group without App Store review submission
+        required: false
+        type: boolean
+        default: false
+      testflight_group:
+        description: TestFlight external group for review-blocked uploads
+        required: false
+        type: string
+        default: 'external_testing'
+      skip_screenshots:
+        description: Skip App Store screenshot upload
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: release-macos-appstore-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos-appstore:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      EXPECTED_BUNDLE_ID: tech.dongdongbh.mindwtr
+      VITE_DROPBOX_APP_KEY: ${{ vars.VITE_DROPBOX_APP_KEY || secrets.VITE_DROPBOX_APP_KEY }}
+      VITE_FEEDBACK_ENDPOINT_URL: ${{ vars.VITE_FEEDBACK_ENDPOINT_URL || 'https://feedback.mindwtr.app' }}
+      VITE_DONATION_PROMPT_ENABLED: "true"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.event.inputs.tag || github.ref }}
+
+      - name: Setup Ruby
+        run: bash scripts/ci/setup-ruby.sh 3.3
+
+      - name: Install locked Fastlane bundle
+        run: |
+          set -euo pipefail
+          gem install bundler --version 4.0.3 --no-document
+          bundle config set --local path vendor/bundle
+          bundle config set --local frozen true
+          bundle install --jobs 4 --retry 3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Intel Rust target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+
+      - name: Validate required secrets
+        env:
+          MAS_CERTIFICATE: ${{ secrets.MAS_CERTIFICATE }}
+          MAS_CERTIFICATE_BASE64: ${{ secrets.MAS_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          MAS_CERTIFICATE_PWD: ${{ secrets.MAS_CERTIFICATE_PWD }}
+          MAS_CERTIFICATE_PASSWORD: ${{ secrets.MAS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MAS_INSTALLER_CERTIFICATE: ${{ secrets.MAS_INSTALLER_CERTIFICATE }}
+          MAS_INSTALLER_CERT_PWD: ${{ secrets.MAS_INSTALLER_CERT_PWD }}
+          MAS_INSTALLER_CERT_PASSWORD: ${{ secrets.MAS_INSTALLER_CERT_PASSWORD }}
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+          MAS_SIGNING_IDENTITY: ${{ secrets.MAS_SIGNING_IDENTITY }}
+          # Optional (#1054): base64 of a Mac App Store provisioning profile for
+          # the widget extension's App ID tech.dongdongbh.mindwtr.MindwtrWidgets
+          # (developer portal: register that App ID, create a "Mac App Store
+          # Connect" profile for it, `base64 -i <file>.provisionprofile`). When
+          # set, the .pkg ships Contents/PlugIns/MindwtrWidgets.appex; when
+          # unset, the build is exactly the widget-less one it always was.
+          MAS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.MAS_WIDGET_PROVISIONING_PROFILE }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MAS_WIDGET_PROVISIONING_PROFILE:-}" ]; then
+            echo "HAS_MAS_WIDGET_PROFILE=1" >> "$GITHUB_ENV"
+            echo "MAS_WIDGET_PROVISIONING_PROFILE is set: the App Store build will embed the macOS widget (#1054)."
+            if [ -z "${APPLE_TEAM_ID:-}" ]; then
+              echo "::error::MAS_WIDGET_PROVISIONING_PROFILE is set but APPLE_TEAM_ID is missing; the widget's App Group is derived from the team ID."
+              exit 1
+            fi
+          else
+            echo "HAS_MAS_WIDGET_PROFILE=0" >> "$GITHUB_ENV"
+            echo "MAS_WIDGET_PROVISIONING_PROFILE is not set: the App Store build ships without the macOS widget (#1054)."
+          fi
+          CERT_B64="${MAS_CERTIFICATE:-${MAS_CERTIFICATE_BASE64:-${APPLE_CERTIFICATE:-}}}"
+          CERT_PWD="${MAS_CERTIFICATE_PWD:-${MAS_CERTIFICATE_PASSWORD:-${APPLE_CERTIFICATE_PASSWORD:-}}}"
+          INSTALLER_CERT_B64="${MAS_INSTALLER_CERTIFICATE:-}"
+          INSTALLER_CERT_PWD="${MAS_INSTALLER_CERT_PWD:-${MAS_INSTALLER_CERT_PASSWORD:-}}"
+          missing=0
+          for key in MAS_PROVISIONING_PROFILE MAS_SIGNING_IDENTITY; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required secret: $key"
+              missing=1
+            fi
+          done
+          for key in IOS_ASC_KEY_ID IOS_ASC_ISSUER_ID IOS_ASC_PRIVATE_KEY; do
+            if [ -z "${!key:-}" ]; then
+              echo "::error::Missing required App Store Connect API secret: $key"
+              missing=1
+            fi
+          done
+          if [ -z "${CERT_B64:-}" ]; then
+            echo "::error::Missing signing certificate secret. Set MAS_CERTIFICATE (or MAS_CERTIFICATE_BASE64)."
+            missing=1
+          fi
+          if [ -z "${INSTALLER_CERT_B64:-}" ]; then
+            echo "::error::Missing installer certificate secret. Set MAS_INSTALLER_CERTIFICATE."
+            missing=1
+          fi
+          if [ -z "${CERT_PWD:-}" ]; then
+            echo "::warning::No certificate password secret found (MAS_CERTIFICATE_PWD / MAS_CERTIFICATE_PASSWORD / APPLE_CERTIFICATE_PASSWORD)."
+            echo "::warning::This is valid only if the exported .p12 has an empty password."
+          fi
+          if [ -z "${INSTALLER_CERT_PWD:-}" ]; then
+            echo "::warning::No installer certificate password secret found (MAS_INSTALLER_CERT_PWD / MAS_INSTALLER_CERT_PASSWORD)."
+            echo "::warning::This is valid only if the installer .p12 has an empty password."
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Import Mac App Store certificates
+        env:
+          MAS_CERTIFICATE: ${{ secrets.MAS_CERTIFICATE }}
+          MAS_CERTIFICATE_BASE64: ${{ secrets.MAS_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          MAS_CERTIFICATE_PWD: ${{ secrets.MAS_CERTIFICATE_PWD }}
+          MAS_CERTIFICATE_PASSWORD: ${{ secrets.MAS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          MAS_INSTALLER_CERTIFICATE: ${{ secrets.MAS_INSTALLER_CERTIFICATE }}
+          MAS_INSTALLER_CERT_PWD: ${{ secrets.MAS_INSTALLER_CERT_PWD }}
+          MAS_INSTALLER_CERT_PASSWORD: ${{ secrets.MAS_INSTALLER_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP_CERT_B64="${MAS_CERTIFICATE:-${MAS_CERTIFICATE_BASE64:-${APPLE_CERTIFICATE:-}}}"
+          APP_CERT_PWD="${MAS_CERTIFICATE_PWD:-${MAS_CERTIFICATE_PASSWORD:-${APPLE_CERTIFICATE_PASSWORD:-}}}"
+          INSTALLER_CERT_B64="${MAS_INSTALLER_CERTIFICATE:-}"
+          INSTALLER_CERT_PWD="${MAS_INSTALLER_CERT_PWD:-${MAS_INSTALLER_CERT_PASSWORD:-}}"
+          KEYCHAIN_PATH="$RUNNER_TEMP/mindwtr-mas.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+          if [ -f "$LOGIN_KEYCHAIN" ]; then
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN" "/Library/Keychains/System.keychain"
+          else
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "/Library/Keychains/System.keychain"
+          fi
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          APP_CERT_PATH="$RUNNER_TEMP/mas-app-signing.p12"
+          if ! printf '%s' "$APP_CERT_B64" | tr -d '\r' | base64 --decode > "$APP_CERT_PATH" 2>/dev/null; then
+            printf '%s' "$APP_CERT_B64" | tr -d '\r' | base64 -D > "$APP_CERT_PATH"
+          fi
+
+          INSTALLER_CERT_PATH="$RUNNER_TEMP/mas-installer-signing.p12"
+          if ! printf '%s' "$INSTALLER_CERT_B64" | tr -d '\r' | base64 --decode > "$INSTALLER_CERT_PATH" 2>/dev/null; then
+            printf '%s' "$INSTALLER_CERT_B64" | tr -d '\r' | base64 -D > "$INSTALLER_CERT_PATH"
+          fi
+
+          if ! openssl pkcs12 -in "$APP_CERT_PATH" -passin "pass:${APP_CERT_PWD:-}" -nokeys -clcerts >/dev/null 2>&1; then
+            echo "::error::Unable to open the decoded .p12 with the provided password."
+            echo "::error::Re-export your Apple Distribution certificate as .p12 and update the matching password secret."
+            exit 1
+          fi
+
+          if ! openssl pkcs12 -in "$INSTALLER_CERT_PATH" -passin "pass:${INSTALLER_CERT_PWD:-}" -nokeys -clcerts >/dev/null 2>&1; then
+            echo "::error::Unable to open installer .p12 with the provided password."
+            echo "::error::Re-export your Mac Installer Distribution certificate as .p12 and update MAS_INSTALLER_CERT_PWD."
+            exit 1
+          fi
+
+          security import "$APP_CERT_PATH" -k "$KEYCHAIN_PATH" -P "${APP_CERT_PWD:-}" -A -T /usr/bin/codesign -T /usr/bin/security
+          security import "$INSTALLER_CERT_PATH" -k "$KEYCHAIN_PATH" -P "${INSTALLER_CERT_PWD:-}" -A -T /usr/bin/productbuild -T /usr/bin/pkgbuild -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,pkgbuild: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p basic "$KEYCHAIN_PATH" || true
+
+      - name: Install provisioning profile
+        env:
+          MAS_PROVISIONING_PROFILE: ${{ secrets.MAS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          PROFILE_PATH="$RUNNER_TEMP/mindwtr-mas.provisionprofile"
+          if ! echo "$MAS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH" 2>/dev/null; then
+            echo "$MAS_PROVISIONING_PROFILE" | base64 -D > "$PROFILE_PATH"
+          fi
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/mindwtr-mas.provisionprofile"
+          cp "$PROFILE_PATH" apps/desktop/src-tauri/embedded.provisionprofile
+
+      - name: Resolve macOS version metadata
+        env:
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          APP_VERSION="$(jq -r '.version // empty' apps/desktop/src-tauri/tauri.conf.json)"
+          if [ -z "${APP_VERSION}" ]; then
+            echo "::error::Missing version in apps/desktop/src-tauri/tauri.conf.json"
+            exit 1
+          fi
+
+          LOCAL_MIN_BUILD=1
+          EXISTING_BUNDLE_VERSION="$(jq -r '.bundle.macOS.bundleVersion // empty' apps/desktop/src-tauri/tauri.appstore.conf.json)"
+          if [[ "${EXISTING_BUNDLE_VERSION}" =~ ^[0-9]+$ ]]; then
+            LOCAL_MIN_BUILD="$((EXISTING_BUNDLE_VERSION + 1))"
+          fi
+
+          APPSTORE_APP_ID=""
+          REMOTE_MAX_BUILD=0
+          REMOTE_LOOKUP_STATUS="skipped"
+
+          ASC_KEY_ID="$(printf '%s' "$IOS_ASC_KEY_ID" | tr -d '\r\n\t ')"
+          ASC_ISSUER_ID="$(printf '%s' "$IOS_ASC_ISSUER_ID" | tr -d '\r\n\t ')"
+          KEY_PATH="$RUNNER_TEMP/macos-asc-key-versioning.p8"
+          bash scripts/ci/write-asc-private-key.sh "$IOS_ASC_PRIVATE_KEY" "$KEY_PATH"
+
+          if ! openssl pkey -in "$KEY_PATH" -noout >/dev/null 2>&1; then
+            echo "::warning::IOS_ASC_PRIVATE_KEY is not a valid .p8 key; skipping remote build-number lookup."
+            REMOTE_LOOKUP_STATUS="invalid_key"
+          else
+            ASC_API_TMP_PREFIX="asc-macos-versioning"
+            source scripts/ci/asc-api-utils.sh
+
+            if ! ASC_TOKEN="$(
+              node scripts/ci/generate-asc-jwt.js "$ASC_KEY_ID" "$ASC_ISSUER_ID" "$KEY_PATH"
+            )"; then
+              echo "::warning::Failed to generate App Store Connect JWT from IOS_ASC_* secrets."
+              REMOTE_LOOKUP_STATUS="invalid_jwt"
+            fi
+
+            APP_LOOKUP_JSON_FILE="$RUNNER_TEMP/asc-macos-app-lookup.json"
+            if [ "${REMOTE_LOOKUP_STATUS}" != "invalid_jwt" ]; then
+              if api_get "$APP_LOOKUP_JSON_FILE" -G \
+                -H "Authorization: Bearer ${ASC_TOKEN}" \
+                --data-urlencode "filter[bundleId]=${EXPECTED_BUNDLE_ID}" \
+                --data-urlencode "limit=1" \
+                "https://api.appstoreconnect.apple.com/v1/apps"; then
+                APPSTORE_APP_ID="$(jq -r '.data[0].id // empty' "$APP_LOOKUP_JSON_FILE")"
+                if [ -n "${APPSTORE_APP_ID}" ]; then
+                  BUILDS_JSON_FILE="$RUNNER_TEMP/asc-macos-builds-page.json"
+                  if api_get "$BUILDS_JSON_FILE" -G \
+                    -H "Authorization: Bearer ${ASC_TOKEN}" \
+                    --data-urlencode "filter[app]=${APPSTORE_APP_ID}" \
+                    --data-urlencode "limit=200" \
+                    "https://api.appstoreconnect.apple.com/v1/builds"; then
+                    while : ; do
+                      PAGE_MAX="$(jq -r '[.data[]?.attributes.version | select(type=="string") | select(test("^[0-9]+$")) | tonumber] | max // 0' "$BUILDS_JSON_FILE")"
+                      if [ "${PAGE_MAX}" -gt "${REMOTE_MAX_BUILD}" ]; then
+                        REMOTE_MAX_BUILD="${PAGE_MAX}"
+                      fi
+                      NEXT_URL="$(jq -r '.links.next // empty' "$BUILDS_JSON_FILE")"
+                      if [ -z "${NEXT_URL}" ]; then
+                        REMOTE_LOOKUP_STATUS="ok"
+                        break
+                      fi
+                      if ! api_get "$BUILDS_JSON_FILE" -g -H "Authorization: Bearer ${ASC_TOKEN}" "$NEXT_URL"; then
+                        REMOTE_LOOKUP_STATUS="api_error"
+                        break
+                      fi
+                    done
+                  else
+                    REMOTE_LOOKUP_STATUS="api_error"
+                  fi
+                else
+                  echo "::warning::App Store Connect app lookup returned no app for bundle id ${EXPECTED_BUNDLE_ID}."
+                  REMOTE_LOOKUP_STATUS="no_app"
+                fi
+              else
+                REMOTE_LOOKUP_STATUS="api_error"
+              fi
+            fi
+          fi
+
+          REMOTE_MIN_BUILD="$((REMOTE_MAX_BUILD + 1))"
+          FINAL_BUILD_NUMBER="${LOCAL_MIN_BUILD}"
+          if [ "${REMOTE_MIN_BUILD}" -gt "${FINAL_BUILD_NUMBER}" ]; then
+            FINAL_BUILD_NUMBER="${REMOTE_MIN_BUILD}"
+          fi
+
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+          echo "APP_BUILD_NUMBER=${FINAL_BUILD_NUMBER}" >> "$GITHUB_ENV"
+          echo "APPSTORE_APP_ID=${APPSTORE_APP_ID:-}" >> "$GITHUB_ENV"
+          echo "Resolved macOS build number: ${FINAL_BUILD_NUMBER} (remote max: ${REMOTE_MAX_BUILD}, remote lookup: ${REMOTE_LOOKUP_STATUS}, local floor: ${LOCAL_MIN_BUILD})"
+
+          APPSTORE_CONFIG_PATH="apps/desktop/src-tauri/tauri.appstore.conf.json"
+          APP_BUILD_NUMBER="${FINAL_BUILD_NUMBER}" APPSTORE_CONFIG_PATH="${APPSTORE_CONFIG_PATH}" node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const filePath = path.resolve(process.env.APPSTORE_CONFIG_PATH);
+          const buildNumber = process.env.APP_BUILD_NUMBER;
+          const config = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+          config.bundle = config.bundle || {};
+          config.bundle.macOS = config.bundle.macOS || {};
+          config.bundle.macOS.bundleVersion = String(buildNumber);
+          fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n');
+          console.log(`Updated ${filePath} bundle.macOS.bundleVersion -> ${buildNumber}`);
+          NODE
+
+      - name: Prepare macOS App Store Tauri config
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const prepareMacConfig = (filePath, infoPlistPath) => {
+            const config = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            const mac = ((config.bundle ??= {}).macOS ??= {});
+            const files = mac.files;
+
+            if (files && typeof files === 'object' && !Array.isArray(files)) {
+              delete files['Info.plist'];
+              if (Object.keys(files).length === 0) {
+                delete mac.files;
+              } else {
+                mac.files = files;
+              }
+            }
+
+            mac.infoPlist = infoPlistPath;
+            fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n');
+          };
+
+          prepareMacConfig(path.resolve('apps/desktop/src-tauri/tauri.conf.json'), './Info.plist');
+          prepareMacConfig(path.resolve('apps/desktop/src-tauri/tauri.appstore.conf.json'), './Info.appstore.plist');
+          console.log('Prepared Tauri configs for macOS App Store build');
+          NODE
+          grep -n '"infoPlist"\|"files"' apps/desktop/src-tauri/tauri.conf.json || true
+          grep -n '"infoPlist"\|"files"' apps/desktop/src-tauri/tauri.appstore.conf.json || true
+
+      - name: Drop the widget App Group from App Store entitlements
+        if: env.HAS_MAS_WIDGET_PROFILE != '1'
+        run: |
+          # Entitlements.mas.plist carries the __MINDWTR_MACOS_APP_GROUP__
+          # placeholder for the widget (#1054); only the widget embed step
+          # resolves it. Without the widget the placeholder would be signed
+          # into the host as-is and App Store Connect rejects app-group values
+          # that are not team-ID-prefixed, so remove the key to keep this
+          # build identical to the widget-less one.
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          path = Path("apps/desktop/src-tauri/Entitlements.mas.plist")
+          entitlements = plistlib.loads(path.read_bytes())
+          removed = entitlements.pop("com.apple.security.application-groups", None)
+          path.write_bytes(plistlib.dumps(entitlements))
+          print(f"Removed application-groups {removed!r} from {path} (no widget provisioning profile)")
+          PY
+
+      - name: Validate Mac App Store entitlements
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          path = Path("apps/desktop/src-tauri/Entitlements.mas.plist")
+          entitlements = plistlib.loads(path.read_bytes())
+
+          if "aps-environment" in entitlements:
+              raise SystemExit("Invalid macOS entitlement: use com.apple.developer.aps-environment, not aps-environment")
+
+          aps_env = entitlements.get("com.apple.developer.aps-environment")
+          if aps_env != "production":
+              raise SystemExit(
+                  f"Invalid com.apple.developer.aps-environment in {path}: expected 'production', got {aps_env!r}"
+              )
+
+          icloud_env = entitlements.get("com.apple.developer.icloud-container-environment")
+          if icloud_env != "Production":
+              raise SystemExit(
+                  f"Invalid com.apple.developer.icloud-container-environment in {path}: expected 'Production', got {icloud_env!r}"
+              )
+
+          print(f"Validated Mac App Store entitlements in {path}")
+          PY
+
+      - name: Build signed macOS app bundle (App Store)
+        timeout-minutes: 45
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MAS_SIGNING_IDENTITY }}
+          VITE_ANALYTICS_HEARTBEAT_URL: ${{ secrets.ANALYTICS_HEARTBEAT_URL }}
+          VITE_ANALYTICS_RELEASE_VERSION: ${{ inputs.tag || github.ref_name }}
+          TAURI_LOG_LEVEL: debug
+          SOURCE_DATE_EPOCH: "1"
+          # Bundled whisper bindings are only needed on this macOS build path.
+          # Linux/AUR source builds must generate native bindings instead.
+          WHISPER_DONT_GENERATE_BINDINGS: "1"
+          # build.rs bakes this into the binary as the widget's App Group ID
+          # (team-ID-prefixed). Only set when the widget actually ships so a
+          # build without the widget profile keeps the DEVTEAM placeholder and
+          # is byte-for-byte the build it always was (#1054).
+          APPLE_TEAM_ID: ${{ env.HAS_MAS_WIDGET_PROFILE == '1' && secrets.APPLE_TEAM_ID || '' }}
+        run: |
+          set -euo pipefail
+          # rust-cache can restore stale CMake cache where GGML_NATIVE stayed ON.
+          # Clear whisper-rs-sys build dirs so GGML_NATIVE_DEFAULT=OFF is applied.
+          if [ -d apps/desktop/src-tauri/target ]; then
+            find apps/desktop/src-tauri/target -type d -path '*/build/whisper-rs-sys-*' -prune -exec rm -rf {} +
+          fi
+          cd apps/desktop
+          # Pin the scoped CLI package: bare `bunx tauri` on a checkout whose lockfile
+          # lacks @tauri-apps/cli falls back to the npm `tauri` v1 package, which
+          # compiles sharp/libvips from source and fails on macOS runners.
+          bunx @tauri-apps/cli@2.11.3 build \
+            --target universal-apple-darwin \
+            --bundles app \
+            --config src-tauri/tauri.appstore.conf.json
+
+      - name: Build and embed macOS widget (App Store)
+        if: env.HAS_MAS_WIDGET_PROFILE == '1'
+        timeout-minutes: 15
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MAS_SIGNING_IDENTITY: ${{ secrets.MAS_SIGNING_IDENTITY }}
+          MAS_WIDGET_PROVISIONING_PROFILE: ${{ secrets.MAS_WIDGET_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          WIDGET_PROFILE_PATH="$RUNNER_TEMP/mindwtr-mas-widget.provisionprofile"
+          if ! echo "$MAS_WIDGET_PROVISIONING_PROFILE" | base64 --decode > "$WIDGET_PROFILE_PATH" 2>/dev/null; then
+            echo "$MAS_WIDGET_PROVISIONING_PROFILE" | base64 -D > "$WIDGET_PROFILE_PATH"
+          fi
+          APP_PATH="$(find apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found"
+            exit 1
+          fi
+          # Modifies the .app in place. Nothing after this step may run
+          # `tauri build`/`tauri bundle` again: productbuild below packages
+          # this exact app, and a Tauri re-bundle would regenerate the .app
+          # from the binary and drop the widget (#1054).
+          MINDWTR_WIDGET_DISTRIBUTION=appstore \
+          MINDWTR_WIDGET_PROVISIONING_PROFILE="$WIDGET_PROFILE_PATH" \
+          bash scripts/build-macos-widget.sh "$APP_PATH" "$APPLE_TEAM_ID" "$MAS_SIGNING_IDENTITY" universal-apple-darwin
+
+      - name: Verify App Store app contains the widget
+        if: env.HAS_MAS_WIDGET_PROFILE == '1'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found"
+            exit 1
+          fi
+          APPEX_PATH="$APP_PATH/Contents/PlugIns/MindwtrWidgets.appex"
+          if [ ! -f "$APPEX_PATH/Contents/MacOS/MindwtrWidgets" ]; then
+            echo "::error::$APP_PATH does not contain the widget appex at Contents/PlugIns/MindwtrWidgets.appex (#1054)."
+            exit 1
+          fi
+          if [ ! -f "$APPEX_PATH/Contents/embedded.provisionprofile" ]; then
+            echo "::error::Widget appex is missing Contents/embedded.provisionprofile; App Store Connect rejects nested bundles without their own profile."
+            exit 1
+          fi
+          WIDGET_DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APPEX_PATH/Contents/Info.plist" 2>/dev/null || true)"
+          if [ -z "$WIDGET_DISPLAY_NAME" ]; then
+            echo "::error::Widget appex Info.plist is missing CFBundleDisplayName; App Store Connect rejects the package."
+            exit 1
+          fi
+          NM_OUTPUT="$(nm "$APPEX_PATH/Contents/MacOS/MindwtrWidgets")"
+          if ! grep -q '[[:space:]]_NSExtensionMain$' <<< "$NM_OUTPUT"; then
+            echo "::error::Widget appex does not reference the required _NSExtensionMain app-extension entry point; App Store Connect rejects the package."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=4 "$APP_PATH"
+          APP_GROUP="${APPLE_TEAM_ID}.tech.dongdongbh.mindwtr"
+          HOST_ENTITLEMENTS_PATH="$RUNNER_TEMP/mas-host-entitlements.plist"
+          APPEX_ENTITLEMENTS_PATH="$RUNNER_TEMP/mas-widget-entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$HOST_ENTITLEMENTS_PATH" 2>/dev/null || true
+          codesign -d --entitlements :- "$APPEX_PATH" > "$APPEX_ENTITLEMENTS_PATH" 2>/dev/null || true
+          expect_entitlement() {
+            local file="$1"
+            local label="$2"
+            local needle="$3"
+            if ! grep -Fq "$needle" "$file"; then
+              echo "::error::${label} entitlements are missing ${needle}."
+              echo "Resolved entitlements:"
+              cat "$file" || true
+              exit 1
+            fi
+          }
+          expect_entitlement "$HOST_ENTITLEMENTS_PATH" "Host app" "<string>${APP_GROUP}</string>"
+          expect_entitlement "$APPEX_ENTITLEMENTS_PATH" "Widget appex" "<string>${APP_GROUP}</string>"
+          expect_entitlement "$APPEX_ENTITLEMENTS_PATH" "Widget appex" "<key>com.apple.security.app-sandbox</key>"
+          expect_entitlement "$APPEX_ENTITLEMENTS_PATH" "Widget appex" "<string>${APPLE_TEAM_ID}.tech.dongdongbh.mindwtr.MindwtrWidgets</string>"
+          echo "Verified widget appex is named, present, provisioned, and signed in $APP_PATH."
+
+      - name: Build signed installer package
+        timeout-minutes: 8
+        env:
+          MAS_INSTALLER_IDENTITY: ${{ secrets.MAS_INSTALLER_IDENTITY }}
+          MAS_INSTALLER_SIGNING_IDENTITY: ${{ secrets.MAS_INSTALLER_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYCHAIN_PATH:-}" ] || [ -z "${KEYCHAIN_PASSWORD:-}" ]; then
+            echo "::error::Missing keychain env from previous step (KEYCHAIN_PATH/KEYCHAIN_PASSWORD)."
+            exit 1
+          fi
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          LOGIN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+          if [ -f "$LOGIN_KEYCHAIN" ]; then
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "$LOGIN_KEYCHAIN" "/Library/Keychains/System.keychain"
+          else
+            security list-keychains -d user -s "$KEYCHAIN_PATH" "/Library/Keychains/System.keychain"
+          fi
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild:,pkgbuild: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          APP_PATH="$(find apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built .app bundle not found"
+            exit 1
+          fi
+
+          INSTALLER_IDENTITY="${MAS_INSTALLER_IDENTITY:-${MAS_INSTALLER_SIGNING_IDENTITY:-}}"
+          if [ -z "${INSTALLER_IDENTITY:-}" ]; then
+            INSTALLER_IDENTITY="$(security find-identity -v -p basic "${KEYCHAIN_PATH}" | sed -n 's/.*\"\\(3rd Party Mac Developer Installer:.*\\)\".*/\\1/p' | head -n 1)"
+          fi
+          if [ -z "${INSTALLER_IDENTITY:-}" ]; then
+            INSTALLER_IDENTITY="$(security find-identity -v -p basic "${KEYCHAIN_PATH}" | sed -n 's/.*\"\\(Mac Installer Distribution:.*\\)\".*/\\1/p' | head -n 1)"
+          fi
+          if [ -z "${INSTALLER_IDENTITY:-}" ]; then
+            echo "::error::Missing installer identity. Set MAS_INSTALLER_IDENTITY (or MAS_INSTALLER_SIGNING_IDENTITY) or import a Mac Installer Distribution certificate."
+            exit 1
+          fi
+          if [[ "$INSTALLER_IDENTITY" != *Installer* ]]; then
+            echo "::error::Installer identity must be an installer certificate, got: $INSTALLER_IDENTITY"
+            echo "::error::Use MAS_INSTALLER_IDENTITY with value like '3rd Party Mac Developer Installer: ...'."
+            exit 1
+          fi
+          if ! security find-identity -v -p basic "${KEYCHAIN_PATH}" | grep -F "\"$INSTALLER_IDENTITY\"" >/dev/null; then
+            echo "::error::Installer identity not found in keychain: $INSTALLER_IDENTITY"
+            echo "::error::Verify MAS_INSTALLER_CERTIFICATE/MAS_INSTALLER_CERT_PWD match this identity."
+            exit 1
+          fi
+          echo "Using installer identity: $INSTALLER_IDENTITY"
+
+          APP_BUNDLE_DIR="$(dirname "$APP_PATH")"
+          BUNDLE_DIR="$(dirname "$APP_BUNDLE_DIR")"
+          PKG_DIR="$BUNDLE_DIR/pkg"
+          PKG_PATH="$PKG_DIR/Mindwtr-mac-appstore.pkg"
+          mkdir -p "$PKG_DIR"
+
+          APP_INFO_PLIST="$APP_PATH/Contents/Info.plist"
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_INFO_PLIST")"
+          APP_BUILD_NUMBER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_INFO_PLIST")"
+          if [ -z "${APP_VERSION:-}" ] || [ -z "${APP_BUILD_NUMBER:-}" ]; then
+            echo "::error::Failed to resolve app version/build from $APP_INFO_PLIST"
+            exit 1
+          fi
+
+          xcrun productbuild \
+            --keychain "$KEYCHAIN_PATH" \
+            --component "$APP_PATH" /Applications \
+            --sign "$INSTALLER_IDENTITY" \
+            "$PKG_PATH"
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "APP_BUILD_NUMBER=$APP_BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "PKG_PATH=$PKG_PATH" >> "$GITHUB_ENV"
+          ls -la "$PKG_DIR"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mindwtr-macos-appstore-pkg
+          path: ${{ env.PKG_PATH }}
+          if-no-files-found: error
+          retention-days: 28
+
+      - name: Prepare Fastlane metadata
+        if: ${{ inputs.upload }}
+        env:
+          RELEASE_BODY: ${{ github.event.release.body || '' }}
+          APP_SUPPORT_URL: "https://github.com/dongdongbh/Mindwtr/issues"
+          APP_MARKETING_URL: "https://github.com/dongdongbh/Mindwtr"
+        run: |
+          set -euo pipefail
+
+          export FASTLANE_METADATA_DIR="$RUNNER_TEMP/fastlane_metadata"
+          scripts/ci/prepare-fastlane-metadata.sh
+          echo "FASTLANE_METADATA_PATH=$FASTLANE_METADATA_DIR" >> "$GITHUB_ENV"
+
+      - name: Prepare Fastlane screenshots
+        if: ${{ inputs.upload && !inputs.skip_screenshots }}
+        run: |
+          set -euo pipefail
+          SHOULD_UPLOAD_SCREENSHOTS="$(scripts/ci/should-upload-fastlane-screenshots.sh apps/desktop/screenshots/mas)"
+          if [ "${SHOULD_UPLOAD_SCREENSHOTS}" != "true" ]; then
+            echo "No macOS App Store screenshot changes detected since the previous release tag; skipping App Store screenshot upload."
+            echo "FASTLANE_SCREENSHOTS_PATH=" >> "$GITHUB_ENV"
+            echo "SKIP_SCREENSHOTS_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          export FASTLANE_SCREENSHOTS_DIR="$RUNNER_TEMP/fastlane_screenshots"
+          bash scripts/ci/prepare-fastlane-screenshots.sh macos apps/desktop/screenshots/mas
+          if find "$FASTLANE_SCREENSHOTS_DIR" -mindepth 2 -type f | grep -q .; then
+            echo "FASTLANE_SCREENSHOTS_PATH=$FASTLANE_SCREENSHOTS_DIR" >> "$GITHUB_ENV"
+            echo "SKIP_SCREENSHOTS_FOR_UPLOAD=false" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No macOS App Store screenshots found under apps/desktop/screenshots/mas; skipping screenshot upload."
+            echo "FASTLANE_SCREENSHOTS_PATH=" >> "$GITHUB_ENV"
+            echo "SKIP_SCREENSHOTS_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Skip Fastlane screenshots
+        if: ${{ inputs.upload && inputs.skip_screenshots }}
+        run: |
+          echo "FASTLANE_SCREENSHOTS_PATH=" >> "$GITHUB_ENV"
+          echo "SKIP_SCREENSHOTS_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+
+      - name: Resolve App Store review submission flag
+        if: ${{ inputs.upload }}
+        timeout-minutes: 10
+        env:
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+          REQUESTED_SUBMIT_FOR_REVIEW: ${{ inputs.submit_for_review && 'true' || 'false' }}
+          REQUESTED_DISTRIBUTE_TESTFLIGHT: ${{ inputs.distribute_testflight && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          EFFECTIVE_SUBMIT_FOR_REVIEW="${REQUESTED_SUBMIT_FOR_REVIEW:-true}"
+          REQUESTED_SUBMIT_FOR_REVIEW="$EFFECTIVE_SUBMIT_FOR_REVIEW"
+          APPSTORE_UPLOAD_DISABLED="false"
+          if [ "$REQUESTED_SUBMIT_FOR_REVIEW" != "true" ]; then
+            REQUESTED_SUBMIT_FOR_REVIEW="false"
+            EFFECTIVE_SUBMIT_FOR_REVIEW="false"
+            echo "Review submission disabled by input; checking App Store review state for TestFlight external routing."
+          fi
+          if [ "${REQUESTED_DISTRIBUTE_TESTFLIGHT:-false}" = "true" ]; then
+            echo "ENABLE_TESTFLIGHT_EXTERNAL_RELEASE=true" >> "$GITHUB_ENV"
+            if [ "$REQUESTED_SUBMIT_FOR_REVIEW" != "true" ]; then
+              echo "SKIP_METADATA_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+              echo "FASTLANE_SCREENSHOTS_PATH=" >> "$GITHUB_ENV"
+              echo "SKIP_SCREENSHOTS_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "ENABLE_TESTFLIGHT_EXTERNAL_RELEASE=false" >> "$GITHUB_ENV"
+          fi
+          echo "SKIP_APP_VERSION_UPDATE_FOR_UPLOAD=false" >> "$GITHUB_ENV"
+          echo "SKIP_APPSTORE_UPLOAD=false" >> "$GITHUB_ENV"
+
+          if [ -z "${IOS_ASC_KEY_ID:-}" ] || [ -z "${IOS_ASC_ISSUER_ID:-}" ] || [ -z "${IOS_ASC_PRIVATE_KEY:-}" ]; then
+            echo "::warning::App Store Connect API secrets are missing. Disabling review submission and TestFlight external routing."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ASC_KEY_ID="$(printf '%s' "$IOS_ASC_KEY_ID" | tr -d '\r\n\t ')"
+          ASC_ISSUER_ID="$(printf '%s' "$IOS_ASC_ISSUER_ID" | tr -d '\r\n\t ')"
+          ASC_KEY_PATH="$RUNNER_TEMP/macos-asc-key-review-check.p8"
+          bash scripts/ci/write-asc-private-key.sh "$IOS_ASC_PRIVATE_KEY" "$ASC_KEY_PATH"
+
+          if ! openssl pkey -in "$ASC_KEY_PATH" -noout >/dev/null 2>&1; then
+            echo "::warning::IOS_ASC_PRIVATE_KEY is invalid. Disabling review submission and TestFlight external routing."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ASC_API_TMP_PREFIX="asc-review"
+          source scripts/ci/asc-api-utils.sh
+
+          if ! ASC_TOKEN="$(
+            node scripts/ci/generate-asc-jwt.js "$ASC_KEY_ID" "$ASC_ISSUER_ID" "$ASC_KEY_PATH"
+          )"; then
+            echo "::warning::Failed to generate App Store Connect JWT. Disabling review submission and TestFlight external routing."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          APPSTORE_APP_ID_RESOLVED=""
+          APP_LOOKUP_JSON_FILE="$RUNNER_TEMP/asc-review-app-lookup.json"
+          if api_get "$APP_LOOKUP_JSON_FILE" -G \
+            -H "Authorization: Bearer ${ASC_TOKEN}" \
+            --data-urlencode "filter[bundleId]=${EXPECTED_BUNDLE_ID}" \
+            --data-urlencode "limit=1" \
+            "https://api.appstoreconnect.apple.com/v1/apps"; then
+            APPSTORE_APP_ID_RESOLVED="$(jq -r '.data[0].id // empty' "$APP_LOOKUP_JSON_FILE")"
+          fi
+
+          if [ -z "${APPSTORE_APP_ID_RESOLVED}" ]; then
+            echo "::warning::App lookup returned no App Store Connect app. Disabling review submission and TestFlight external routing."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          REVIEW_JSON_FILE="$RUNNER_TEMP/asc-review-versions.json"
+          if ! api_get "$REVIEW_JSON_FILE" -G \
+            -H "Authorization: Bearer ${ASC_TOKEN}" \
+            --data-urlencode "filter[appStoreState]=WAITING_FOR_REVIEW,IN_REVIEW" \
+            --data-urlencode "filter[platform]=MAC_OS" \
+            --data-urlencode "limit=1" \
+            "https://api.appstoreconnect.apple.com/v1/apps/${APPSTORE_APP_ID_RESOLVED}/appStoreVersions"; then
+            echo "::warning::Review-state lookup failed. Disabling review submission and TestFlight external routing."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ACTIVE_REVIEW_ID="$(jq -r '.data[0].id // empty' "$REVIEW_JSON_FILE")"
+          ACTIVE_REVIEW_VERSION="$(jq -r '.data[0].attributes.versionString // empty' "$REVIEW_JSON_FILE")"
+          ACTIVE_REVIEW_STATE="$(jq -r '.data[0].attributes.appStoreState // empty' "$REVIEW_JSON_FILE")"
+          if [ -n "${ACTIVE_REVIEW_ID}" ]; then
+            echo "::warning::Found existing macOS App Store submission in state ${ACTIVE_REVIEW_STATE:-unknown} (version ${ACTIVE_REVIEW_VERSION:-unknown}). Upload will continue for TestFlight using version ${APP_VERSION} with build ${APP_BUILD_NUMBER}, and review submission is disabled."
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            echo "ENABLE_TESTFLIGHT_EXTERNAL_RELEASE=true" >> "$GITHUB_ENV"
+            echo "SKIP_APP_VERSION_UPDATE_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+            echo "SKIP_METADATA_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+            echo "FASTLANE_SCREENSHOTS_PATH=" >> "$GITHUB_ENV"
+            echo "SKIP_SCREENSHOTS_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -n "${APP_VERSION:-}" ]; then
+            TARGET_VERSION_JSON_FILE="$RUNNER_TEMP/asc-target-version.json"
+            if api_get "$TARGET_VERSION_JSON_FILE" -G \
+              -H "Authorization: Bearer ${ASC_TOKEN}" \
+              --data-urlencode "filter[versionString]=${APP_VERSION}" \
+              --data-urlencode "filter[platform]=MAC_OS" \
+              --data-urlencode "limit=1" \
+              "https://api.appstoreconnect.apple.com/v1/apps/${APPSTORE_APP_ID_RESOLVED}/appStoreVersions"; then
+              TARGET_VERSION_ID="$(jq -r '.data[0].id // empty' "$TARGET_VERSION_JSON_FILE")"
+              TARGET_VERSION_STATE="$(jq -r '.data[0].attributes.appStoreState // empty' "$TARGET_VERSION_JSON_FILE")"
+              if [ -n "${TARGET_VERSION_ID}" ]; then
+                case "${TARGET_VERSION_STATE:-}" in
+                  PREPARE_FOR_SUBMISSION|DEVELOPER_REJECTED)
+                    echo "::notice::Found reusable macOS App Store version ${APP_VERSION} in state ${TARGET_VERSION_STATE:-unknown}. Reusing the existing version record for upload."
+                    echo "SKIP_APP_VERSION_UPDATE_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+                    ;;
+                  *)
+                    echo "::warning::Existing macOS App Store version ${APP_VERSION} is not editable (state ${TARGET_VERSION_STATE:-unknown}). Skipping App Store Connect publish for this run."
+                    echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+                    echo "SKIP_METADATA_FOR_UPLOAD=true" >> "$GITHUB_ENV"
+                    echo "SKIP_APPSTORE_UPLOAD=true" >> "$GITHUB_ENV"
+                    APPSTORE_UPLOAD_DISABLED="true"
+                    ;;
+                esac
+              fi
+            else
+              echo "::warning::Target-version lookup failed. Upload will continue and may attempt to create version ${APP_VERSION}."
+            fi
+          fi
+
+          if [ "${APPSTORE_UPLOAD_DISABLED}" = "true" ]; then
+            echo "App Store Connect upload disabled because version ${APP_VERSION} is already in a non-editable state."
+          elif [ "$REQUESTED_SUBMIT_FOR_REVIEW" = "true" ]; then
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=true" >> "$GITHUB_ENV"
+            echo "No active App Store review submission found; review submission remains enabled."
+          else
+            echo "EFFECTIVE_SUBMIT_FOR_REVIEW=false" >> "$GITHUB_ENV"
+            echo "No active App Store review submission found; submit_for_review remains disabled."
+          fi
+
+      - name: Upload package to App Store Connect
+        if: ${{ inputs.upload && env.SKIP_APPSTORE_UPLOAD != 'true' }}
+        timeout-minutes: 30
+        env:
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+          SUBMIT_FOR_REVIEW: ${{ env.EFFECTIVE_SUBMIT_FOR_REVIEW || 'false' }}
+          PHASED_RELEASE: ${{ inputs.phased_release && 'true' || 'false' }}
+          SKIP_APP_VERSION_UPDATE: ${{ env.SKIP_APP_VERSION_UPDATE_FOR_UPLOAD || 'false' }}
+          SKIP_METADATA: ${{ env.SKIP_METADATA_FOR_UPLOAD || 'false' }}
+          SKIP_SCREENSHOTS: ${{ env.SKIP_SCREENSHOTS_FOR_UPLOAD || 'true' }}
+          FASTLANE_SKIP_UPDATE_CHECK: "1"
+          FASTLANE_HIDE_CHANGELOG: "1"
+          FASTLANE_OPT_OUT_USAGE: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PKG_PATH:-}" ] || [ ! -f "$PKG_PATH" ]; then
+            echo "::error::PKG file not found: ${PKG_PATH:-<empty>}"
+            exit 1
+          fi
+
+          ASC_KEY_ID_CLEAN="$(printf '%s' "$IOS_ASC_KEY_ID" | tr -d '\r\n\t ')"
+          ASC_ISSUER_ID_CLEAN="$(printf '%s' "$IOS_ASC_ISSUER_ID" | tr -d '\r\n\t ')"
+          ASC_KEY_PATH="$RUNNER_TEMP/macos-asc-key-fastlane.p8"
+          bash scripts/ci/write-asc-private-key.sh "$IOS_ASC_PRIVATE_KEY" "$ASC_KEY_PATH"
+
+          mkdir -p fastlane
+          cat <<'EOF' > fastlane/Fastfile
+          opt_out_usage
+          default_platform(:mac)
+
+          platform :mac do
+            lane :upload_app_store do
+              screenshots_path = ENV["FASTLANE_SCREENSHOTS_PATH"]
+              skip_screenshots = ENV.fetch("SKIP_METADATA", "false") == "true" || ENV.fetch("SKIP_SCREENSHOTS", "true") == "true"
+              deliver_options = {
+                app_identifier: ENV.fetch("EXPECTED_BUNDLE_ID"),
+                app_version: ENV.fetch("APP_VERSION"),
+                platform: "osx",
+                pkg: ENV.fetch("PKG_PATH"),
+                metadata_path: ENV.fetch("FASTLANE_METADATA_PATH"),
+                skip_metadata: ENV.fetch("SKIP_METADATA", "false") == "true",
+                skip_screenshots: skip_screenshots,
+                skip_app_version_update: ENV.fetch("SKIP_APP_VERSION_UPDATE", "false") == "true",
+                force: true,
+                run_precheck_before_submit: false,
+                submit_for_review: ENV.fetch("SUBMIT_FOR_REVIEW", "false") == "true",
+                automatic_release: true
+              }
+              unless ENV.fetch("SKIP_METADATA", "false") == "true"
+                deliver_options[:phased_release] = ENV.fetch("PHASED_RELEASE", "true") == "true"
+              end
+              if screenshots_path && !screenshots_path.empty?
+                deliver_options[:screenshots_path] = screenshots_path
+                deliver_options[:overwrite_screenshots] = true unless skip_screenshots
+              end
+              api_key = app_store_connect_api_key(
+                key_id: ENV.fetch("FASTLANE_ASC_KEY_ID"),
+                issuer_id: ENV.fetch("FASTLANE_ASC_ISSUER_ID"),
+                key_filepath: ENV.fetch("ASC_KEY_PATH"),
+                duration: 1200,
+                in_house: false
+              )
+
+              deliver(deliver_options.merge(api_key: api_key))
+            end
+          end
+          EOF
+
+          FASTLANE_ASC_KEY_ID="$ASC_KEY_ID_CLEAN" \
+          FASTLANE_ASC_ISSUER_ID="$ASC_ISSUER_ID_CLEAN" \
+          ASC_KEY_PATH="$ASC_KEY_PATH" \
+          bundle exec fastlane mac upload_app_store
+
+      - name: Distribute upload to TestFlight external group
+        if: ${{ inputs.upload }}
+        timeout-minutes: 30
+        env:
+          IOS_ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          IOS_ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          IOS_ASC_PRIVATE_KEY: ${{ secrets.IOS_ASC_PRIVATE_KEY }}
+          TESTFLIGHT_EXTERNAL_GROUP: ${{ inputs.testflight_group || 'external_testing' }}
+          FASTLANE_SKIP_UPDATE_CHECK: "1"
+          FASTLANE_HIDE_CHANGELOG: "1"
+          FASTLANE_OPT_OUT_USAGE: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+
+          if [ "${ENABLE_TESTFLIGHT_EXTERNAL_RELEASE:-false}" != "true" ]; then
+            echo "TestFlight external distribution not enabled for this run; skipping."
+            exit 0
+          fi
+
+          ASC_KEY_PATH="$RUNNER_TEMP/macos-asc-key-fastlane-testflight.p8"
+          bash scripts/ci/write-asc-private-key.sh "$IOS_ASC_PRIVATE_KEY" "$ASC_KEY_PATH"
+
+          WHAT_TO_TEST_FILE="metadata/en-US/release_notes.txt"
+          DEFAULT_WHAT_TO_TEST="Bug fixes, performance improvements, and sync stability updates."
+          WHAT_TO_TEST=""
+          if [ -f "$WHAT_TO_TEST_FILE" ]; then
+            WHAT_TO_TEST="$(tr '\n' ' ' < "$WHAT_TO_TEST_FILE" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+          fi
+          if [ -z "${WHAT_TO_TEST}" ]; then
+            WHAT_TO_TEST="$DEFAULT_WHAT_TO_TEST"
+          fi
+          export TESTFLIGHT_WHAT_TO_TEST="$WHAT_TO_TEST"
+          echo "Using TestFlight What to Test: ${TESTFLIGHT_WHAT_TO_TEST}"
+
+          mkdir -p fastlane
+          cat <<'EOF' > fastlane/Fastfile
+          opt_out_usage
+
+          lane :distribute_external_group do
+            beta_review_locked_error = lambda do |error|
+              message = error.to_s
+              message.match?(/cannot accept new beta review submission/i) ||
+                message.match?(/another build.*beta review/i) ||
+                message.match?(/same train.*beta review/i)
+            end
+
+            api_key = app_store_connect_api_key(
+              key_id: ENV.fetch("IOS_ASC_KEY_ID"),
+              issuer_id: ENV.fetch("IOS_ASC_ISSUER_ID"),
+              key_filepath: ENV.fetch("ASC_KEY_PATH"),
+              duration: 1200,
+              in_house: false
+            )
+
+            upload_to_testflight(
+              api_key: api_key,
+              app_identifier: ENV.fetch("EXPECTED_BUNDLE_ID"),
+              app_platform: "osx",
+              distribute_only: true,
+              app_version: ENV.fetch("APP_VERSION"),
+              build_number: ENV.fetch("APP_BUILD_NUMBER"),
+              distribute_external: true,
+              groups: [ENV.fetch("TESTFLIGHT_EXTERNAL_GROUP")],
+              notify_external_testers: true,
+              changelog: ENV.fetch("TESTFLIGHT_WHAT_TO_TEST"),
+              submit_beta_review: true,
+              skip_submission: false,
+              skip_waiting_for_build_processing: false,
+              wait_processing_timeout_duration: 1800
+            )
+          rescue => e
+            if beta_review_locked_error.call(e)
+              UI.important("Another TestFlight build is already in beta review for this train. Skipping beta review submission for this run.")
+              begin
+                upload_to_testflight(
+                  api_key: api_key,
+                  app_identifier: ENV.fetch("EXPECTED_BUNDLE_ID"),
+                  app_platform: "osx",
+                  distribute_only: true,
+                  app_version: ENV.fetch("APP_VERSION"),
+                  build_number: ENV.fetch("APP_BUILD_NUMBER"),
+                  distribute_external: true,
+                  groups: [ENV.fetch("TESTFLIGHT_EXTERNAL_GROUP")],
+                  notify_external_testers: true,
+                  changelog: ENV.fetch("TESTFLIGHT_WHAT_TO_TEST"),
+                  submit_beta_review: false,
+                  skip_submission: true,
+                  skip_waiting_for_build_processing: false,
+                  wait_processing_timeout_duration: 1800
+                )
+              rescue => retry_error
+                if beta_review_locked_error.call(retry_error)
+                  UI.important("Beta review lock is still active. Continuing without failing this workflow.")
+                else
+                  raise retry_error
+                end
+              end
+            else
+              raise e
+            end
+          end
+          EOF
+
+          echo "Distributing macOS build ${APP_VERSION} (${APP_BUILD_NUMBER}) to TestFlight group: ${TESTFLIGHT_EXTERNAL_GROUP}"
+          ASC_KEY_PATH="$ASC_KEY_PATH" bundle exec fastlane distribute_external_group
+
+      - name: Cleanup signing files
+        if: always()
+        run: |
+          rm -rf fastlane || true
+          rm -f apps/desktop/src-tauri/embedded.provisionprofile
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "${KEYCHAIN_PATH}" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi

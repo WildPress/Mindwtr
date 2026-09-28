@@ -1,0 +1,1250 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '!v*-rc.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.2.3)'
+        required: true
+        type: string
+      rollout_mode:
+        description: 'Production stores: staged by default; immediate for corrective hotfixes'
+        required: true
+        type: choice
+        options: [staged, immediate]
+        default: staged
+      rollout_percentage:
+        description: 'Initial Play/MS Store percentage for staged mode (greater than 0, less than 100)'
+        required: true
+        type: number
+        default: 5
+      run_linux:
+        description: 'Run Linux release job'
+        required: false
+        type: boolean
+        default: false
+      run_macos:
+        description: 'Run macOS release job'
+        required: false
+        type: boolean
+        default: false
+      run_windows:
+        description: 'Run Windows release job'
+        required: false
+        type: boolean
+        default: false
+      run_android:
+        description: 'Run Android release job'
+        required: false
+        type: boolean
+        default: false
+      run_android_foss:
+        description: 'Run Android FOSS release job'
+        required: false
+        type: boolean
+        default: false
+      run_ios_appstore:
+        description: 'Run iOS App Store release job'
+        required: false
+        type: boolean
+        default: false
+      force_ios_appstore_upload:
+        description: 'Fail instead of silently skipping iOS App Store upload when a corrected Apple build is required'
+        required: false
+        type: boolean
+        default: false
+      run_macos_appstore:
+        description: 'Run macOS App Store release job'
+        required: false
+        type: boolean
+        default: false
+      run_update_packages:
+        description: 'Run Scoop/Winget update job'
+        required: false
+        type: boolean
+        default: false
+      run_update_flathub:
+        description: 'Run Flathub update job'
+        required: false
+        type: boolean
+        default: false
+      run_update_linux_repos:
+        description: 'Run Linux repo publish job'
+        required: false
+        type: boolean
+        default: false
+      run_publish_chocolatey:
+        description: 'Run Chocolatey publish job'
+        required: false
+        type: boolean
+        default: false
+      run_update_aur:
+        description: 'Run AUR binary package update job'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  REQUIRE_STABLE_RELEASE_TAG: "1"
+
+jobs:
+  # Stable releases validate the immutable tag, every committed version manifest,
+  # and the CloudKit Production ledger before any platform build can start.
+  validate:
+    runs-on: ubuntu-latest
+    name: Validate Stable Release
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      release_notes_path: ${{ steps.release_notes.outputs.body_path }}
+      rollout_mode: ${{ steps.rollout.outputs.mode }}
+      rollout_percentage: ${{ steps.rollout.outputs.percentage }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate store rollout policy
+        id: rollout
+        env:
+          # Tag pushes stage by default. Set the repository variable before an
+          # emergency tag only when immediate distribution is intended.
+          ROLLOUT_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.rollout_mode || vars.RELEASE_ROLLOUT_MODE || 'staged' }}
+          ROLLOUT_PERCENTAGE: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.rollout_percentage) || '5' }}
+        run: |
+          python3 - <<'PY'
+          import math
+          import os
+          mode = os.environ['ROLLOUT_MODE']
+          percentage = float(os.environ['ROLLOUT_PERCENTAGE'])
+          if mode not in ('staged', 'immediate'):
+              raise SystemExit('rollout_mode must be staged or immediate')
+          if not math.isfinite(percentage) or not 0 < percentage < 100:
+              raise SystemExit('rollout_percentage must be greater than 0 and less than 100')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'mode={mode}\npercentage={percentage}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'### Store rollout policy\n\nMode: **{mode}**. ')
+              summary.write(f'Play/MS initial rollout: **{percentage:g}%**; Apple: **7-day phased release**.\n' if mode == 'staged' else 'All production stores release immediately after approval.\n')
+          PY
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          GITHUB_EVENT_INPUTS_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          scripts/ci/resolve-release-version.sh "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate stable tag naming
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected stable tag like v1.1.5, got: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Resolve and validate release notes
+        id: release_notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          for path in \
+            "docs/release-notes/${TAG}.md" \
+            "docs/release-notes/${VERSION}.md"; do
+            [ -f "$path" ] || continue
+            heading="$(head -n 1 "$path")"
+            if [[ "$heading" != "# Mindwtr ${VERSION}" && "$heading" != "# Mindwtr ${TAG}" ]]; then
+              echo "Stable release notes heading must be '# Mindwtr ${VERSION}' or '# Mindwtr ${TAG}': $path" >&2
+              exit 1
+            fi
+            echo "Using release notes at $path"
+            echo "body_path=$path" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+          echo "Missing stable release notes. Expected one of:" >&2
+          echo "  - docs/release-notes/${TAG}.md" >&2
+          echo "  - docs/release-notes/${VERSION}.md" >&2
+          exit 1
+
+      - name: Verify app versions match the stable tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('fs');
+          const version = process.env.VERSION;
+          const checks = [
+            ['package.json', json => json.version],
+            ['apps/desktop/package.json', json => json.version],
+            ['apps/mobile/package.json', json => json.version],
+            ['apps/cloud/package.json', json => json.version],
+            ['packages/core/package.json', json => json.version],
+            ['apps/mobile/app.json', json => json.expo && json.expo.version],
+            ['apps/desktop/src-tauri/tauri.conf.json', json => json.version],
+          ];
+          const failures = [];
+          for (const [file, getter] of checks) {
+            const value = getter(JSON.parse(fs.readFileSync(file, 'utf8')));
+            if (value !== version) {
+              failures.push(`${file}: expected ${version}, got ${value || '<missing>'}`);
+            }
+          }
+          const cargoFile = 'apps/desktop/src-tauri/Cargo.toml';
+          const cargoVersion = /^version = "([^"]+)"/m.exec(fs.readFileSync(cargoFile, 'utf8'))?.[1];
+          if (cargoVersion !== version) {
+            failures.push(`${cargoFile}: expected ${version}, got ${cargoVersion || '<missing>'}`);
+          }
+          if (failures.length) {
+            console.error('Stable release tags and committed app/store versions must match.');
+            console.error(failures.join('\n'));
+            process.exit(1);
+          }
+          console.log(`Verified app/store versions use ${version}.`);
+          NODE
+
+      - name: Verify committed FOSS release version matches the stable tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          COMMITTED=$(node -p "require('./apps/mobile/release-version.json').releaseVersion")
+          if [ "v$COMMITTED" != "$TAG" ] && [ "$COMMITTED" != "$TAG" ]; then
+            echo "apps/mobile/release-version.json says '$COMMITTED' but the stable tag is '$TAG'." >&2
+            echo "Run ./scripts/bump-version.sh \"$TAG\" before creating the tag." >&2
+            exit 1
+          fi
+          echo "Verified committed FOSS release version $COMMITTED."
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: ".bun-version"
+
+      - name: Verify CloudKit production schema is fully deployed
+        run: bun run schema:check -- --release-gate
+
+      - name: Verify stable tag points at this commit
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          TAG_SHA="$(git rev-list -n 1 "$TAG")"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "Stable release workflow must run from the commit pointed to by $TAG." >&2
+            echo "$TAG -> $TAG_SHA" >&2
+            echo "workflow HEAD -> $HEAD_SHA" >&2
+            exit 1
+          fi
+          echo "Verified $TAG points at $HEAD_SHA."
+
+  # Google Play refuses a staged production publication, and Microsoft refuses a
+  # new submission, while the previous rollout is still open. Both refusals used
+  # to arrive after an hour of builds, so read that state first. Read-only.
+  # Only a run that reaches a store is checked: a recovery dispatch that rebuilds
+  # package channels must not be refused by its own tag's open rollout. The Play
+  # publish is gated by run_android (android-foss never reaches Play) and the
+  # Microsoft submission by run_windows.
+  rollout-preflight:
+    needs: validate
+    if: ${{ always() && needs.validate.result == 'success' && needs.validate.outputs.rollout_mode == 'staged' && github.repository == 'dongdongbh/Mindwtr' && (github.event_name != 'workflow_dispatch' || inputs.run_android || inputs.run_windows) }}
+    runs-on: ubuntu-latest
+    name: Store Rollout Preflight
+    timeout-minutes: 10
+    concurrency:
+      group: google-play-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Authenticate Google Play API
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_android }}
+        id: play_auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: ${{ secrets.ANDROID_SERVICE_ACCOUNT_JSON }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+
+      - name: Refuse a stable release while a production rollout is open
+        env:
+          CHECK_PLAY: ${{ github.event_name != 'workflow_dispatch' || inputs.run_android }}
+          CHECK_MSSTORE: ${{ github.event_name != 'workflow_dispatch' || inputs.run_windows }}
+          GOOGLE_PLAY_ACCESS_TOKEN: ${{ steps.play_auth.outputs.access_token }}
+          MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+          MS_STORE_APP_ID: ${{ secrets.MS_STORE_APP_ID || '9N0V5B0B6FRX' }}
+        run: |
+          set -euo pipefail
+          blocked=0
+
+          if [ "${CHECK_PLAY:-}" != "true" ]; then
+            echo "This run does not reach Google Play; skipped the Play rollout check."
+          elif [ -z "${GOOGLE_PLAY_ACCESS_TOKEN:-}" ]; then
+            echo "No Google Play credentials; skipped the Play rollout check."
+          else
+            play_result="$RUNNER_TEMP/play-rollout-status.json"
+            python3 scripts/ci/google-play-edit.py rollout \
+              --package tech.dongdongbh.mindwtr \
+              --action status \
+              --result "$play_result"
+            play_state="$(jq -r '"\(.open) \(.versionCode) \(.status)"' "$play_result")"
+            echo "- Google Play production: $play_state" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${play_state%% *}" = "true" ]; then
+              blocked=1
+              echo "Google Play production versionCode $(jq -r '.versionCode' "$play_result") is still $(jq -r '.status' "$play_result")." >&2
+            fi
+          fi
+
+          if [ "${CHECK_MSSTORE:-}" != "true" ]; then
+            echo "This run does not reach the Microsoft Store; skipped the Microsoft rollout check."
+          elif [ -z "${MS_CLIENT_SECRET:-}" ]; then
+            echo "No Microsoft Store credentials; skipped the Microsoft rollout check."
+          else
+            ms_result="$RUNNER_TEMP/msstore-rollout-status.json"
+            node scripts/ci/msstore-rollout.mjs --action status --result "$ms_result"
+            ms_state="$(jq -r '"\(.open) \(.submissionId) \(.status)"' "$ms_result")"
+            echo "- Microsoft Store production: $ms_state" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${ms_state%% *}" = "true" ]; then
+              blocked=1
+              echo "Microsoft Store submission $(jq -r '.submissionId' "$ms_result") is still $(jq -r '.status' "$ms_result")." >&2
+            fi
+          fi
+
+          if [ "$blocked" -ne 0 ]; then
+            echo "A staged production rollout is still open. Finalize or halt it first (see docs/development/store-rollouts.md), then rerun this release." >&2
+            exit 1
+          fi
+          echo "No open production rollout blocks this release."
+
+  linux:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_linux) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && (needs['android-version-code'].result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_android && !inputs.run_android_foss)) }}
+    uses: ./.github/workflows/release-linux.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  macos:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_macos) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && (needs['android-version-code'].result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_android && !inputs.run_android_foss)) }}
+    uses: ./.github/workflows/release-macos.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  windows:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_windows) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && (needs['android-version-code'].result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_android && !inputs.run_android_foss)) }}
+    uses: ./.github/workflows/release-windows.yml
+    permissions:
+      contents: read
+      # SignPath signing reads the unsigned-binaries artifact (#965).
+      actions: read
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      run_msstore_flight: ${{ vars.MSSTORE_FLIGHT_ID != '' }}
+      run_msstore: true
+      rollout_mode: ${{ needs.validate.outputs.rollout_mode }}
+      rollout_percentage: ${{ fromJSON(needs.validate.outputs.rollout_percentage) }}
+    secrets: inherit
+
+  android-version-code:
+    needs: [validate, rollout-preflight]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_android || inputs.run_android_foss) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') }}
+    runs-on: ubuntu-latest
+    name: Android VersionCode Preflight
+    timeout-minutes: 10
+    concurrency:
+      group: google-play-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    outputs:
+      version_code: ${{ steps.version_code.outputs.resolved_code }}
+      local_version_code: ${{ steps.version_code.outputs.local_code }}
+      remote_max_version_code: ${{ steps.version_code.outputs.remote_max_code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Authenticate Google Play API
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_android }}
+        id: play_auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: ${{ secrets.ANDROID_SERVICE_ACCOUNT_JSON }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+
+      - name: Resolve Android versionCode
+        id: version_code
+        env:
+          ACCESS_TOKEN: ${{ steps.play_auth.outputs.access_token }}
+          USE_PLAY_TRACKS: ${{ github.event_name != 'workflow_dispatch' || inputs.run_android }}
+        run: |
+          set -euo pipefail
+          PACKAGE="tech.dongdongbh.mindwtr"
+          LOCAL_CODE=$(jq -r '.expo.android.versionCode' apps/mobile/app.json)
+          if [ -z "$LOCAL_CODE" ] || [ "$LOCAL_CODE" = "null" ]; then
+            echo "Missing expo.android.versionCode in apps/mobile/app.json" >&2
+            exit 1
+          fi
+          MAX_CODE=0
+          if [ "$USE_PLAY_TRACKS" = "true" ]; then
+            if [ -z "${ACCESS_TOKEN:-}" ]; then
+              echo "Missing Google Play access token for Android versionCode preflight" >&2
+              exit 1
+            fi
+            EDIT_ID=$(curl -sS -X POST \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE/edits" \
+              -d '{}' | jq -r '.id')
+            if [ -z "$EDIT_ID" ] || [ "$EDIT_ID" = "null" ]; then
+              echo "Failed to create Google Play edit" >&2
+              exit 1
+            fi
+            TRACKS_FILE=$(mktemp)
+            TRACKS_CODE=$(curl -sS -o "$TRACKS_FILE" -w "%{http_code}" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE/edits/$EDIT_ID/tracks")
+            TRACKS_JSON=$(cat "$TRACKS_FILE")
+            if [ "$TRACKS_CODE" != "200" ]; then
+              echo "Failed to fetch Google Play tracks (HTTP $TRACKS_CODE): $TRACKS_JSON" >&2
+              exit 1
+            fi
+            if echo "$TRACKS_JSON" | jq -e '.error' >/dev/null; then
+              echo "Failed to fetch Google Play tracks: $TRACKS_JSON" >&2
+              exit 1
+            fi
+            MAX_CODE=$(echo "$TRACKS_JSON" | jq -r '[(.tracks // [])[]? | (.releases // [])[]? | (.versionCodes // [])[]? | tonumber] | max // 0')
+            if [ -z "$MAX_CODE" ] || [ "$MAX_CODE" = "null" ]; then
+              MAX_CODE=0
+            fi
+            curl -sS -X DELETE \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/$PACKAGE/edits/$EDIT_ID" >/dev/null
+          fi
+          REMOTE_MAX_VERSION_CODE="$MAX_CODE" \
+            ALLOW_UNTRACKED_VERSION_CODE=0 \
+            node scripts/ci/android-version-code-policy.js
+
+  android:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_android) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && needs['android-version-code'].result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-android.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      # Tagged stable requests expand inside the shared workflow to production,
+      # beta, and internal while retaining one standard AAB and versionCode.
+      play_track: production
+      rollout_mode: ${{ needs.validate.outputs.rollout_mode }}
+      rollout_percentage: ${{ fromJSON(needs.validate.outputs.rollout_percentage) }}
+      version_code: ${{ needs['android-version-code'].outputs.version_code }}
+    secrets: inherit
+
+  android-foss:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_android_foss) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && needs['android-version-code'].result == 'success' }}
+    uses: ./.github/workflows/release-android-foss.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      version_code: ${{ needs['android-version-code'].outputs.version_code }}
+    secrets: inherit
+
+  ios-appstore:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_ios_appstore) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && (needs['android-version-code'].result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_android && !inputs.run_android_foss)) }}
+    uses: ./.github/workflows/release-ios-appstore.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      upload: true
+      submit_for_review: true
+      include_watch: true
+      phased_release: ${{ needs.validate.outputs.rollout_mode == 'staged' }}
+      testflight_only: false
+      distribute_testflight: true
+      force_appstore_upload: ${{ github.event_name == 'workflow_dispatch' && inputs.force_ios_appstore_upload || false }}
+      testflight_group: 'external_testing'
+    secrets: inherit
+
+  macos-appstore:
+    needs: [validate, rollout-preflight, android-version-code]
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_macos_appstore) && needs.validate.result == 'success' && (needs['rollout-preflight'].result == 'success' || needs['rollout-preflight'].result == 'skipped') && (needs['android-version-code'].result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.run_android && !inputs.run_android_foss)) }}
+    uses: ./.github/workflows/release-macos-appstore.yml
+    with:
+      tag: ${{ needs.validate.outputs.tag }}
+      upload: true
+      submit_for_review: true
+      phased_release: ${{ needs.validate.outputs.rollout_mode == 'staged' }}
+      distribute_testflight: true
+      testflight_group: 'external_testing'
+    secrets: inherit
+
+  release:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.run_linux && inputs.run_macos && inputs.run_windows && inputs.run_android && inputs.run_android_foss) }}
+    needs: [validate, linux, macos, windows, android, android-foss]
+    # Pinned on purpose: this job builds or packages with tools from the runner image,
+    # and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19. Bump CI first, then this.
+    runs-on: ubuntu-24.04
+    name: Create Release
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Import Mindwtr release signing key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Download build artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tmp_dir="$(mktemp -d)"
+          mkdir -p ./release-assets
+
+          cleanup() {
+            rm -rf "$tmp_dir"
+          }
+
+          trap cleanup EXIT
+
+          artifact_names="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" --paginate --jq '.artifacts[] | select(.expired == false and (.name | startswith("release-"))) | .name')"
+          if [ -z "$artifact_names" ]; then
+            echo "No release-* artifacts found for run ${GITHUB_RUN_ID}." >&2
+            exit 1
+          fi
+
+          while IFS= read -r artifact_name; do
+            [ -n "$artifact_name" ] || continue
+            artifact_dir="${tmp_dir}/${artifact_name}"
+            mkdir -p "$artifact_dir"
+            gh run download "${GITHUB_RUN_ID}" --repo "${GITHUB_REPOSITORY}" -n "$artifact_name" -D "$artifact_dir"
+            find "$artifact_dir" -type f -print0 | while IFS= read -r -d '' file; do
+              cp "$file" ./release-assets/
+            done
+          done <<< "$artifact_names"
+
+      - name: List release assets
+        run: ls -la ./release-assets/ || echo "No assets found"
+
+      - name: Validate release assets
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          count="$(find ./release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [ "${count}" -eq 0 ]; then
+            echo "No release artifacts were downloaded. Aborting release creation."
+            exit 1
+          fi
+          echo "Release asset count: ${count}"
+
+          # Ensure all artifacts are non-empty and compute checksums.
+          while IFS= read -r -d '' file; do
+            if [ ! -s "$file" ]; then
+              echo "Artifact has zero size: $file" >&2
+              exit 1
+            fi
+          done < <(find ./release-assets -maxdepth 1 -type f -print0)
+
+          has_match() {
+            local pattern="$1"
+            find ./release-assets -maxdepth 1 -type f -name "$pattern" -print -quit | grep -q .
+          }
+
+          missing=0
+          if ! has_match "*.apk"; then
+            echo "Missing Android artifact (*.apk)." >&2
+            missing=1
+          fi
+          if ! has_match "*-foss.apk"; then
+            echo "Missing Android FOSS artifact (*-foss.apk)." >&2
+            missing=1
+          fi
+          if ! has_match "*.dmg"; then
+            echo "Missing macOS artifact (*.dmg)." >&2
+            missing=1
+          fi
+          expected_windows_installer="./release-assets/mindwtr_${VERSION}_x64-setup.exe"
+          mapfile -d '' -t windows_installers < <(find ./release-assets -maxdepth 1 -type f -name '*.exe' -print0)
+          if [ "${#windows_installers[@]}" -ne 1 ]; then
+            echo "Expected exactly one Windows installer for ${VERSION}; found ${#windows_installers[@]}." >&2
+            if [ "${#windows_installers[@]}" -gt 0 ]; then
+              printf '  %s\n' "${windows_installers[@]}" >&2
+            fi
+            missing=1
+          elif [ "${windows_installers[0]}" != "$expected_windows_installer" ]; then
+            echo "Expected Windows installer ${expected_windows_installer}; found ${windows_installers[0]}." >&2
+            missing=1
+          fi
+          if ! has_match "*.AppImage" && ! has_match "*.deb" && ! has_match "*.rpm" && ! has_match "*.snap"; then
+            echo "Missing Linux artifact (*.AppImage, *.deb, *.rpm, or *.snap)." >&2
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          (
+            cd ./release-assets
+            sha256sum * > SHA256SUMS
+            gpg --batch --yes --armor --detach-sign --output SHA256SUMS.asc SHA256SUMS
+            gpg --batch --verify SHA256SUMS.asc SHA256SUMS
+          )
+          echo "Generated and signed checksum manifest at release-assets/SHA256SUMS"
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_FILE: ${{ needs.validate.outputs.release_notes_path }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.validate.outputs.tag }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; stable release assets are immutable. Publish fixes under a new tag." >&2
+            exit 1
+          else
+            if [[ "$TAG" == *-* ]]; then
+              gh release create "$TAG" ./release-assets/* \
+                --draft=false \
+                --prerelease \
+                --notes-file "$NOTES_FILE"
+            else
+              gh release create "$TAG" ./release-assets/* \
+                --draft=false \
+                --notes-file "$NOTES_FILE"
+            fi
+          fi
+
+  update-packages:
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    name: Update Scoop/Winget Packages
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.run_update_packages && (needs.release.result == 'success' || needs.release.result == 'skipped'))) }}
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: source
+
+      - name: Checkout packages repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: dongdongbh/homebrew-mindwtr
+          token: ${{ secrets.PACKAGES_REPO_TOKEN }}
+          path: packages-repo
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_EVENT_INPUTS_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "${INPUT_TAG:-}" ] && ! echo "${INPUT_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid tag format" >&2
+            exit 1
+          fi
+          source/scripts/ci/resolve-release-version.sh "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download release assets and compute hashes
+        id: hashes
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          URL_EXE="https://github.com/${{ github.repository }}/releases/download/${TAG}/mindwtr_${VERSION}_x64-setup.exe"
+
+          echo "Waiting for release assets to become available..."
+          for attempt in $(seq 1 10); do
+            if curl -fsI "$URL_EXE" >/dev/null; then
+              echo "Release assets are available."
+              break
+            fi
+            if [ "$attempt" -eq 10 ]; then
+              echo "Release assets not available after waiting."
+              exit 1
+            fi
+            sleep 15
+          done
+
+          curl -fL -o mindwtr.exe "$URL_EXE"
+
+          SHA_EXE=$(sha256sum mindwtr.exe | awk '{print $1}')
+
+          echo "sha_exe=$SHA_EXE" >> "$GITHUB_OUTPUT"
+
+      - name: Update Scoop manifest
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA_EXE="${{ steps.hashes.outputs.sha_exe }}"
+          URL_EXE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/mindwtr_${VERSION}_x64-setup.exe#/dl.7z"
+
+          FILE="packages-repo/bucket/mindwtr.json"
+          jq --arg v "$VERSION" \
+             --arg url "$URL_EXE" \
+             --arg hash "$SHA_EXE" \
+             '.version = $v
+              | .architecture."64bit".url = $url
+              | .architecture."64bit".hash = $hash
+             | .autoupdate.architecture."64bit".url = "https://github.com/dongdongbh/Mindwtr/releases/download/v\($v)/mindwtr_\($v)_x64-setup.exe#/dl.7z"' \
+             "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+
+      - name: Check Winget package exists
+        id: winget_check
+        run: |
+          PKG_ID="dongdongbh.Mindwtr"
+          PKG_LOWER="${PKG_ID,,}"
+          FIRST="${PKG_LOWER:0:1}"
+          URL="https://github.com/microsoft/winget-pkgs/tree/master/manifests/${FIRST}/${PKG_ID//./\/}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Winget package not found yet; skipping submission."
+          fi
+
+      - name: Checkout winget-pkgs fork
+        if: steps.winget_check.outputs.exists == 'true'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: dongdongbh/winget-pkgs
+          token: ${{ secrets.PACKAGES_REPO_TOKEN }}
+          path: winget-pkgs
+
+      - name: Prepare Winget manifests
+        if: steps.winget_check.outputs.exists == 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          REPO="${{ github.repository }}"
+          SHA_EXE="${{ steps.hashes.outputs.sha_exe }}"
+          RELEASE_DATE="$(date -u +%Y-%m-%d)"
+          INSTALLER_URL="https://github.com/${REPO}/releases/download/${TAG}/mindwtr_${VERSION}_x64-setup.exe"
+          MANIFEST_DIR="winget-pkgs/manifests/d/dongdongbh/Mindwtr/${VERSION}"
+
+          mkdir -p "$MANIFEST_DIR"
+
+          cat <<EOF | sed 's/^          //' > "$MANIFEST_DIR/dongdongbh.Mindwtr.installer.yaml"
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+          PackageIdentifier: dongdongbh.Mindwtr
+          PackageVersion: ${VERSION}
+          InstallerLocale: en-US
+          InstallerType: nullsoft
+          Scope: user
+          InstallModes:
+            - interactive
+            - silent
+            - silentWithProgress
+          InstallerSwitches:
+            Silent: /S /CURRENTUSER
+            SilentWithProgress: /S /CURRENTUSER
+          UpgradeBehavior: install
+          Commands:
+            - mindwtr
+          ProductCode: Mindwtr
+          ReleaseDate: ${RELEASE_DATE}
+          AppsAndFeaturesEntries:
+            - ProductCode: Mindwtr
+          InstallationMetadata:
+            DefaultInstallLocation: '%LOCALAPPDATA%\\Programs\\Mindwtr'
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${INSTALLER_URL}
+              InstallerSha256: ${SHA_EXE}
+          ManifestType: installer
+          ManifestVersion: 1.10.0
+          EOF
+
+          INSTALLER_MANIFEST="$MANIFEST_DIR/dongdongbh.Mindwtr.installer.yaml"
+          test -s "$INSTALLER_MANIFEST"
+
+          cat <<EOF | sed 's/^          //' > "$MANIFEST_DIR/dongdongbh.Mindwtr.locale.en-US.yaml"
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+          PackageIdentifier: dongdongbh.Mindwtr
+          PackageVersion: ${VERSION}
+          PackageLocale: en-US
+          Publisher: dongdongbh
+          PublisherUrl: https://github.com/dongdongbh
+          PublisherSupportUrl: https://github.com/dongdongbh/Mindwtr/issues
+          Author: dongdongbh
+          PackageName: Mindwtr
+          PackageUrl: https://github.com/dongdongbh/Mindwtr
+          License: AGPL-3.0
+          LicenseUrl: https://github.com/dongdongbh/Mindwtr/blob/HEAD/LICENSE
+          ShortDescription: A complete Getting Things Done (GTD) productivity system.
+          Description: A complete Getting Things Done (GTD) productivity system.
+          Moniker: mindwtr
+          Tags:
+            - cross-platform
+            - getting-things-done
+            - gtd
+            - gtd-applications
+            - gtd-workflow
+            - personal-management
+            - productivity
+            - second-brain
+            - task-management
+            - todo-app
+          ReleaseNotesUrl: https://github.com/${REPO}/releases/tag/${TAG}
+          ManifestType: defaultLocale
+          ManifestVersion: 1.10.0
+          EOF
+
+          cat <<EOF | sed 's/^          //' > "$MANIFEST_DIR/dongdongbh.Mindwtr.locale.zh-CN.yaml"
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.locale.1.10.0.schema.json
+          PackageIdentifier: dongdongbh.Mindwtr
+          PackageVersion: ${VERSION}
+          PackageLocale: zh-CN
+          Publisher: dongdongbh
+          PublisherUrl: https://github.com/dongdongbh
+          PublisherSupportUrl: https://github.com/dongdongbh/Mindwtr/issues
+          Author: dongdongbh
+          PackageName: Mindwtr
+          PackageUrl: https://github.com/dongdongbh/Mindwtr
+          License: AGPL-3.0
+          LicenseUrl: https://github.com/dongdongbh/Mindwtr/blob/HEAD/LICENSE
+          ShortDescription: 完整的 GTD（搞定）任务管理系统。
+          Description: 完整的 GTD（搞定）任务管理系统。
+          Moniker: mindwtr
+          Tags:
+            - cross-platform
+            - getting-things-done
+            - gtd
+            - gtd-applications
+            - gtd-workflow
+            - personal-management
+            - productivity
+            - second-brain
+            - task-management
+            - todo-app
+          ReleaseNotesUrl: https://github.com/${REPO}/releases/tag/${TAG}
+          ManifestType: locale
+          ManifestVersion: 1.10.0
+          EOF
+
+          cat <<EOF | sed 's/^          //' > "$MANIFEST_DIR/dongdongbh.Mindwtr.yaml"
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+          PackageIdentifier: dongdongbh.Mindwtr
+          PackageVersion: ${VERSION}
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.10.0
+          EOF
+
+      - name: Submit Winget PR
+        if: steps.winget_check.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_REPO_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          BRANCH="mindwtr-${VERSION}"
+          cd winget-pkgs
+          git checkout -b "$BRANCH"
+          git add manifests/d/dongdongbh/Mindwtr/"$VERSION"
+          git config --local user.name "GitHub Actions"
+          git config --local user.email "actions@github.com"
+          git commit -m "New version: Mindwtr ${VERSION}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --head "dongdongbh:${BRANCH}" \
+            --base master \
+            --title "New version: Mindwtr ${VERSION}" \
+            --body "Automated manifest update for Mindwtr ${VERSION}."
+
+      - name: Commit and push
+        run: |
+          cd packages-repo
+          git config --local user.name "GitHub Actions"
+          git config --local user.email "actions@github.com"
+          git add bucket/mindwtr.json
+          if git diff --cached --quiet; then
+            echo "No package changes to commit."
+            exit 0
+          fi
+          git commit -m "update: Mindwtr ${{ steps.version.outputs.version }}"
+          git push
+
+  update-flathub:
+    needs: [validate, release]
+    name: Update Flathub
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.run_update_flathub && (needs.release.result == 'success' || needs.release.result == 'skipped') && !contains(inputs.tag, '-'))) }}
+    uses: ./.github/workflows/update-flathub.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    secrets: inherit
+
+  update-flathub-beta:
+    needs: [validate, release]
+    name: Update Flathub Beta
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success' && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.run_update_flathub && (needs.release.result == 'success' || needs.release.result == 'skipped') && !contains(inputs.tag, '-'))) }}
+    uses: ./.github/workflows/update-flathub.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      channel: beta
+    secrets: inherit
+
+  update-linux-repos:
+    needs: [validate, release]
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.run_update_linux_repos && (needs.release.result == 'success' || needs.release.result == 'skipped'))) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-repo.yml
+    secrets: inherit
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+  # Stable releases update both AUR beta identities so current and transitional
+  # users pick stable back up after a test cycle without switching packages.
+  update-aur-beta-bin:
+    needs: [validate, release]
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.run_update_aur && (needs.release.result == 'success' || needs.release.result == 'skipped'))) }}
+    name: Update AUR Beta
+    uses: ./.github/workflows/update-aur-beta.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    secrets: inherit
+
+  # Stable releases also land in the beta repos (matching the Flathub beta
+  # branch behavior) so beta-repo users pick stable back up after a test
+  # cycle. Runs after the stable repo publish: both jobs push to gh-pages and
+  # would race otherwise.
+  update-linux-repos-beta:
+    needs: [validate, release, update-linux-repos]
+    if: ${{ always() && needs.validate.result == 'success' && needs.update-linux-repos.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/publish-repo.yml
+    secrets: inherit
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      channel: beta
+
+  publish-chocolatey:
+    needs: [validate, release]
+    runs-on: windows-2025-vs2026
+    name: Publish Chocolatey
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success' && !contains(github.ref, '-')) || (github.event_name == 'workflow_dispatch' && inputs.run_publish_chocolatey && (needs.release.result == 'success' || needs.release.result == 'skipped'))) && vars.CHOCOLATEY_PUBLISH_ENABLED == 'true' }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Resolve release tag/version
+        id: version
+        shell: pwsh
+        run: |
+          $inputTag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          $env:GITHUB_EVENT_INPUTS_TAG = "${{ github.event.inputs.tag }}"
+          $lines = & scripts/ci/resolve-release-version.ps1 -InputTag $inputTag
+          foreach ($line in $lines) {
+            $line >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Download Windows installer and compute SHA256
+        id: installer
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $tag = "${{ steps.version.outputs.tag }}"
+          $version = "${{ steps.version.outputs.version }}"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/mindwtr_${version}_x64-setup.exe"
+          Write-Host "Waiting for release asset: $url"
+          $maxAttempts = 20
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+              $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 10 -ErrorAction Stop
+              if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400) {
+                break
+              }
+            } catch {
+              if ($attempt -eq $maxAttempts) {
+                throw "Release asset unavailable after $maxAttempts attempts: $url"
+              }
+              Start-Sleep -Seconds 15
+            }
+          }
+          $outFile = Join-Path $PWD "mindwtr-${version}-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $outFile -MaximumRedirection 10
+          $sha = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLowerInvariant()
+          "installer_url=$url" >> $env:GITHUB_OUTPUT
+          "installer_path=$outFile" >> $env:GITHUB_OUTPUT
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Installer SHA256: $sha"
+
+      - name: Ensure Chocolatey CLI exists
+        shell: pwsh
+        run: |
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            throw "Chocolatey CLI (choco) not found on runner."
+          }
+          choco --version
+
+      - name: Build Chocolatey package (auto-generated install script)
+        id: pack
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $version = "${{ steps.version.outputs.version }}"
+          $installerUrl = "${{ steps.installer.outputs.installer_url }}"
+          $sha = "${{ steps.installer.outputs.sha256 }}"
+
+          $pkgRoot = Join-Path $PWD "chocolatey-package"
+          $toolsDir = Join-Path $pkgRoot "tools"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+
+          Copy-Item "metadata/chocolatey/mindwtr.nuspec" -Destination (Join-Path $pkgRoot "mindwtr.nuspec") -Force
+          $template = Get-Content -Raw "metadata/chocolatey/tools/chocolateyInstall.ps1.template"
+          $installScript = $template.Replace("__INSTALLER_URL__", $installerUrl).Replace("__CHECKSUM__", $sha)
+          Set-Content -Path (Join-Path $toolsDir "chocolateyInstall.ps1") -Value $installScript -Encoding UTF8 -NoNewline
+
+          Push-Location $pkgRoot
+          choco pack "mindwtr.nuspec" --version "$version"
+          Pop-Location
+
+          $nupkg = Get-ChildItem -Path $pkgRoot -Filter "mindwtr.$version.nupkg" | Select-Object -First 1
+          if (-not $nupkg) {
+            throw "Failed to generate Chocolatey package for version $version."
+          }
+          "nupkg_path=$($nupkg.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "Generated package: $($nupkg.FullName)"
+
+      - name: Smoke test Chocolatey package locally
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $pkgRoot = Join-Path $PWD "chocolatey-package"
+          choco install mindwtr --source "$pkgRoot" --force --no-progress -y
+
+      - name: Push package to Chocolatey
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            throw "Missing CHOCOLATEY_API_KEY secret."
+          }
+          $nupkg = "${{ steps.pack.outputs.nupkg_path }}"
+          $output = choco push "$nupkg" --source "https://push.chocolatey.org/" --api-key "$env:CHOCOLATEY_API_KEY" --timeout 2700 2>&1
+          $exitCode = $LASTEXITCODE
+          $text = ($output | Out-String)
+          Write-Host $text
+          if ($exitCode -ne 0) {
+            if ($text -match "already exists") {
+              Write-Host "Chocolatey package version already exists. Skipping duplicate push."
+              exit 0
+            }
+            throw "Chocolatey push failed."
+          }
+
+  update-aur:
+    needs: [validate, release]
+    # Pinned on purpose: this job builds or packages with tools from the runner image,
+    # and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19. Bump CI first, then this.
+    runs-on: ubuntu-24.04
+    name: Update AUR (mindwtr-bin)
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    if: ${{ always() && needs.validate.result == 'success' && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') && ((startsWith(github.ref, 'refs/tags/') && github.event_name == 'push' && needs.release.result == 'success') || (github.event_name == 'workflow_dispatch' && inputs.run_update_aur && (needs.release.result == 'success' || needs.release.result == 'skipped'))) }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Resolve release version
+        id: version
+        env:
+          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          GITHUB_EVENT_INPUTS_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "${INPUT_TAG:-}" ] && ! echo "${INPUT_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid tag format" >&2
+            exit 1
+          fi
+          scripts/ci/resolve-release-version.sh "$INPUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD version
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          echo "Updating PKGBUILD to version $VERSION"
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+        shell: bash
+
+      - name: Configure SSH for AUR
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "Missing AUR_SSH_PRIVATE_KEY secret."
+            exit 1
+          fi
+
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            HostKeyAlgorithms ssh-ed25519
+            StrictHostKeyChecking yes
+          EOF
+
+          : > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$RUNNER_TEMP/aur-known-hosts" 2>/dev/null
+          ACTUAL_FINGERPRINT="$(ssh-keygen -lf "$RUNNER_TEMP/aur-known-hosts" -E sha256 | awk '{print $2}')"
+          EXPECTED_FINGERPRINT='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          if [ "$ACTUAL_FINGERPRINT" != "$EXPECTED_FINGERPRINT" ]; then
+            echo "AUR SSH host fingerprint mismatch: expected ${EXPECTED_FINGERPRINT}, got ${ACTUAL_FINGERPRINT:-missing}." >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/aur-known-hosts" ~/.ssh/known_hosts
+
+      - name: Clone AUR repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf aur-mindwtr-bin
+          for attempt in 1 2 3; do
+            if git clone ssh://aur@aur.archlinux.org/mindwtr-bin.git aur-mindwtr-bin; then
+              exit 0
+            fi
+            echo "AUR clone attempt ${attempt} failed; retrying..." >&2
+            rm -rf aur-mindwtr-bin
+            sleep 3
+          done
+          echo "Failed to clone mindwtr-bin from AUR after 3 attempts." >&2
+          exit 1
+
+      - name: Sync PKGBUILD into AUR repo
+        shell: bash
+        run: cp aur/PKGBUILD aur-mindwtr-bin/PKGBUILD
+
+      - name: Update .SRCINFO and smoke package
+        run: |
+          HOST_UID="$(id -u)"
+          HOST_GID="$(id -g)"
+          docker run --rm \
+            -e HOST_UID="$HOST_UID" \
+            -e HOST_GID="$HOST_GID" \
+            -v "$PWD/aur-mindwtr-bin:/aur" \
+            -w /aur \
+            archlinux:latest \
+            bash -lc '
+              set -euo pipefail
+              pacman -Sy --noconfirm --needed base-devel git pacman-contrib
+              getent group "$HOST_GID" >/dev/null 2>&1 || groupadd -g "$HOST_GID" builder
+              id -u builder >/dev/null 2>&1 || useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+              chown -R builder:builder /aur
+              su builder -c "updpkgsums"
+              su builder -c "makepkg --verifysource --noconfirm"
+              su builder -c "makepkg --cleanbuild --clean --nodeps --noconfirm"
+              su builder -c "makepkg --printsrcinfo > /aur/.SRCINFO"
+            '
+        shell: bash
+
+      - name: Validate AUR package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/ci/validate-aur-package.mjs \
+            --package-dir aur-mindwtr-bin \
+            --package mindwtr-bin
+
+      - name: Verify AUR package ownership before push
+        shell: bash
+        run: node scripts/ci/audit-aur-state.mjs
+
+      - name: Commit and push changes
+        shell: bash
+        working-directory: aur-mindwtr-bin
+        env:
+          AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain -- PKGBUILD .SRCINFO)" ]; then
+            echo "No AUR binary-package changes to publish."
+            exit 0
+          fi
+
+          git config --local user.name "${AUR_USERNAME:-mindwtr-bot}"
+          git config --local user.email "${AUR_EMAIL:-actions@github.com}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${{ steps.version.outputs.tag }}"
+
+          PUSH_LOG="$RUNNER_TEMP/aur-bin-push.log"
+          if git push origin master 2>&1 | tee "$PUSH_LOG"; then
+            exit 0
+          fi
+          if grep -Eqi 'AUR is down due to maintenance|disabled (all )?AUR pushes|pushes (are|have been) disabled' "$PUSH_LOG"; then
+            echo "::warning::AUR publication delayed by Arch maintenance/security controls. Re-dispatch once pushes are restored."
+            exit 0
+          fi
+          echo "Failed to push mindwtr-bin to AUR." >&2
+          exit 1
