@@ -8,7 +8,7 @@
 
 A free to-do app built on Getting Things Done (GTD). Works offline, no account needed.
 
-20,000+ users · Windows · macOS · Linux · iOS · Android
+30,000+ users · Windows · macOS · Linux · iOS · Android
 
 [**Download**](https://mindwtr.app/#download) · [Features](#highlights) · [Docs](https://docs.mindwtr.app/) · [中文](./README_zh.md)
 
@@ -61,6 +61,13 @@ A free to-do app built on Getting Things Done (GTD). Works offline, no account n
          alt="Get it on F-Droid"
          style="height: 74px"
          height="74" />
+  </a>
+  <a href="https://appimage.github.io/Mindwtr/" target="_blank">
+    <img alt="Download as an AppImage"
+         src="https://docs.appimage.org/_images/download-appimage-banner.svg"
+         align="center"
+         style="height: 50px"
+         height="50" />
   </a>
   <a href="https://snapcraft.io/mindwtr" target="_blank">
     <img alt="Get it from the Snap Store"

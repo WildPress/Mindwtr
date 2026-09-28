@@ -2,15 +2,20 @@ import React, { useCallback } from 'react';
 import { Alert, Share } from 'react-native';
 import {
     formatAIErrorAlertBody,
+    canSkipRecurringTaskOccurrence,
     Task,
     TaskStatus,
     TimeEstimate,
     createAIProvider,
+    createTaskCancellationUndo,
     generateUUID,
     type AIProviderId,
+    type Language,
+    getChecklistEditStatus,
     getUsedTaskTokens,
     tFallback,
     type StoreActionResult,
+    useTaskStore,
 } from '@mindwtr/core';
 
 import type { AIResponseAction } from '../ai-response-modal';
@@ -44,6 +49,7 @@ type ShowToast = (options: {
 
 type TaskEditActionsParams = {
     aiEnabled: boolean;
+    language?: Language;
     closeAIModal: () => void;
     deleteTask: (taskId: string) => Promise<StoreActionResult>;
     descriptionDraft: string;
@@ -61,6 +67,7 @@ type TaskEditActionsParams = {
     prioritiesEnabled: boolean;
     projectContext?: Record<string, unknown> | null;
     resetTaskChecklist: (taskId: string) => Promise<StoreActionResult>;
+    skipRecurringTaskOccurrence: (taskId: string) => Promise<StoreActionResult>;
     restoreTask: (taskId: string) => Promise<StoreActionResult>;
     setAiModal: React.Dispatch<React.SetStateAction<AIResponseModalState>>;
     setChecklist: SetTaskEditDraftValue<Task['checklist']>;
@@ -79,6 +86,7 @@ type TaskEditActionsParams = {
 
 export function useTaskEditActions({
     aiEnabled,
+    language = 'en',
     closeAIModal,
     deleteTask,
     descriptionDraft,
@@ -96,6 +104,7 @@ export function useTaskEditActions({
     prioritiesEnabled,
     projectContext,
     resetTaskChecklist,
+    skipRecurringTaskOccurrence,
     restoreTask,
     setAiModal,
     setChecklist,
@@ -111,6 +120,7 @@ export function useTaskEditActions({
     titleDraftRef,
     canMutate = () => true,
 }: TaskEditActionsParams) {
+    const cancellationBeforeRef = React.useRef<Task | null>(null);
     const showTaskWriteError = useCallback((message?: string) => showToast({
         title: tFallback(t, 'common.error', 'Error'),
         message: message || tFallback(t, 'task.updateFailed', 'Could not update task.'),
@@ -136,15 +146,7 @@ export function useTaskEditActions({
     const applyChecklistUpdate = useCallback((nextChecklist: NonNullable<Task['checklist']>) => {
         if (!canMutate()) return;
         const currentStatus = taskEditDraft?.draft.status ?? task?.status ?? 'inbox';
-        let nextStatus = currentStatus;
-        if (task?.taskMode === 'list') {
-            const allComplete = nextChecklist.length > 0 && nextChecklist.every((item) => item.isCompleted);
-            if (allComplete) {
-                nextStatus = 'done';
-            } else if (currentStatus === 'done') {
-                nextStatus = 'next';
-            }
-        }
+        const nextStatus = getChecklistEditStatus({ taskMode: task?.taskMode, status: currentStatus, checklist: nextChecklist });
         setChecklist(nextChecklist);
         if (nextStatus !== currentStatus) setDraftField('status', nextStatus);
     }, [canMutate, setChecklist, setDraftField, task?.status, task?.taskMode, taskEditDraft?.draft.status]);
@@ -152,11 +154,15 @@ export function useTaskEditActions({
     const handleResetChecklist = useCallback(async () => {
         const current = taskEditDraft?.checklist || [];
         if (current.length === 0 || !task) return;
-        const succeeded = await runStoreAction(
-            () => resetTaskChecklist(task.id),
-            'Failed to reset checklist',
-        );
-        if (!succeeded) return;
+        // Items added in this editor are not saved yet: only the draft reopens them.
+        const saved = useTaskStore.getState()._tasksById.get(task.id) ?? task;
+        if (saved.checklist?.length) {
+            const succeeded = await runStoreAction(
+                () => resetTaskChecklist(task.id),
+                'Failed to reset checklist',
+            );
+            if (!succeeded) return;
+        }
         const reset = current.map((item) => ({ ...item, isCompleted: false }));
         applyChecklistUpdate(reset);
     }, [applyChecklistUpdate, resetTaskChecklist, runStoreAction, task, taskEditDraft?.checklist]);
@@ -340,8 +346,65 @@ export function useTaskEditActions({
 
     const handleCancelTask = useCallback(async () => {
         if (!task || !canMutate()) return;
-        await draftLifecycle.cancel();
-    }, [canMutate, draftLifecycle, task]);
+        const before = cancellationBeforeRef.current?.id === task.id
+            ? cancellationBeforeRef.current
+            : useTaskStore.getState()._tasksById.get(task.id) ?? task;
+        cancellationBeforeRef.current = before;
+        try {
+            if (!await draftLifecycle.cancel()) {
+                const current = useTaskStore.getState()._tasksById.get(task.id);
+                if (current?.status !== 'archived' || !current.cancelledAt) cancellationBeforeRef.current = null;
+                return;
+            }
+            cancellationBeforeRef.current = null;
+            const cancelledAt = useTaskStore.getState()._tasksById.get(task.id)?.cancelledAt;
+            const undoCancellation = createTaskCancellationUndo(before, cancelledAt);
+            const restore = async () => {
+                const outcome = await undoCancellation();
+                if (outcome.success) return;
+                logTaskError('Failed to undo task cancellation', new Error(outcome.error || 'Cancellation was superseded'));
+                showToast({
+                    title: tFallback(t, 'common.error', 'Error'),
+                    message: outcome.error || tFallback(t, 'task.updateFailed', 'Could not update task.'),
+                    tone: 'error',
+                    durationMs: 5200,
+                    ...(outcome.retryable ? {
+                        actionLabel: tFallback(t, 'common.undo', 'Undo'),
+                        onAction: restore,
+                    } : {}),
+                });
+            };
+            showToast({
+                title: tFallback(t, 'common.notice', 'Notice'),
+                message: tFallback(t, 'task.cancelledWithRestore', 'Task cancelled. You can restore it from Archive.'),
+                tone: 'info',
+                durationMs: 5200,
+                ...(useTaskStore.getState().settings?.undoNotificationsEnabled === false ? {} : {
+                    actionLabel: tFallback(t, 'common.undo', 'Undo'),
+                    onAction: restore,
+                }),
+            });
+        } catch (error) {
+            logTaskError('Failed to cancel task', error);
+            showTaskWriteError(error instanceof Error ? error.message : undefined);
+        }
+    }, [canMutate, draftLifecycle, showTaskWriteError, showToast, t, task]);
+
+    const handleSkipOccurrence = useCallback(async () => {
+        if (!task || !canMutate()) return;
+        if (draftLifecycle.hasPendingChanges()) {
+            if (!canSkipRecurringTaskOccurrence({ ...task, ...mergedTask })) {
+                showTaskWriteError(tFallback(t, 'task.skipOccurrenceSaveFirst', 'Save or discard status and recurrence changes before skipping.'));
+                return;
+            }
+            if (!await draftLifecycle.save()) return;
+        }
+        const skipped = await runStoreAction(
+            () => skipRecurringTaskOccurrence(task.id),
+            'Failed to skip recurring occurrence',
+        );
+        if (skipped) onClose();
+    }, [canMutate, draftLifecycle, mergedTask, onClose, runStoreAction, showTaskWriteError, skipRecurringTaskOccurrence, t, task]);
 
     const handleConvertToReference = useCallback(() => {
         if (!canMutate()) return;
@@ -378,8 +441,8 @@ export function useTaskEditActions({
             Alert.alert(t('ai.missingKeyTitle'), t('ai.missingKeyBody'));
             return null;
         }
-        return createAIProvider(buildAIConfig(settings, apiKey));
-    }, [aiEnabled, settings, t]);
+        return createAIProvider(buildAIConfig(settings, apiKey, language));
+    }, [aiEnabled, language, settings, t]);
 
     const applyAISuggestion = useCallback((suggested: { title?: string; context?: string; timeEstimate?: TimeEstimate }) => {
         if (!canMutate()) return;
@@ -532,6 +595,7 @@ export function useTaskEditActions({
         handleConvertToReference,
         handleConvertToSection,
         handleCancelTask,
+        handleSkipOccurrence,
         handleDeleteTask,
         handleDone,
         handleDuplicateTask,

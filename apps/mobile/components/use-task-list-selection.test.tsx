@@ -49,9 +49,8 @@ const baseParams = (overrides: Partial<HookParams> = {}): HookParams => ({
   batchDeleteTasks: vi.fn(async () => ({ success: true } as StoreActionResult)),
   batchMoveTasks: vi.fn(async () => ({ success: true } as StoreActionResult)),
   batchUpdateTasks: vi.fn(async () => ({ success: true } as StoreActionResult)),
-  restoreActionLabel: 'Restore',
   restoreTask: vi.fn(async () => undefined),
-  t: (key: string) => key,
+  t: (key: string) => ({ 'common.undo': 'Undo', 'list.countTaskSingular': 'task', 'common.tasks': 'tasks' }[key] ?? key),
   tasksById: { a: makeTask('a') },
   ...overrides,
 });
@@ -109,7 +108,8 @@ describe('useTaskListSelection handleBatchDelete', () => {
     const toasts = mocks.showToast.mock.calls.map((call) => call[0]);
     const success = toasts.find((toast) => toast.tone === 'success');
     expect(success).toBeTruthy();
-    expect(success?.actionLabel).toBe('Restore');
+    expect(success?.message).toBe('1 task');
+    expect(success?.actionLabel).toBe('Undo');
     expect(hookRef.selectionMode).toBe(false);
     expect(hookRef.hasSelection).toBe(false);
   });
@@ -202,6 +202,33 @@ describe('useTaskListSelection handleBatchRemoveTags', () => {
     expect(toasts.some((toast) => toast.tone === 'success')).toBe(false);
     expect(toasts.some((toast) => toast.tone === 'warning')).toBe(true);
     expect(hookRef.hasSelection).toBe(true);
+  });
+
+  it('keeps the typed tag when Add tag fails, and clears it once a write succeeds', async () => {
+    let result: StoreActionResult = { success: false, error: 'nope' };
+    const batchUpdateTasks = vi.fn(async () => result);
+    renderer.act(() => {
+      renderer.create(<Harness {...baseParams({ batchUpdateTasks, tasksById: taggedTasks })} />);
+    });
+    renderer.act(() => {
+      hookRef.toggleMultiSelect('a');
+      hookRef.setTagModalVisible(true);
+      hookRef.setTagInput('#new');
+    });
+
+    await renderer.act(async () => {
+      await hookRef.handleBatchAddTag();
+    });
+    // The dialog closes so the warning toast shows; reopening it shows the tag again.
+    expect(hookRef.tagModalVisible).toBe(false);
+    expect(hookRef.tagInput).toBe('#new');
+    expect(hookRef.hasSelection).toBe(true);
+
+    result = { success: true };
+    await renderer.act(async () => {
+      await hookRef.handleBatchAddTag();
+    });
+    expect(hookRef.tagInput).toBe('');
   });
 });
 

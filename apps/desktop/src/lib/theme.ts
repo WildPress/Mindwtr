@@ -2,6 +2,7 @@ import type { AppData } from '@mindwtr/core';
 import { THEME_DESCRIPTORS, resolveThemeColorScheme, themeDescriptor } from '@mindwtr/core';
 
 import { invokeNative } from './tauri-invoke';
+import { isLinuxRuntime } from './runtime';
 
 // The themes desktop ships CSS for, read off core's registry rather than
 // hand-listed here: `desktop: false` themes (material3-*) collapse below.
@@ -28,7 +29,7 @@ type NativeThemeWindowModule = {
 
 export const THEME_STORAGE_KEY = 'mindwtr-theme';
 const SYSTEM_THEME_MEDIA_QUERY = '(prefers-color-scheme: dark)';
-const COMMAND_THEME_POLL_INTERVAL_MS = 2000;
+const SYSTEM_THEME_PORTAL_CHANGED_EVENT = 'system-theme-portal-changed';
 let cachedSystemThemePreference: SystemThemePreference = null;
 
 const isDesktopThemeMode = (value: string | null | undefined): value is DesktopThemeMode => (
@@ -94,8 +95,12 @@ export const watchSystemThemePreference = (
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return () => { };
 
     const mediaQuery = window.matchMedia(SYSTEM_THEME_MEDIA_QUERY);
+    let lastNotifiedTheme: NativeThemePreference | null = null;
     const handler = (event: MediaQueryListEvent | { matches: boolean }) => {
-        onChange(event.matches ? 'dark' : 'light');
+        const theme = event.matches ? 'dark' : 'light';
+        if (theme === lastNotifiedTheme) return;
+        lastNotifiedTheme = theme;
+        onChange(theme);
     };
 
     if (typeof mediaQuery.addEventListener === 'function') {
@@ -116,6 +121,8 @@ export const watchNativeSystemThemePreference = (
     onChange: (theme: NativeThemePreference) => void,
     onError?: (step: 'resolveSystem' | 'watch', error: unknown) => void,
 ): (() => void) => {
+    // GTK theme events reflect our own setTheme calls on Linux, not the portal preference.
+    if (isLinuxRuntime()) return () => { };
     let cancelled = false;
     let stopWatchingNativeTheme = () => { };
 
@@ -164,50 +171,31 @@ export const watchNativeSystemThemePreference = (
     };
 };
 
-export const watchSystemThemeCommandPreference = (
+export const watchSystemThemePortalPreference = (
+    loadEventModule: () => Promise<{
+        listen: (event: string, listener: (event: { payload: unknown }) => void) => Promise<() => void>;
+    }>,
     onChange: (theme: NativeThemePreference) => void,
-    onError?: (step: 'resolveSystem', error: unknown) => void,
-    pollIntervalMs = COMMAND_THEME_POLL_INTERVAL_MS,
+    onError?: (step: 'watch', error: unknown) => void,
 ): (() => void) => {
-    if (typeof window === 'undefined') return () => { };
-
     let cancelled = false;
-    let lastTheme: SystemThemePreference = null;
-    let pollInFlight = false;
-
-    const emitIfChanged = (theme: SystemThemePreference) => {
-        if (!theme || theme === lastTheme) return;
-        lastTheme = theme;
-        onChange(theme);
-    };
-
-    const poll = async () => {
-        if (cancelled || pollInFlight) return;
-        pollInFlight = true;
-        try {
-            const theme = coerceSystemThemePreference(
-                await invokeNative('get_system_theme_preference')
-            );
-            if (!cancelled) {
-                emitIfChanged(theme);
-            }
-        } catch (error) {
-            if (!cancelled) {
-                onError?.('resolveSystem', error);
-            }
-        } finally {
-            pollInFlight = false;
-        }
-    };
-
-    void poll();
-    const pollTimer = window.setInterval(() => {
-        void poll();
-    }, pollIntervalMs);
+    let unlisten = () => { };
+    void loadEventModule()
+        .then(({ listen }) => listen(SYSTEM_THEME_PORTAL_CHANGED_EVENT, ({ payload }) => {
+            const theme = coerceSystemThemePreference(payload);
+            if (!cancelled && theme) onChange(theme);
+        }))
+        .then((stop) => {
+            if (cancelled) stop();
+            else unlisten = stop;
+        })
+        .catch((error) => {
+            if (!cancelled) onError?.('watch', error);
+        });
 
     return () => {
         cancelled = true;
-        window.clearInterval(pollTimer);
+        unlisten();
     };
 };
 
@@ -229,17 +217,40 @@ export const applyThemeMode = (mode: DesktopThemeMode | null, systemTheme?: Syst
     root.classList.remove(...Object.values(THEME_MODE_CLASSES));
 
     const prefersDark = resolveSystemThemePreference(systemTheme) === 'dark';
-    root.classList.toggle(
-        'dark',
-        mode === 'system' || mode === null ? prefersDark : resolveThemeColorScheme(mode, 'light') === 'dark',
-    );
+    const isDark = mode === null ? prefersDark : resolveThemeColorScheme(mode, prefersDark ? 'dark' : 'light') === 'dark';
+    root.classList.toggle('dark', isDark);
 
-    const themeClass = THEME_MODE_CLASSES[mode as keyof typeof THEME_MODE_CLASSES];
+    const themeClass = mode === 'system-oled' && isDark
+        ? THEME_MODE_CLASSES.oled
+        : THEME_MODE_CLASSES[mode as keyof typeof THEME_MODE_CLASSES];
     if (themeClass) root.classList.add(themeClass);
 };
 
-export const resolveNativeTheme = (mode: DesktopThemeMode | null): 'light' | 'dark' | null => {
-    if (!mode || mode === 'system') return null;
+export const applySystemThemeChange = (
+    mode: DesktopThemeMode | null,
+    theme: NativeThemePreference,
+    applyNative: (theme: NativeThemePreference) => void,
+): void => {
+    applyThemeMode(mode, theme);
+    if (isLinuxRuntime()) applyNative(theme);
+};
+
+export const applyStartupSystemThemeBeforeApp = async (
+    result: Promise<SystemThemePreference>,
+    appOwnsTheme: () => boolean,
+    apply: (theme: NativeThemePreference) => void,
+): Promise<void> => {
+    const theme = await result;
+    if (theme && !appOwnsTheme()) apply(theme);
+};
+
+export const resolveNativeTheme = (
+    mode: DesktopThemeMode | null,
+    systemTheme = resolveSystemThemePreference(),
+): 'light' | 'dark' | null => {
+    if (!mode || mode === 'system' || mode === 'system-oled') {
+        return isLinuxRuntime() ? systemTheme : null;
+    }
     return resolveThemeColorScheme(mode, 'light');
 };
 
@@ -248,17 +259,19 @@ export const applyNativeTheme = async (
     loadAppModule: () => Promise<NativeThemeAppModule>,
     loadWindowModule: () => Promise<NativeThemeWindowModule>,
     onError?: (step: 'app' | 'window', error: unknown) => void,
-): Promise<void> => {
-    await Promise.all([
+): Promise<boolean> => {
+    const applied = await Promise.all([
         loadAppModule()
-            .then(({ setTheme }) => setTheme(theme))
-            .catch((error) => onError?.('app', error)),
+            .then(async ({ setTheme }) => { await setTheme(theme); return true; })
+            .catch((error) => { onError?.('app', error); return false; }),
         loadWindowModule()
-            .then(({ getCurrentWindow }) => {
+            .then(async ({ getCurrentWindow }) => {
                 const currentWindow = getCurrentWindow();
-                if (typeof currentWindow.setTheme !== 'function') return undefined;
-                return currentWindow.setTheme(theme);
+                if (typeof currentWindow.setTheme !== 'function') return false;
+                await currentWindow.setTheme(theme);
+                return true;
             })
-            .catch((error) => onError?.('window', error)),
+            .catch((error) => { onError?.('window', error); return false; }),
     ]);
+    return applied.every(Boolean);
 };

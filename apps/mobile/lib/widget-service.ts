@@ -124,7 +124,6 @@ function createPayloadProjectionFromData(data: AppData, language: Language): Wid
 // The native widget's task list scrolls (RemoteViewsService), so the payload
 // carries a fixed slice instead of a per-widget-height budget.
 const ANDROID_WIDGET_MAX_ITEMS = 200;
-const ANDROID_WIDGET_LIST_BUDGET_RELEASE_CHECK = 'v1.3.1/android-widget-list-budget';
 const ANDROID_WIDGET_RELEASE_CHECK = 'v1.3.0/android-native-widget';
 const ANDROID_WIDGET_PROVIDER_COMPAT_RELEASE_CHECK = 'v1.3.0/android-widget-provider-compat';
 const WIDGET_FOCUS_TODAY_RELEASE_CHECK = 'v1.3.0/widget-focus-today';
@@ -154,6 +153,7 @@ async function updateAndroidWidgetsFromData(rendered: TasksWidgetPayload, langua
         // Older installed native modules return only the compatibility count.
         const legacyWidgetCount = typeof refreshResult === 'number' ? refreshResult : refreshResult?.legacyWidgetCount;
         const hiddenCheckoffCount = typeof refreshResult === 'object' ? refreshResult.hiddenCheckoffCount : undefined;
+        const serializedCheckoffCount = typeof refreshResult === 'object' ? refreshResult.serializedCheckoffCount : undefined;
         const directCollectionCount = typeof refreshResult === 'object' ? refreshResult.directCollectionCount : undefined;
         const renderedTaskCount = typeof refreshResult === 'object' ? refreshResult.renderedTaskCount : undefined;
         const eligibleTaskCount = typeof refreshResult === 'object' ? refreshResult.eligibleTaskCount : undefined;
@@ -167,7 +167,6 @@ async function updateAndroidWidgetsFromData(rendered: TasksWidgetPayload, langua
             void logInfo('Android widget list rendered within parcel budget', {
                 scope: 'widget',
                 extra: {
-                    releaseCheck: ANDROID_WIDGET_LIST_BUDGET_RELEASE_CHECK,
                     count: String(directCollectionCount),
                     items: String(renderedTaskCount),
                     totalItems: String(eligibleTaskCount),
@@ -181,6 +180,15 @@ async function updateAndroidWidgetsFromData(rendered: TasksWidgetPayload, langua
                 extra: {
                     releaseCheck: 'v1.3.1/widget-checkoff-hide',
                     count: String(hiddenCheckoffCount),
+                },
+            });
+        }
+        if (typeof serializedCheckoffCount === 'number' && serializedCheckoffCount > 0) {
+            void logInfo('Android widget check-off state serialized', {
+                scope: 'widget',
+                extra: {
+                    releaseCheck: 'v1.3.2/widget-checkoff-serialized',
+                    count: String(serializedCheckoffCount),
                 },
             });
         }
@@ -447,6 +455,11 @@ export async function updateMobileWidgetFromData(data: AppData): Promise<boolean
             // function's promise settles, so a fire-and-forget write could
             // never land (correction #5).
             await AsyncStorage.setItem(WIDGET_FINGERPRINT_STORAGE_KEY, widgetFingerprint).catch(() => undefined);
+            void logInfo('Widget Focus pools published to native host', {
+                scope: 'widget',
+                force: true,
+                extra: { releaseCheck: 'v1.3.2/widget-focus-pools' },
+            });
         }
     }
 

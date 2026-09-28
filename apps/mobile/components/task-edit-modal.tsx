@@ -7,10 +7,11 @@ import { Task,
     type Attachment,
     type AttachmentDraftSettlementInput,
     type RecurrenceWeekday,
-    type RecurrenceByDay,
     type TaskStatus,
-    buildRRuleString,
-    parseRRuleString,
+    buildTaskEditorMonthlyCustomRRule,
+    getTaskEditorMonthlyCustom,
+    getRetainedTaskContexts,
+    isTaskEditorTimeSpentEnabled,
     resolveAutoTextDirection,
     DEFAULT_PROJECT_COLOR,
     getLocalizedWeekdayButtons,
@@ -20,11 +21,13 @@ import { Task,
     resolveTaskViewSection,
     resolveFeatureFlags,
     isProjectedRecurringTask,
+    canSkipRecurringTaskOccurrence,
     isTaskActionable,
     setTaskViewSectionId,
     shallow,
     sortViewSectionDefinitions,
-    tFallback, } from '@mindwtr/core';
+    tFallback,
+    toggleTaskEditorToken, } from '@mindwtr/core';
 import { taskDraftToUpdatePatch } from '@mindwtr/core/task-draft';
 import { useLanguage } from '../contexts/language-context';
 import { useThemeColors } from '@/hooks/use-theme-colors';
@@ -174,6 +177,7 @@ function TaskEditModalInner({
     const { showToast } = useToast();
     const {
         tasks,
+        allTasks,
         projects,
         allProjects,
         sections,
@@ -185,6 +189,7 @@ function TaskEditModalInner({
         promoteTaskToProject,
         convertTaskToSection,
         resetTaskChecklist,
+        skipRecurringTaskOccurrence,
         addProject,
         addSection,
         addArea,
@@ -199,6 +204,7 @@ function TaskEditModalInner({
         const derived = state.getDerivedState();
         return {
             tasks: state.tasks,
+            allTasks: state._allTasks,
             projects: state.projects,
             allProjects: state._allProjects,
             sections: state.sections,
@@ -210,6 +216,7 @@ function TaskEditModalInner({
             promoteTaskToProject: state.promoteTaskToProject,
             convertTaskToSection: state.convertTaskToSection,
             resetTaskChecklist: state.resetTaskChecklist,
+            skipRecurringTaskOccurrence: state.skipRecurringTaskOccurrence,
             addProject: state.addProject,
             addSection: state.addSection,
             addArea: state.addArea,
@@ -222,6 +229,10 @@ function TaskEditModalInner({
             tagTokenUsage: derived.tagTokenUsage,
         };
     }, shallow);
+    const contextHistory = useMemo(
+        () => getRetainedTaskContexts(allTasks),
+        [allTasks],
+    );
     const { t, language } = useLanguage();
     // Already identity-stable: resolveThemeTokens caches its result on the theme,
     // so this only changes when a colour actually does (#766).
@@ -232,7 +243,7 @@ function TaskEditModalInner({
     const resolvedFeatureFlags = resolveFeatureFlags(settings);
     const prioritiesEnabled = resolvedFeatureFlags.priorities;
     const timeEstimatesEnabled = resolvedFeatureFlags.timeEstimates;
-    const timeSpentEnabled = resolvedFeatureFlags.pomodoro && settings.gtd?.pomodoro?.linkTask === true;
+    const timeSpentEnabled = isTaskEditorTimeSpentEnabled(settings);
     const resetCopilotStateRef = useRef<() => void>(() => {});
     const settleAttachmentDraftRef = useRef<(input: AttachmentDraftSettlementInput) => void>(() => {});
     const settleAttachmentDraft = useCallback((input: AttachmentDraftSettlementInput) => {
@@ -258,6 +269,7 @@ function TaskEditModalInner({
         aiModal,
         acknowledgeRecoveredActivityInput,
         checklistDraftRef,
+        cancelRetryPending,
         contextInputDraft,
         customWeekdays,
         descriptionDebounceRef,
@@ -365,6 +377,7 @@ function TaskEditModalInner({
         applyCopilotSuggestion,
     } = useTaskEditCopilot({
         settings,
+        language,
         aiEnabled,
         aiProvider,
         timeEstimatesEnabled,
@@ -432,7 +445,7 @@ function TaskEditModalInner({
         editedTags: draftTags,
         contextInputDraft,
         tagInputDraft,
-        allContexts,
+        contextHistory,
         allTags,
         contextTokenUsage,
         tagTokenUsage,
@@ -595,7 +608,7 @@ function TaskEditModalInner({
     const [customInterval, setCustomInterval] = useState(1);
     const [customMode, setCustomMode] = useState<'date' | 'nth' | 'lastDay'>('date');
     const [customOrdinal, setCustomOrdinal] = useState<'1' | '2' | '3' | '4' | '-1'>('1');
-    const [customWeekday, setCustomWeekday] = useState<RecurrenceWeekday>(monthlyWeekdayCode);
+    const [customWeekday, setCustomWeekday] = useState<RecurrenceWeekday | 'WEEKDAY'>(monthlyWeekdayCode);
     const [customMonthDays, setCustomMonthDays] = useState<number[]>([monthlyAnchorDate.getDate()]);
     const [waitingAssignmentModalVisible, setWaitingAssignmentModalVisible] = useState(false);
     const [waitingAssignmentInput, setWaitingAssignmentInput] = useState('');
@@ -619,50 +632,23 @@ function TaskEditModalInner({
     }, []);
 
     const openCustomRecurrence = useCallback(() => {
-        const parsed = parseRRuleString(recurrenceRRuleValue);
-        const interval = parsed.interval && parsed.interval > 0 ? parsed.interval : 1;
-        let mode: 'date' | 'nth' | 'lastDay' = 'date';
-        let ordinal: '1' | '2' | '3' | '4' | '-1' = '1';
-        let weekday: RecurrenceWeekday = monthlyWeekdayCode;
-        const monthDays = (parsed.byMonthDay ?? []).filter((day) => day === -1 || (day >= 1 && day <= 31));
-        if (monthDays.length === 1 && monthDays[0] === -1) {
-            mode = 'lastDay';
-        } else if (monthDays.length > 0) {
-            mode = 'date';
-            setCustomMonthDays(monthDays);
-        }
-        const token = parsed.byDay?.find((day) => /^(-1|1|2|3|4)/.test(String(day)));
-        if (token) {
-            const match = String(token).match(/^(-1|1|2|3|4)?(SU|MO|TU|WE|TH|FR|SA)$/);
-            if (match) {
-                mode = 'nth';
-                ordinal = (match[1] ?? '1') as '1' | '2' | '3' | '4' | '-1';
-                weekday = match[2] as RecurrenceWeekday;
-            }
-        }
-        setCustomInterval(interval);
-        setCustomMode(mode);
-        setCustomOrdinal(ordinal);
-        setCustomWeekday(weekday);
-        if (monthDays.length === 0 || (monthDays.length === 1 && monthDays[0] === -1)) {
-            setCustomMonthDays([monthlyAnchorDate.getDate()]);
-        }
+        const custom = getTaskEditorMonthlyCustom(recurrenceRRuleValue, monthlyAnchorDate);
+        setCustomInterval(custom.interval);
+        setCustomMode(custom.mode);
+        setCustomOrdinal(custom.ordinal);
+        setCustomWeekday(custom.weekday);
+        setCustomMonthDays(custom.monthDays);
         setCustomRecurrenceVisible(true);
-    }, [monthlyAnchorDate, monthlyWeekdayCode, recurrenceRRuleValue]);
+    }, [monthlyAnchorDate, recurrenceRRuleValue]);
 
     const applyCustomRecurrence = useCallback(() => {
-        const parsed = parseRRuleString(recurrenceRRuleValue);
-        const intervalValue = Number(customInterval);
-        const safeInterval = Number.isFinite(intervalValue) && intervalValue > 0 ? intervalValue : 1;
-        // buildRRuleString clamps, dedupes and sorts the list.
-        const safeMonthDays = customMonthDays.length > 0 ? customMonthDays : [1];
-        const ends = { count: parsed.count, until: parsed.until };
-        const rrule = customMode === 'nth'
-            ? buildRRuleString('monthly', [`${customOrdinal}${customWeekday}` as RecurrenceByDay], safeInterval, ends)
-            : buildRRuleString('monthly', undefined, safeInterval, {
-                ...ends,
-                byMonthDay: customMode === 'lastDay' ? [-1] : safeMonthDays,
-            });
+        const rrule = buildTaskEditorMonthlyCustomRRule(recurrenceRRuleValue, {
+            interval: customInterval,
+            mode: customMode,
+            ordinal: customOrdinal,
+            weekday: customWeekday,
+            monthDays: customMonthDays,
+        });
         setDraftField('recurrence', 'monthly');
         setDraftField('recurrenceStrategy', recurrenceStrategyValue);
         setDraftField('recurrenceRRule', rrule);
@@ -800,22 +786,10 @@ function TaskEditModalInner({
         }
     }, [setDraftField, timeSpentEnabled]);
     const toggleQuickContextToken = useCallback((token: string) => {
-        const next = new Set(parseTokenList(contextInputDraft, '@'));
-        if (next.has(token)) {
-            next.delete(token);
-        } else {
-            next.add(token);
-        }
-        updateContextInput(Array.from(next).join(', '));
+        updateContextInput(toggleTaskEditorToken(contextInputDraft, token, '@'));
     }, [contextInputDraft, updateContextInput]);
     const toggleQuickTagToken = useCallback((token: string) => {
-        const next = new Set(parseTokenList(tagInputDraft, '#'));
-        if (next.has(token)) {
-            next.delete(token);
-        } else {
-            next.add(token);
-        }
-        updateTagInput(Array.from(next).join(', '));
+        updateTagInput(toggleTaskEditorToken(tagInputDraft, token, '#'));
     }, [tagInputDraft, updateTagInput]);
     const commitContextDraft = useCallback(() => {
         setIsContextInputFocused(false);
@@ -833,6 +807,7 @@ function TaskEditModalInner({
         handleAttemptClose,
         handleConvertToSection,
         handleCancelTask,
+        handleSkipOccurrence,
         handleDeleteTask,
         handleDone,
         handleDuplicateTask,
@@ -841,6 +816,7 @@ function TaskEditModalInner({
         handleShare,
     } = useTaskEditActions({
         aiEnabled,
+        language,
         closeAIModal,
         deleteTask,
         descriptionDraft,
@@ -858,6 +834,7 @@ function TaskEditModalInner({
         prioritiesEnabled,
         projectContext,
         resetTaskChecklist,
+        skipRecurringTaskOccurrence,
         restoreTask,
         setAiModal,
         setChecklist,
@@ -1130,8 +1107,11 @@ function TaskEditModalInner({
                         onShare={handleShare}
                         onDuplicate={handleDuplicateTask}
                         onPromoteToProject={handlePromoteTaskToProject}
-                        onCancelTask={task && isTaskActionable(task) && !isProjectedRecurringTask(task)
+                        onCancelTask={task && (cancelRetryPending || isTaskActionable(task)) && !isProjectedRecurringTask(task)
                             ? handleCancelTask
+                            : undefined}
+                        onSkipOccurrence={task && !readOnly && !isProjectedRecurringTask(task) && canSkipRecurringTaskOccurrence(task)
+                            ? handleSkipOccurrence
                             : undefined}
                         cancelTaskLabel={task?.recurrence
                             ? tFallback(t, 'task.cancelRecurringSeries', 'Cancel recurring series')
@@ -1331,6 +1311,7 @@ function TaskEditModalInner({
                         linkInputTouched={linkInputTouched}
                         linkModalVisible={linkModalVisible}
                         linkModalTitle={editingLinkAttachmentId ? t('common.edit') : t('attachments.addLink')}
+                        linkMultiline={!editingLinkAttachmentId}
                         destinationFields={destinationFields}
                         projectFilterAreaId={projectFilterAreaId}
                         projects={projects}

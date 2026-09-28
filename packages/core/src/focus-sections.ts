@@ -19,8 +19,10 @@ import {
     getFocusSequentialFirstTaskIds,
     getProjectDeadlineBoosts,
     getUpcomingDeferredTasks,
+    isTaskFocusedNow,
     PRIORITY_RANK,
     shouldShowTaskForStart,
+    sortByPrecomputedKey,
     sortFocusNextActions,
     sortTasksByFocusOrder,
     sortTasksBySavedPreference,
@@ -43,13 +45,22 @@ export function getTodayBounds(now: Date): { startOfToday: Date; endOfToday: Dat
  * "Due today or starting today" — the ONE answer to what belongs in Today, read
  * by the Today bucket below and by the widget selection's starred rule. A change
  * to what counts as today is an edit to this function and nothing else.
+ *
+ * `bounds` is the same pair `getTodayBounds(now)` returns; a caller testing many
+ * tasks against one `now` passes it so the two `Date` objects are built once for
+ * the loop instead of once per task. Leaving it out is exactly as before.
  */
-export function isTodayScheduleCandidate(task: Task, now: Date): boolean {
-    const { startOfToday, endOfToday } = getTodayBounds(now);
-    const due = safeParseDueDate(task.dueDate);
-    const start = safeParseDate(task.startTime);
-    const startsToday = Boolean(start && start >= startOfToday && start <= endOfToday);
-    return Boolean(due && due <= endOfToday) || startsToday;
+export function isTodayScheduleCandidate(
+    task: Task,
+    now: Date,
+    bounds: { startOfToday: Date; endOfToday: Date } = getTodayBounds(now),
+): boolean {
+    const startOfTodayMs = bounds.startOfToday.getTime();
+    const endOfTodayMs = bounds.endOfToday.getTime();
+    const due = safeParseDueDate(task.dueDate)?.getTime();
+    const start = safeParseDate(task.startTime)?.getTime();
+    const startsToday = start !== undefined && start >= startOfTodayMs && start <= endOfTodayMs;
+    return (due !== undefined && due <= endOfTodayMs) || startsToday;
 }
 
 /**
@@ -59,10 +70,8 @@ export function isTodayScheduleCandidate(task: Task, now: Date): boolean {
  */
 export interface FocusPools {
     /**
-     * Starred tasks after the user's criteria. Deliberately NOT narrowed by
-     * area visibility or start time: the star buttons enforce a store-wide
-     * count, so a starred task hidden by those rules would silently eat a slot
-     * no filter change can reveal ("I can only star 4 when the limit is 5").
+     * Today's starred tasks after the user's criteria. Area visibility does
+     * not hide a Focus slot; future-start stars remain in Upcoming until ready.
      */
     focused: Task[];
     /** The time-granularity pool after the user's criteria (Next actions, Review Due). */
@@ -108,16 +117,16 @@ export function buildFocusPools({
         { projects, now, tokenMatchMode: 'all' },
     );
     return {
-        focused: narrow(tasks.filter((task) => task.isFocusedToday === true)),
+        focused: narrow(tasks.filter((task) => isTaskFocusedNow(task, now))),
         active: narrow(visibleTasks.filter((task) => shouldShowTaskForStart(task, { now, granularity: 'time' }))),
         // Today membership is decided at day granularity (a later-today start
         // belongs there, by its time). A task deferred to another day must
         // still be excluded, or a due-today row with a future-day start would
         // double up in both Today and Upcoming.
         schedule: narrow(visibleTasks.filter((task) => shouldShowTaskForStart(task, { now }))),
-        // Starred tasks are excluded: they render in Today's Focus regardless
-        // of deferral, and one task must not appear in two sections (#1061).
-        upcoming: getUpcomingDeferredTasks(narrow(visibleTasks.filter((task) => !task.isFocusedToday)), { now }),
+        // A future-start star stays in Upcoming until its start day. Today's
+        // stars cannot enter this pool because they are no longer deferred.
+        upcoming: getUpcomingDeferredTasks(narrow(visibleTasks), { now }),
         base: visibleTasks,
     };
 }
@@ -146,37 +155,40 @@ export interface FocusListContext {
     prioritiesEnabled: boolean;
     /** The saved filter's direction, honoured by a non-default sort. */
     sortOrder?: 'asc' | 'desc';
-    /**
-     * Escape hatch for a caller that already owns its saved-perspective sort.
-     * `apps/mobile/lib/widget-data.ts` is the only one; drop this parameter and
-     * that argument together.
-     */
-    sortBySavedPerspective?: (items: Task[]) => Task[];
 }
 
 export function deriveFocusTaskLists(pools: FocusPools, ctx: FocusListContext): FocusTaskLists {
     const { now, projects, sections, sortBy, prioritiesEnabled } = ctx;
     const isDefaultSort = sortBy === DEFAULT_FOCUS_SORT_BY;
-    const sortBySavedPerspective = ctx.sortBySavedPerspective
-        ?? ((items: Task[]) => (isDefaultSort ? items : sortTasksBySavedPreference(items, sortBy, {
-            projects,
-            prioritizeByPriority: prioritiesEnabled,
-            sortOrder: ctx.sortOrder,
-        })));
+    const sortBySavedPerspective = (items: Task[]) => (isDefaultSort ? items : sortTasksBySavedPreference(items, sortBy, {
+        projects,
+        prioritizeByPriority: prioritiesEnabled,
+        sortOrder: ctx.sortOrder,
+    }));
 
     // Equal times fall back to priority (when the feature is on) and then to
     // creation order — one rule for Today and Review Due on every surface.
-    const sortWith = (items: Task[], getTime: (task: Task) => number) => [...items].sort((a, b) => {
-        const timeDiff = getTime(a) - getTime(b);
-        if (timeDiff !== 0) return timeDiff;
-        if (prioritiesEnabled) {
-            const priorityDiff = (PRIORITY_RANK[b.priority as TaskPriority] || 0) - (PRIORITY_RANK[a.priority as TaskPriority] || 0);
-            if (priorityDiff !== 0) return priorityDiff;
-        }
-        const aCreated = safeParseDate(a.createdAt)?.getTime() ?? 0;
-        const bCreated = safeParseDate(b.createdAt)?.getTime() ?? 0;
-        return aCreated - bCreated;
-    });
+    // The three values are read once per task, not once per comparison: the
+    // comparator used to parse `createdAt` (and, through `getTime`, the due and
+    // start strings) on every one of the O(n log n) comparisons, which was the
+    // cost here — the same finding as #766, and the same fix.
+    const sortWith = (items: Task[], getTime: (task: Task) => number) => sortByPrecomputedKey(
+        items,
+        (task) => ({
+            time: getTime(task),
+            priority: PRIORITY_RANK[task.priority as TaskPriority] || 0,
+            created: safeParseDate(task.createdAt)?.getTime() ?? 0,
+        }),
+        (a, b) => {
+            const timeDiff = a.time - b.time;
+            if (timeDiff !== 0) return timeDiff;
+            if (prioritiesEnabled) {
+                const priorityDiff = b.priority - a.priority;
+                if (priorityDiff !== 0) return priorityDiff;
+            }
+            return a.created - b.created;
+        },
+    );
 
     const sequentialProjectIds = new Set<string>();
     const sequentialWithinSectionProjectIds = new Set<string>();
@@ -196,11 +208,13 @@ export function deriveFocusTaskLists(pools: FocusPools, ctx: FocusListContext): 
         return !sequentialFirstTaskIds.has(task.id);
     };
 
+    // One pair of Date objects for the whole loop, not one pair per task.
+    const todayBounds = getTodayBounds(now);
     const scheduleItems = pools.schedule.filter((task) => {
         if (task.isFocusedToday) return false;
         if (task.status !== 'next') return false;
         if (isSequentialBlocked(task)) return false;
-        return isTodayScheduleCandidate(task, now);
+        return isTodayScheduleCandidate(task, now, todayBounds);
     });
     const scheduleIds = new Set(scheduleItems.map((task) => task.id));
 
@@ -261,8 +275,8 @@ export interface FocusTaskSection {
 
 /**
  * The Focus screen's task sections in screen order with the screen's titles:
- * Today's Focus (only when starred tasks exist), Today, Review Due, Next
- * actions, Upcoming (only when non-empty). `translate` returns undefined for a
+ * Today's Focus (only when starred tasks exist), Today, Next actions, Review
+ * Due, Upcoming (only when non-empty). `translate` returns undefined for a
  * missing key so both `t()` and a raw dictionary lookup fit.
  */
 export function buildFocusTaskSections(
@@ -275,11 +289,27 @@ export function buildFocusTaskSections(
     }
     sections.push(
         { key: 'schedule', title: translate('focus.schedule') ?? 'Today', items: lists.schedule },
-        { key: 'reviewDue', title: translate('agenda.reviewDue') ?? 'Review Due', items: lists.reviewDue },
         { key: 'next', title: translate('focus.nextActions') ?? translate('list.next') ?? 'Next actions', items: lists.nextActions },
+        { key: 'reviewDue', title: translate('agenda.reviewDue') ?? 'Review Due', items: lists.reviewDue },
     );
     if (lists.upcoming.length > 0) {
         sections.push({ key: 'upcoming', title: translate('agenda.upcoming') ?? 'Upcoming', items: lists.upcoming });
     }
     return sections;
+}
+
+/**
+ * Focus's "Projects to review" list, shown after the task sections: live,
+ * non-archived projects whose review date has come, earliest review first,
+ * then by title. Pass the projects the screen's area filter keeps.
+ */
+export function getReviewDueProjects(projects: readonly Project[], now: Date): Project[] {
+    return projects
+        .filter((project) => project.status !== 'archived' && isDueForReview(project.reviewAt, now))
+        .sort((a, b) => {
+            const aReview = safeParseDate(a.reviewAt)?.getTime() ?? Number.POSITIVE_INFINITY;
+            const bReview = safeParseDate(b.reviewAt)?.getTime() ?? Number.POSITIVE_INFINITY;
+            if (aReview !== bReview) return aReview - bReview;
+            return a.title.localeCompare(b.title);
+        });
 }

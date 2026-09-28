@@ -19,6 +19,41 @@ const {
 } = plugin.__testables;
 
 describe('ios-widgets-and-shortcuts', () => {
+  it('keeps repeated prebuilds and new Swift files in the widget target with group-relative paths', () => {
+    const project = require('xcode').project('fixture.pbxproj');
+    project.hash = { project: { objects: {
+      PBXNativeTarget: {
+        APP: { buildPhases: [] },
+        WIDGET: { buildPhases: [] },
+      },
+      PBXBuildFile: {}, PBXFileReference: {}, PBXGroup: {},
+    } } };
+    project.addBuildPhase([], 'PBXSourcesBuildPhase', 'Sources', 'APP');
+    // Older generated projects named this phase after the target.
+    project.addBuildPhase(['Existing.swift'], 'PBXSourcesBuildPhase', 'MindwtrWidgets', 'WIDGET');
+    const group = project.addPbxGroup(['Existing.swift'], 'MindwtrWidgets', 'MindwtrWidgets');
+    const options = {
+      swiftFiles: ['Existing.swift', 'New.swift'], groupKey: group.uuid, targetUuid: 'WIDGET',
+    };
+
+    expect(ensureWidgetSwiftSourcesInTarget(project, options)).toEqual(['New.swift']);
+    expect(ensureWidgetSwiftSourcesInTarget(project, options)).toEqual([]);
+    expect(project.pbxSourcesBuildPhaseObj('APP').files).toHaveLength(0);
+    expect(project.pbxSourcesBuildPhaseObj('WIDGET').files).toHaveLength(2);
+    const references = Object.values(project.pbxFileReferenceSection()).filter((entry) => typeof entry === 'object');
+    expect(references.map((entry) => entry.path.replaceAll('"', ''))).toEqual(['Existing.swift', 'New.swift']);
+  });
+
+  it('ships saved-list Shortcuts with the existing widget catalog and preserves Open List', () => {
+    const dir = path.resolve(__dirname, '..', APP_INTENTS_FOLDER);
+    expect(collectSwiftFiles(dir)).toContain('MindwtrSavedListCatalog.swift');
+    const source = fs.readFileSync(path.join(dir, 'MindwtrSiriCaptureIntents.swift'), 'utf8');
+    expect(source).toContain('struct MindwtrOpenSavedListIntent: AppIntent');
+    expect(source).toContain('var list: MindwtrSavedListEntity');
+    expect(source).toContain('var list: MindwtrShortcutList');
+    expect(source).toContain('MindwtrSavedListCatalog.destination(id: list.id)');
+  });
+
   it('ships the rich configurable Tasks widget with legacy payload and iOS 15 fallbacks', () => {
     const widgetsDir = path.resolve(__dirname, '..', 'widgets-ios');
     const tasksSource = fs.readFileSync(
@@ -78,6 +113,7 @@ describe('ios-widgets-and-shortcuts', () => {
     expect(legacy).toContain('StaticConfiguration(');
     for (const configuration of [modern, legacy]) {
       expect(configuration).toContain('let kind: String = mindwtrWidgetKind');
+      expect(configuration).toContain('.contentMarginsDisabled()');
       expect(configuration).not.toContain('if #available');
     }
     expect(bundleSource).toContain('enum MindwtrWidgetsEntryPoint');
@@ -168,6 +204,7 @@ describe('ios-widgets-and-shortcuts', () => {
 
       const calls = [];
       const xcodeProject = {
+        hash: { project: { objects: { PBXNativeTarget: { WIDGET_TARGET: { buildPhases: [] } } } } },
         hasFile: () => false,
         addSourceFile: (...args) => calls.push(args),
       };
@@ -187,9 +224,9 @@ describe('ios-widgets-and-shortcuts', () => {
         SHARED_WIDGET_ACTION_STORE,
       ]);
       expect(calls).toEqual([
-        ['MindwtrWidgets/MindwtrTasksWidget.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
-        ['MindwtrWidgets/MindwtrTasksWidgetIntents.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
-        [`MindwtrWidgets/${SHARED_WIDGET_ACTION_STORE}`, { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
+        ['MindwtrTasksWidget.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
+        ['MindwtrTasksWidgetIntents.swift', { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
+        [SHARED_WIDGET_ACTION_STORE, { target: 'WIDGET_TARGET' }, 'WIDGET_GROUP'],
       ]);
       expect(calls.some(([, options]) => options.target !== 'WIDGET_TARGET')).toBe(false);
     } finally {

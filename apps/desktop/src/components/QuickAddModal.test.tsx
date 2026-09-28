@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { buildEntityMap, useTaskStore, type Task } from '@mindwtr/core';
 import type { ComponentProps } from 'react';
 
@@ -131,6 +132,30 @@ beforeEach(() => {
 });
 
 describe('QuickAddModal', () => {
+    it('offers retained contexts only after a typed query', async () => {
+        const timestamp = '2026-09-27T00:00:00.000Z';
+        const task = (id: string, status: Task['status'], deletedAt?: string): Task => ({
+            id, title: id, status, contexts: [`@${id}-only`], tags: [], createdAt: timestamp, updatedAt: timestamp, deletedAt,
+        });
+        act(() => useTaskStore.setState({ _allTasks: [
+            task('active', 'next'), task('done', 'done'), task('archived', 'archived'), task('deleted', 'next', timestamp),
+            { ...task('bare', 'archived'), contexts: ['Seasonal Planning'] },
+        ] }));
+        renderQuickAddModal();
+        await act(async () => {
+            window.dispatchEvent(new CustomEvent('mindwtr:quick-add'));
+        });
+        const input = screen.getByRole('combobox');
+        fireEvent.change(input, { target: { value: '@' } });
+        expect(screen.queryByRole('option', { name: '@archived-only' })).not.toBeInTheDocument();
+        fireEvent.change(input, { target: { value: '@arch' } });
+        expect(await screen.findByRole('option', { name: '@archived-only' })).toBeVisible();
+        fireEvent.change(input, { target: { value: '@dele' } });
+        expect(screen.queryByRole('option', { name: '@deleted-only' })).not.toBeInTheDocument();
+        fireEvent.change(input, { target: { value: '@Seas' } });
+        expect(await screen.findByRole('option', { name: '@Seasonal Planning' })).toBeVisible();
+    });
+
     it('blocks sandbox audio and private-file capture before native access', async () => {
         sandboxState.enabled = true;
         renderQuickAddModal();
@@ -923,7 +948,7 @@ describe('QuickAddModal', () => {
         expect(tauriMocks.invoke).not.toHaveBeenCalledWith('start_audio_recording');
     });
 
-    it('starts recording when speech-to-text is configured (record gate agrees with the transcribe gate)', async () => {
+    it.each(['text', 'audio'] as const)('starts recording with Enter from %s capture when speech-to-text is configured', async (captureMode) => {
         // The record gate and the transcribe gate both resolve readiness through
         // resolveSpeechCapture from the same settings snapshot, so a configured
         // offline provider must let recording proceed rather than showing the
@@ -951,15 +976,16 @@ describe('QuickAddModal', () => {
 
         await act(async () => {
             window.dispatchEvent(new CustomEvent('mindwtr:quick-add', {
-                detail: { initialValue: 'Voice note' },
+                detail: { initialValue: 'Voice note', captureMode },
             }));
             await Promise.resolve();
         });
 
-        fireEvent.click(screen.getByRole('button', { name: 'Audio' }));
+        if (captureMode === 'text') fireEvent.click(screen.getByRole('button', { name: 'Audio' }));
 
         await act(async () => {
-            fireEvent.click(screen.getByRole('button', { name: 'Start recording' }));
+            expect(screen.getByRole('button', { name: 'Start recording' })).toHaveFocus();
+            await userEvent.keyboard('{Enter}');
             await Promise.resolve();
         });
 

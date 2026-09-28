@@ -105,7 +105,7 @@ class QuickCaptureActivity : AppCompatActivity() {
         false
       }
     }
-    payload.palette?.takeUnless { payload.usesSystemColors }?.let { applyPalette(it, title, cancel) }
+    payload.resolvedPalette(this)?.let { applyPalette(it, title, cancel) }
     onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
       override fun handleOnBackPressed() {
         audioSession.cancelAudioOrClose()
@@ -297,6 +297,7 @@ class QuickCaptureActivity : AppCompatActivity() {
     Toast.makeText(this, labels.added, Toast.LENGTH_SHORT).show()
     WidgetPayloadStore.incrementInboxCount(this)
     WidgetRenderer.refreshAll(this)
+    CaptureSyncHeadlessService.start(this)
   }
 
   private class AudioSessionModel(val session: QuickCaptureAudioSession) : ViewModel() {

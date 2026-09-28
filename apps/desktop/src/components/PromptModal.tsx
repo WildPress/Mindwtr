@@ -33,7 +33,10 @@ interface PromptModalProps {
     // No bare 'date': dates go through DateField below, so a Jalali user never
     // meets a native Gregorian control here.
     inputType?: 'text' | 'datetime-local';
+    multiline?: boolean;
     allowEmptyConfirm?: boolean;
+    /** A message refusing the typed value (confirm stays off and the message shows); null accepts it. */
+    validate?: (value: string) => string | null;
     browseLabel?: string;
     onBrowse?: () => Promise<string | null>;
     secondaryLabel?: string;
@@ -58,7 +61,9 @@ export function PromptModal({
     createLabel,
     onCreate,
     inputType = 'text',
+    multiline = false,
     allowEmptyConfirm = false,
+    validate,
     browseLabel,
     onBrowse,
     secondaryLabel,
@@ -87,8 +92,10 @@ export function PromptModal({
         }
     }, [isOpen, defaultValue, numericField?.defaultValue]);
     const dateParts = useMemo(() => splitDateTimeLocal(value), [value]);
-    const canConfirm = allowEmptyConfirm || value.trim().length > 0;
-    const showValidation = !allowEmptyConfirm && hasInteracted && !canConfirm;
+    const hasValue = allowEmptyConfirm || value.trim().length > 0;
+    const refusal = hasValue ? validate?.(value) ?? null : null;
+    const canConfirm = hasValue && !refusal;
+    const showValidation = !allowEmptyConfirm && hasInteracted && !hasValue;
     // Only pass a second argument when numericField opted in — existing callers
     // that pass a single-arg onConfirm must keep seeing exactly one argument.
     const confirmWithValue = () => {
@@ -101,13 +108,14 @@ export function PromptModal({
 
     // Shared by every field in the dialog so Enter confirms and Escape cancels
     // wherever the caret happens to be, rather than only from the first input.
-    const handleFieldKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    const handleFieldKeyDown = (event: KeyboardEvent<HTMLElement>) => {
         if (event.key === 'Escape') {
             event.preventDefault();
             onCancel();
             return;
         }
         if (event.key !== 'Enter') return;
+        if (multiline && event.currentTarget instanceof HTMLTextAreaElement) return;
         event.preventDefault();
         if (canConfirm) {
             confirmWithValue();
@@ -187,6 +195,23 @@ export function PromptModal({
                         )}
                     />
                     </div>
+                ) : multiline ? (
+                    <textarea
+                        autoFocus
+                        value={value}
+                        onChange={(event) => {
+                            setValue(event.target.value);
+                            setHasInteracted(true);
+                        }}
+                        onBlur={() => setHasInteracted(true)}
+                        onKeyDown={handleFieldKeyDown}
+                        placeholder={placeholder}
+                        aria-label={title}
+                        aria-invalid={showValidation || Boolean(refusal)}
+                        aria-describedby={showValidation || refusal ? validationId : description ? descriptionId : undefined}
+                        rows={4}
+                        className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2 shadow-sm transition-colors focus:border-transparent focus:ring-2 focus:ring-primary"
+                    />
                 ) : (
                     <AutocompleteTextInput
                         autoFocus
@@ -204,8 +229,8 @@ export function PromptModal({
                         onBlur={() => setHasInteracted(true)}
                         onKeyDown={handleFieldKeyDown}
                         placeholder={placeholder}
-                        aria-invalid={showValidation}
-                        aria-describedby={showValidation ? validationId : undefined}
+                        aria-invalid={showValidation || Boolean(refusal)}
+                        aria-describedby={showValidation || refusal ? validationId : undefined}
                         className="w-full rounded-lg border border-border bg-card px-3 py-2 shadow-sm transition-colors focus:border-transparent focus:ring-2 focus:ring-primary"
                     />
                 )}
@@ -213,6 +238,9 @@ export function PromptModal({
                     <p id={validationId} className="text-xs text-destructive">
                         {t('common.validationRequired')}
                     </p>
+                )}
+                {refusal && (
+                    <p id={validationId} role="alert" className="text-xs text-destructive">{refusal}</p>
                 )}
                 {errorMessage && (
                     <p role="alert" className="text-xs text-destructive">{errorMessage}</p>

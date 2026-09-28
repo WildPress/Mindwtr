@@ -36,11 +36,31 @@ function collectCodeSlugs({ file, source }) {
     const slug = match[2] ?? constants.get(match[3]);
     if (slug !== undefined) sites.push({ file, slug });
   }
+  // A conditional value (`releaseCheck: queued ? 'a' : 'b'`) emits either literal.
+  for (const match of source.matchAll(
+    /\breleaseCheck\s*:\s*[^,{}?\r\n]+\?\s*(['"])([^'"\r\n]*)\1\s*:\s*(['"])([^'"\r\n]*)\3/g,
+  )) {
+    sites.push({ file, slug: match[2] }, { file, slug: match[4] });
+  }
   // Native Rust diagnostics put the field inside a log message rather than
   // a JavaScript object. Only count log macros, not unused string constants.
   if (file.endsWith(".rs")) {
-    for (const message of source.matchAll(/\blog::(?:info|warn)!\(\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
-      for (const match of message[1].matchAll(/\bextra\.releaseCheck=([\w./-]+)/g)) {
+    const messages = [
+      ...Array.from(source.matchAll(/\blog::(?:info|warn)!\(\s*"((?:\\[\s\S]|[^"\\])*)"/g), (match) => match[1]),
+      // A formatted message immediately logged, then reused for the Diagnostics file.
+      ...Array.from(source.matchAll(/\blet\s+(\w+)\s*=\s*format!\(\s*"((?:\\[\s\S]|[^"\\])*)"\s*\);\s*log::(?:info|warn)!\(\s*"\{\1\}"\s*\)/g), (match) => match[2]),
+    ];
+    for (const message of messages) {
+      for (const match of message.matchAll(/\bextra\.releaseCheck=([\w./-]+)/g)) {
+        sites.push({ file, slug: match[1] });
+      }
+    }
+  }
+  // Native Android diagnostics likewise put the field in the first string of
+  // an android.util.Log info/warn call; unused string constants do not count.
+  if (file.endsWith(".kt")) {
+    for (const message of source.matchAll(/\bLog\.(?:i|w)\([^,()]+,\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
+      for (const match of message[1].matchAll(/\breleaseCheck=([\w./-]+)/g)) {
         sites.push({ file, slug: match[1] });
       }
     }
@@ -68,6 +88,7 @@ function parseLedger(source) {
 const sources = (await Promise.all([
   collectSources(path.join(root, "packages")),
   collectSources(path.join(root, "apps")),
+  collectSources(path.join(root, "scripts")),
 ])).flat();
 const codeSites = sources.flatMap(collectCodeSlugs);
 function findUnemittedSlugs(slugs, sites) {
@@ -96,6 +117,16 @@ describe("release diagnostics ledger", () => {
     ]);
   });
 
+  it("resolves both literals of a conditional releaseCheck value", () => {
+    const file = "apps/example.ts";
+    expect(collectCodeSlugs({ file, source: `
+      logInfo('accepted', { releaseCheck: queued ? 'v1.3.3/queued-check' : 'v1.3.0/plain-check' });
+    ` })).toEqual([
+      { file, slug: "v1.3.3/queued-check" },
+      { file, slug: "v1.3.0/plain-check" },
+    ]);
+  });
+
   it("rejects a ledger slug whose constant has no releaseCheck use", () => {
     const slug = "v1.2.8/unused-check";
     const sources = [{ file: "apps/example.ts", source: `
@@ -119,6 +150,30 @@ describe("release diagnostics ledger", () => {
       { file, slug: "v1.3.0/native-capture" },
       { file, slug: "v1.3.0/native-retry" },
     ]);
+  });
+
+  it("resolves native Android diagnostic fields only inside Log calls", () => {
+    const file = "apps/android-native/android/app/src/main/java/Example.kt";
+    expect(collectCodeSlugs({ file, source: `
+      const val UNUSED = "releaseCheck=v1.3.0/unused-android"
+      Log.i(TAG, "Host reused releaseCheck=v1.3.0/android-reuse " +
+          "reason=\$reason")
+      Log.w(CoreHost.TAG, "Guard blocked releaseCheck=v1.3.0/android-guard outcome=blocked")
+    ` })).toEqual([
+      { file, slug: "v1.3.0/android-reuse" },
+      { file, slug: "v1.3.0/android-guard" },
+    ]);
+  });
+
+  it("resolves a Rust formatted message immediately forwarded to a log macro", () => {
+    const file = "apps/desktop/src-tauri/src/example.rs";
+    expect(collectCodeSlugs({ file, source: `
+      let line = format!("Saved extra.releaseCheck=v1.3.3/formatted count={count}");
+      log::info!("{line}");
+      let unused = format!("Unused extra.releaseCheck=v1.3.3/unused");
+      let other = format!("Different extra.releaseCheck=v1.3.3/different");
+      log::warn!("{unrelated}");
+    ` })).toEqual([{ file, slug: "v1.3.3/formatted" }]);
   });
 
   it("uses version-prefixed slugs at every code site", () => {

@@ -29,35 +29,54 @@ import DraggableFlatList, {
 } from 'react-native-draggable-flatlist';
 
 import {
-  buildAdvancedFilterCriteriaChips,
+  buildFocusAdvancedFilterChips,
+  buildFocusNextItems,
   buildFocusPools,
+  buildFocusScheduleItems,
   buildFocusTaskSections,
+  canReorderFocusTasks,
   DEFAULT_FOCUS_SORT_BY,
   deriveFocusTaskLists,
-  FOCUS_SORT_OPTIONS,
-  buildFocusTaskGroups,
+  getFocusEmptyState,
+  getFocusFilterTokens,
+  getFocusGroupByLabel,
+  getFocusGroupByOptions,
+  getFocusProjectFilterLabel,
+  getFocusProjectFilterOptions,
+  getFocusReorderPositionLabel,
+  getFocusReorderSecondaryLabel,
+  getFocusSaveFilterName,
+  getFocusSortByLabel,
+  getFocusSortOptions,
+  getFocusStarBlockedText,
   getProjectDeadlineBoostLabel,
-  removeAdvancedFilterCriteriaChip,
+  getReviewDueProjects,
+  moveFocusReorderTask,
+  planFocusFilterCriterionRemoval,
+  planFocusFilterDelete,
+  planFocusFilterSave,
+  planFocusGroupChange,
+  planFocusSortChange,
+  reconcileFocusReorderOrder,
+  resolveFocusPerspective,
+  selectFocusSavedFilters,
   shouldShowTaskForStart,
   generateUUID,
-  markSavedFilterDeleted,
-  getFocusStarBlockedText,
   normalizeFocusTaskLimit,
   resolveFeatureFlags,
-  resolveTaskPerspectiveForFeatures,
   splitTodayTasksByStartTime,
   translateWithFallback,
   useTaskStore,
   getAdvancedReviewDate,
   isTaskActionable,
-  isDueForReview,
+  isTaskDateCoherent,
+  isTaskFutureFocusCandidate,
   isTodayScheduleCandidate,
   safeFormatDate,
-  safeParseDate,
   safeParseDueDate,
   getTaskMetadataFilterVisibility,
-  hasTimeComponent,
   shallow,
+  type FocusListItem as FocusSectionListItem,
   type Project,
   TIME_ESTIMATE_OPTIONS,
   type Task,
@@ -80,10 +99,6 @@ import { TaskEditModal } from '@/components/task-edit-modal';
 import type { TaskEditTab } from '@/components/task-edit/use-task-edit-state';
 import { useFutureStartRevealTick, useLocalDayKey } from '@/hooks/use-local-day-key';
 import { PomodoroPanel } from '@/components/pomodoro-panel';
-import {
-  getFocusTokenOptions,
-  NO_PROJECT_FILTER_ID,
-} from '@/lib/focus-screen-utils';
 import { FilterChip, TaskFilterSheet } from '@/components/task-filter-sheet';
 import { useTaskFilterSelections } from '@/hooks/use-task-filter-selections';
 import { useVisibleTaskContext } from '@/hooks/use-visible-tasks';
@@ -100,8 +115,6 @@ import {
   FOCUS_ESTIMATED_TASK_HEIGHT,
   FOCUS_LIST_HEADER_LAYOUT_KEY,
 } from '@/components/focus/focus-list-layout';
-
-const FOCUS_GROUP_BY_OPTIONS: FocusGroupBy[] = ['none', 'context', 'project', 'area', 'energy', 'priority', 'person', 'tag'];
 
 function resolveTaskRouteTab(value?: string | string[]): TaskEditTab {
   const routeValue = Array.isArray(value) ? value[0] : value;
@@ -145,10 +158,7 @@ type FocusFilterChip = {
 
 type FocusSectionType = 'focus' | 'schedule' | 'next' | 'upcoming' | 'reviewDue' | 'reviewProjects';
 
-type FocusListItem =
-  | { type: 'task'; task: Task; grouped?: boolean }
-  | { type: 'project'; project: Project }
-  | { type: 'groupHeader'; id: string; title: string; count: number; muted?: boolean; dotColor?: string };
+type FocusListItem = FocusSectionListItem | { type: 'project'; project: Project };
 
 type FocusSection = {
   title: string;
@@ -167,9 +177,11 @@ const getStartDateOffset = (days: number): Date => {
 
 const formatDateOnly = (date: Date): string => safeFormatDate(date, 'yyyy-MM-dd');
 
-function normalizeFocusGroupBy(value: unknown): FocusGroupBy {
-  return FOCUS_GROUP_BY_OPTIONS.includes(value as FocusGroupBy) ? value as FocusGroupBy : 'none';
-}
+// A start date must not fall after the due date (#1252): a task due on Friday can start
+// tomorrow, but not next week.
+const canStartOn = (task: Task, date: Date): boolean => (
+  isTaskDateCoherent({ dueDate: task.dueDate, startTime: formatDateOnly(date) })
+);
 
 const readPersistedFocusExpandedSections = (raw: string | null): Partial<FocusExpandedSections> | null => {
   if (!raw) return null;
@@ -278,10 +290,9 @@ export default function FocusScreen() {
   const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusReorderPositionRef = useRef<number | null>(null);
   const { priorities: prioritiesEnabled, timeEstimates: timeEstimatesEnabled, pomodoro: pomodoroEnabled } = resolveFeatureFlags(settings);
-  const focusTaskLimit = normalizeFocusTaskLimit(settings?.gtd?.focusTaskLimit);
-  const upcomingFocusBlockedLabel = getFocusStarBlockedText(t, { blockedReason: 'deferred' }, focusTaskLimit)
-    ?? undefined;
-  const focusGroupBy = normalizeFocusGroupBy(settings?.gtd?.focusGroupBy);
+  const upcomingFocusBlockedLabel = getFocusStarBlockedText(
+    t, { blockedReason: 'deferred' }, normalizeFocusTaskLimit(settings?.gtd?.focusTaskLimit),
+  ) ?? undefined;
   const { areaById, projectById, resolvedAreaFilter, visibleTasks } = useVisibleTaskContext();
   const visibleProjects = useMemo(() => (
     projects.filter((project) => !project.deletedAt && projectMatchesAreaFilterSelection(project, resolvedAreaFilter, areaById))
@@ -298,47 +309,30 @@ export default function FocusScreen() {
       shouldShowTaskForStart(task, { now, granularity: 'time' })
     ));
   }, [baseActiveTasks, localDayKey, futureStartTick]);
-  const tokenOptions = useMemo(() => getFocusTokenOptions(activeTasks), [activeTasks]);
+  const tokenOptions = useMemo(() => getFocusFilterTokens(activeTasks), [activeTasks]);
   const metadataFilterVisibility = useMemo(() => getTaskMetadataFilterVisibility(activeTasks, {
     prioritiesEnabled,
     timeEstimatesEnabled,
   }), [activeTasks, prioritiesEnabled, timeEstimatesEnabled]);
-  const activeProjectIds = useMemo(() => (
-    new Set(activeTasks.map((task) => task.projectId).filter((projectId): projectId is string => Boolean(projectId)))
-  ), [activeTasks]);
-  const projectOptions = useMemo(() => (
-    visibleProjects
-      .filter((project) => activeProjectIds.has(project.id))
-      .sort((a, b) => {
-        const aOrder = Number.isFinite(a.order) ? (a.order as number) : Number.POSITIVE_INFINITY;
-        const bOrder = Number.isFinite(b.order) ? (b.order as number) : Number.POSITIVE_INFINITY;
-        if (aOrder !== bOrder) return aOrder - bOrder;
-        return a.title.localeCompare(b.title);
-      })
-  ), [activeProjectIds, visibleProjects]);
-  const showNoProjectOption = useMemo(() => activeTasks.some((task) => !task.projectId), [activeTasks]);
   const savedFocusFilters = useMemo(
-    () => (settings?.savedFilters ?? []).filter((filter) => filter.view === 'focus' && !filter.deletedAt),
+    () => selectFocusSavedFilters(settings?.savedFilters),
     [settings?.savedFilters],
   );
   const resolveText = useCallback((key: string, fallback: string) => {
     return translateWithFallback(t, key, fallback);
   }, [t]);
-  const projectFilterOptions = useMemo(() => ([
-    ...(showNoProjectOption
-      ? [{ id: NO_PROJECT_FILTER_ID, title: resolveText('taskEdit.noProjectOption', 'No project') }]
-      : []),
-    ...projectOptions.map((project) => ({ id: project.id, title: project.title })),
-  ]), [projectOptions, resolveText, showNoProjectOption]);
+  const projectFilterOptions = useMemo(
+    () => getFocusProjectFilterOptions(activeTasks, visibleProjects, t),
+    [activeTasks, t, visibleProjects],
+  );
   const projectFilterOptionIds = useMemo(
     () => projectFilterOptions.map((option) => option.id),
     [projectFilterOptions],
   );
-  const getProjectFilterLabel = useCallback((projectId: string) => (
-    projectId === NO_PROJECT_FILTER_ID
-      ? resolveText('taskEdit.noProjectOption', 'No project')
-      : projectById.get(projectId)?.title
-  ), [projectById, resolveText]);
+  const getProjectFilterLabel = useCallback(
+    (projectId: string) => getFocusProjectFilterLabel(projectId, projectById, t),
+    [projectById, t],
+  );
   const resetFocusSortBy = useCallback(() => setFocusSortBy(DEFAULT_FOCUS_SORT_BY), []);
   const selections = useTaskFilterSelections({
     view: 'focus',
@@ -366,20 +360,16 @@ export default function FocusScreen() {
     effectiveGroupBy: effectiveFocusGroupBy,
     isDefaultPerspective,
     canSavePerspective: canSaveFocusPerspective,
-  } = resolveTaskPerspectiveForFeatures({
-    sortBy: activeSavedFilter?.sortBy ?? focusSortBy,
-    groupBy: normalizeFocusGroupBy(activeSavedFilter?.groupBy ?? focusGroupBy),
+  } = resolveFocusPerspective({
+    activeSavedFilter,
+    sortBy: focusSortBy,
     settings,
     hasActiveFilters: hasFilters,
     hasCurrentCriteria: selections.hasCurrentCriteria,
     activeSavedFilterId: selections.activeSavedFilterId,
   });
-  const focusSortOptions = prioritiesEnabled
-    ? FOCUS_SORT_OPTIONS
-    : FOCUS_SORT_OPTIONS.filter((option) => option !== 'priority');
-  const focusGroupByOptions = prioritiesEnabled
-    ? FOCUS_GROUP_BY_OPTIONS
-    : FOCUS_GROUP_BY_OPTIONS.filter((option) => option !== 'priority');
+  const focusSortOptions = getFocusSortOptions(prioritiesEnabled);
+  const focusGroupByOptions = getFocusGroupByOptions(prioritiesEnabled);
   // Every Focus pool at once, from the shared core derivation: the starred
   // pool (never area- or start-hidden, so a hidden star cannot eat one of the
   // cap's slots), the time-granularity pool behind Next actions and Review
@@ -413,46 +403,25 @@ export default function FocusScreen() {
     }
     return byTaskId;
   }, [tc.secondaryText, upcomingEntries]);
-  const getFocusGroupByLabel = useCallback((groupBy: FocusGroupBy) => {
-    switch (groupBy) {
-      case 'context':
-        return resolveText('focus.group.context', 'Context');
-      case 'project':
-        return resolveText('focus.group.project', 'Project');
-      case 'area':
-        return resolveText('focus.group.area', 'Area');
-      case 'energy':
-        return resolveText('focus.group.energy', 'Energy');
-      case 'priority':
-        return resolveText('focus.group.priority', 'Priority');
-      case 'person':
-        return resolveText('people.title', 'People');
-      case 'tag':
-        return resolveText('tags.title', 'Tags');
-      case 'none':
-      default:
-        return resolveText('focus.group.none', 'None');
-    }
-  }, [resolveText]);
-  const getFocusSortByLabel = useCallback((sortBy: SortField) => {
-    if (sortBy === 'priority') return resolveText('filters.priority', 'Priority');
-    return resolveText(`sort.${sortBy}`, sortBy);
-  }, [resolveText]);
   const updateFocusSortBy = useCallback((nextSortBy: SortField) => {
-    if (nextSortBy === effectiveFocusSortBy && !activeSavedFilter) return;
+    const plan = planFocusSortChange(nextSortBy, {
+      effectiveSortBy: effectiveFocusSortBy,
+      hasActiveSavedFilter: Boolean(activeSavedFilter),
+    });
+    if (!plan) return;
     unbindSavedFilter();
-    setFocusSortBy(nextSortBy);
+    setFocusSortBy(plan.sortBy);
   }, [activeSavedFilter, effectiveFocusSortBy, unbindSavedFilter]);
   const updateFocusGroupBy = useCallback((nextGroupBy: FocusGroupBy) => {
-    if (nextGroupBy === effectiveFocusGroupBy && !activeSavedFilter) return;
+    const plan = planFocusGroupChange(nextGroupBy, {
+      effectiveGroupBy: effectiveFocusGroupBy,
+      hasActiveSavedFilter: Boolean(activeSavedFilter),
+      settings,
+    });
+    if (!plan) return;
     unbindSavedFilter();
-    void updateSettings({
-      gtd: {
-        ...(settings?.gtd ?? {}),
-        focusGroupBy: nextGroupBy,
-      },
-    }).catch(() => undefined);
-  }, [activeSavedFilter, effectiveFocusGroupBy, settings?.gtd, unbindSavedFilter, updateSettings]);
+    void updateSettings(plan.settingsUpdate).catch(() => undefined);
+  }, [activeSavedFilter, effectiveFocusGroupBy, settings, unbindSavedFilter, updateSettings]);
   const showTaskUpdateError = useCallback((message?: string) => {
     showToast({
       title: resolveText('common.error', 'Error'),
@@ -471,11 +440,16 @@ export default function FocusScreen() {
     const startDate = new Date(selectedDate);
     startDate.setHours(0, 0, 0, 0);
     const startTime = formatDateOnly(startDate);
+    // The menu hides the choices that cannot work; this catches the custom date.
+    if (!canStartOn(task, startDate)) {
+      showTaskUpdateError(resolveText('task.dateIssue.startAfterDue', 'Starts after due date'));
+      return;
+    }
     const previousStartTime = task.startTime;
-    // "Today" is a start date too (#1252): it files the task under Today without
-    // starring it. Only a later date is a deferral, and only a deferral drops the star.
+    // A future-start Next action keeps its star queued for its start day.
+    // Other statuses still drop a star when deferred.
     const startsToday = startDate.getTime() <= getStartDateOffset(0).getTime();
-    const previousFocused = !startsToday && task.isFocusedToday === true;
+    const previousFocused = !startsToday && task.status !== 'next' && task.isFocusedToday === true;
     const deferUpdates: Partial<Task> = {
       startTime,
       ...(previousFocused ? { isFocusedToday: false } : {}),
@@ -595,10 +569,10 @@ export default function FocusScreen() {
           text: resolveText('quickDate.tomorrow', 'Tomorrow'),
           onPress: () => deferTaskUntil(task, getStartDateOffset(1)),
         },
-        {
+        ...(canStartOn(task, getStartDateOffset(7)) ? [{
           text: resolveText('quickDate.nextWeek', 'Next week'),
           onPress: () => deferTaskUntil(task, getStartDateOffset(7)),
-        },
+        }] : []),
         {
           text: resolveText('recurrence.custom', 'Custom...'),
           onPress: () => openDeferDatePicker(task),
@@ -641,33 +615,28 @@ export default function FocusScreen() {
     setFiltersVisible(false);
   }, [applySavedSelections]);
   const saveCurrentFilter = useCallback(() => {
-    const trimmedName = saveFilterName.trim();
-    if (!trimmedName || !canSaveFocusPerspective) return;
-    const nowIso = new Date().toISOString();
-    const nextFilter: SavedFilter = {
+    const plan = planFocusFilterSave({
+      name: saveFilterName,
+      canSave: canSaveFocusPerspective,
+      currentCriteria: selections.currentCriteria,
+      effectiveSortBy: effectiveFocusSortBy,
+      effectiveGroupBy: effectiveFocusGroupBy,
+      savedFilters: settings?.savedFilters,
       id: generateUUID(),
-      name: trimmedName,
-      view: 'focus',
-      criteria: selections.currentCriteria,
-      ...(effectiveFocusSortBy !== DEFAULT_FOCUS_SORT_BY ? { sortBy: effectiveFocusSortBy } : {}),
-      ...(effectiveFocusGroupBy !== 'none' ? { groupBy: effectiveFocusGroupBy } : {}),
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    updateSettings({
-      savedFilters: [...(settings?.savedFilters ?? []), nextFilter],
-    }).then(() => {
+      nowIso: new Date().toISOString(),
+    });
+    if (!plan) return;
+    updateSettings({ savedFilters: plan.savedFilters }).then(() => {
       // Binds the new filter as the active one; its criteria are the ones just
       // saved, so re-applying them is a no-op beyond marking it selected.
-      applySavedFocusFilter(nextFilter);
+      applySavedFocusFilter(plan.filter);
       setSaveFilterDialogVisible(false);
     }).catch(() => undefined);
   }, [applySavedFocusFilter, canSaveFocusPerspective, effectiveFocusGroupBy, effectiveFocusSortBy, saveFilterName, selections.currentCriteria, settings?.savedFilters, updateSettings]);
   // A deleted saved filter drops out of savedFocusFilters, and the selections
   // hook clears its own binding from there.
   const deleteSavedFilter = useCallback((filter: SavedFilter) => {
-    const nextFilters = markSavedFilterDeleted(settings?.savedFilters, filter.id);
-    updateSettings({ savedFilters: nextFilters }).catch(() => undefined);
+    updateSettings(planFocusFilterDelete(settings?.savedFilters, filter.id)).catch(() => undefined);
   }, [settings?.savedFilters, updateSettings]);
   const confirmDeleteSavedFilter = useCallback((filter: SavedFilter) => {
     Alert.alert(
@@ -685,17 +654,14 @@ export default function FocusScreen() {
     );
   }, [deleteSavedFilter, resolveText]);
   const removeAdvancedSavedFilterCriterion = useCallback((chipId: string) => {
-    if (!activeSavedFilter) return;
-    const nextCriteria = removeAdvancedFilterCriteriaChip(activeSavedFilter.criteria, chipId);
-    if (nextCriteria === activeSavedFilter.criteria) return;
-
-    const nowIso = new Date().toISOString();
-    const nextFilters = (settings?.savedFilters ?? []).map((filter) => (
-      filter.id === activeSavedFilter.id
-        ? { ...filter, criteria: nextCriteria, updatedAt: nowIso }
-        : filter
-    ));
-    updateSettings({ savedFilters: nextFilters }).catch(() => undefined);
+    const plan = planFocusFilterCriterionRemoval({
+      activeSavedFilter,
+      criterionId: chipId,
+      savedFilters: settings?.savedFilters,
+      nowIso: new Date().toISOString(),
+    });
+    if (!plan) return;
+    updateSettings({ savedFilters: plan.savedFilters }).catch(() => undefined);
   }, [activeSavedFilter, settings?.savedFilters, updateSettings]);
   const confirmRemoveAdvancedSavedFilterCriterion = useCallback((chipId: string, label: string) => {
     Alert.alert(
@@ -833,15 +799,7 @@ export default function FocusScreen() {
   }, [futureStartTick, localDayKey, schedule]);
   const reviewDueProjects = useMemo(() => {
     void localDayKey;
-    const now = new Date();
-    return visibleProjects
-      .filter((project) => project.status !== 'archived' && isDueForReview(project.reviewAt, now))
-      .sort((a, b) => {
-        const aReview = safeParseDate(a.reviewAt)?.getTime() ?? Number.POSITIVE_INFINITY;
-        const bReview = safeParseDate(b.reviewAt)?.getTime() ?? Number.POSITIVE_INFINITY;
-        if (aReview !== bReview) return aReview - bReview;
-        return a.title.localeCompare(b.title);
-      });
+    return getReviewDueProjects(visibleProjects, new Date());
   }, [localDayKey, visibleProjects]);
 
   // Manual focusOrder is a full-list concept. focusedTasks derives from
@@ -850,9 +808,11 @@ export default function FocusScreen() {
   // corrupts the positions of hidden focused tasks. Gate reorder on the default
   // sort AND no active filter (the effect below also exits reorder mode if a
   // filter engages mid-reorder). Clearing the filter is the correction path.
-  const canReorderFocus = effectiveFocusSortBy === DEFAULT_FOCUS_SORT_BY
-    && !hasFilters
-    && focusedTasks.length > 0;
+  const canReorderFocus = canReorderFocusTasks({
+    effectiveSortBy: effectiveFocusSortBy,
+    hasActiveFilters: hasFilters,
+    focusedCount: focusedTasks.length,
+  });
 
   const enterFocusReorder = useCallback(() => {
     animateFocusReorderLayout();
@@ -913,98 +873,42 @@ export default function FocusScreen() {
   // finishing or arriving mid-reorder) without discarding the user's ordering.
   // Deriving this rather than syncing draft state in an effect avoids a render
   // loop: focusedTasks is a fresh array every render.
-  const focusReorderData = useMemo(() => {
-    const byId = new Map(focusedTasks.map((task) => [task.id, task] as const));
-    const kept = focusReorderDraft
-      .filter((task) => byId.has(task.id))
-      .map((task) => byId.get(task.id) as Task);
-    const keptIds = new Set(kept.map((task) => task.id));
-    const added = focusedTasks.filter((task) => !keptIds.has(task.id));
-    return [...kept, ...added];
-  }, [focusReorderDraft, focusedTasks]);
+  const focusReorderData = useMemo(
+    () => reconcileFocusReorderOrder(focusReorderDraft, focusedTasks),
+    [focusReorderDraft, focusedTasks],
+  );
 
-  const moveFocusReorderTask = useCallback((taskId: string, offset: -1 | 1) => {
-    const from = focusReorderData.findIndex((task) => task.id === taskId);
-    const to = from + offset;
-    if (from < 0 || to < 0 || to >= focusReorderData.length) return;
-    const next = [...focusReorderData];
-    const [moved] = next.splice(from, 1);
-    if (!moved) return;
-    next.splice(to, 0, moved);
+  const moveFocusReorderTaskBy = useCallback((taskId: string, offset: -1 | 1) => {
+    const next = moveFocusReorderTask(focusReorderData, taskId, offset);
+    if (!next) return;
     setFocusReorderDraft(next);
     setShowFocusReorderHint(false);
     void Haptics.selectionAsync().catch(() => undefined);
     void Promise.resolve(reorderFocusedTasks(next.map((task) => task.id))).catch(() => {});
   }, [focusReorderData, reorderFocusedTasks]);
 
-  const getFocusReorderSecondaryLabel = useCallback((task: Task) => {
-    const details: string[] = [];
-    const project = task.projectId ? projectById.get(task.projectId) : undefined;
-    if (project) details.push(project.title);
-    const dueDate = safeParseDueDate(task.dueDate);
-    if (dueDate) {
-      details.push(safeFormatDate(
-        dueDate,
-        hasTimeComponent(task.dueDate) ? 'Pp' : 'P',
-        task.dueDate,
-      ));
-    }
-    return details.join(' · ');
-  }, [projectById]);
+  const getReorderSecondaryLabel = useCallback(
+    (task: Task) => getFocusReorderSecondaryLabel(task, projectById, safeFormatDate),
+    [projectById],
+  );
 
   const sections = useMemo<FocusSection[]>(() => {
     if (!focusViewStateHydrated) return [];
 
-    const buildTaskItems = (items: Task[], grouped = false): FocusListItem[] => (
-      items.map((task) => ({ type: 'task' as const, task, grouped }))
+    const buildTaskItems = (items: Task[]): FocusListItem[] => (
+      items.map((task) => ({ type: 'task' as const, task, grouped: false }))
     );
     const buildProjectItems = (items: Project[]): FocusListItem[] => (
       items.map((project) => ({ type: 'project' as const, project }))
     );
-    const buildScheduleItems = (): FocusListItem[] => {
-      if (!expandedSections.schedule) return [];
-      return [
-        ...buildTaskItems(scheduleByStartTime.ready),
-        ...(scheduleByStartTime.laterToday.length > 0
-          ? [
-            {
-              type: 'groupHeader' as const,
-              id: 'focus:schedule:later-today',
-              title: resolveText('agenda.laterToday', 'Later today'),
-              count: scheduleByStartTime.laterToday.length,
-              muted: true,
-            },
-            ...buildTaskItems(scheduleByStartTime.laterToday, true),
-          ]
-          : []),
-      ];
-    };
-    const buildGroupedNextItems = (): FocusListItem[] => {
-      if (!expandedSections.next) return [];
-      if (effectiveFocusGroupBy === 'none') {
-        return buildTaskItems(nextActions);
-      }
-      const groups = buildFocusTaskGroups({
-        groupBy: effectiveFocusGroupBy,
-        tasks: nextActions,
-        projects,
-        areas,
-        resolveText,
-        theme: themePreset,
-      });
-      return groups
-        .flatMap((group) => [
-          {
-            type: 'groupHeader' as const,
-            id: group.key,
-            title: group.label,
-            count: group.tasks.length,
-            muted: group.muted,
-            dotColor: group.dotColor,
-          },
-          ...buildTaskItems(group.tasks, true),
-        ]);
-    };
+    const buildScheduleItems = (): FocusListItem[] => (
+      expandedSections.schedule ? buildFocusScheduleItems(scheduleByStartTime, t) : []
+    );
+    const buildGroupedNextItems = (): FocusListItem[] => (
+      expandedSections.next
+        ? buildFocusNextItems({ groupBy: effectiveFocusGroupBy, tasks: nextActions, projects, areas, t, theme: themePreset })
+        : []
+    );
     // Same buckets, order and titles as the widget (@mindwtr/core focus-sections).
     const nextSections: FocusSection[] = buildFocusTaskSections(
       { focusedTasks, schedule, reviewDue, nextActions, upcoming },
@@ -1039,7 +943,6 @@ export default function FocusScreen() {
     nextActions,
     upcoming,
     projects,
-    resolveText,
     reviewDue,
     reviewDueProjects,
     schedule,
@@ -1138,16 +1041,18 @@ export default function FocusScreen() {
   // are removed from the saved filter itself rather than from the selections.
   const advancedFilterChips = useMemo<FocusFilterChip[]>(() => {
     if (!activeSavedFilter) return [];
-    return buildAdvancedFilterCriteriaChips(selections.criteria, {
-      getAreaLabel: (areaId) => areaById.get(areaId)?.name,
-      resolveText,
+    return buildFocusAdvancedFilterChips({
+      activeSavedFilter,
+      criteria: selections.criteria,
+      areaById,
+      t,
     }).map((chip) => ({
-      id: `advanced:${chip.id}`,
+      id: chip.id,
       label: chip.label,
-      onPress: () => confirmRemoveAdvancedSavedFilterCriterion(chip.id, chip.label),
+      onPress: () => confirmRemoveAdvancedSavedFilterCriterion(chip.criterionId, chip.label),
       variant: 'advanced',
     }));
-  }, [activeSavedFilter, areaById, confirmRemoveAdvancedSavedFilterCriterion, selections.criteria, resolveText]);
+  }, [activeSavedFilter, areaById, confirmRemoveAdvancedSavedFilterCriterion, selections.criteria, t]);
   const activeFilterChips = useMemo<FocusFilterChip[]>(() => ([
     ...selections.chips.map((chip) => ({
       id: chip.id,
@@ -1158,15 +1063,17 @@ export default function FocusScreen() {
     ...advancedFilterChips,
   ]), [advancedFilterChips, selections.chips]);
   const openSaveFilterDialog = useCallback(() => {
-    const defaultName = activeFilterChips.slice(0, 3).map((chip) => chip.label).join(' + ')
-      || resolveText('savedFilters.defaultName', 'Focus filter');
-    setSaveFilterName(defaultName);
+    setSaveFilterName(getFocusSaveFilterName(
+      activeFilterChips.map((chip) => chip.label),
+      resolveText('savedFilters.defaultName', 'Focus filter'),
+    ));
     setSaveFilterDialogVisible(true);
   }, [activeFilterChips, resolveText]);
-  const emptyTitle = hasFilters ? resolveText('filters.noMatch', 'No tasks match these filters.') : t('agenda.allClear');
-  const emptySubtitle = hasFilters
-    ? resolveText('filters.label', 'Filters')
-    : tasks.length > 0 ? t('agenda.noTasks') : t('agenda.emptyStart');
+  const { title: emptyTitle, subtitle: emptySubtitle } = getFocusEmptyState({
+    hasActiveFilters: hasFilters,
+    hasAnyTasks: tasks.length > 0,
+    t,
+  });
   const pomodoroTasks = useMemo(() => {
     const byId = new Map<string, Task>();
     [...focusedTasks, ...schedule, ...nextActions, ...reviewDue].forEach((task) => {
@@ -1337,7 +1244,10 @@ export default function FocusScreen() {
     }
 
     const canMarkReviewed = section.type === 'reviewDue' && Boolean(item.task.reviewAt);
-    const canDeferTask = !canMarkReviewed && !item.task.dueDate && (item.task.isFocusedToday === true || item.task.status === 'next');
+    // A task due today or overdue has no later start date left to choose, so it gets no menu.
+    const canDeferTask = !canMarkReviewed
+      && canStartOn(item.task, getStartDateOffset(1))
+      && (item.task.isFocusedToday === true || item.task.status === 'next');
     // Passed by reference, not wrapped: both already take the task, and a fresh
     // arrow here would defeat the row's memo boundary (#766).
     const longPressAction = canMarkReviewed
@@ -1369,9 +1279,9 @@ export default function FocusScreen() {
           actions={rowActions}
           isHighlighted={item.task.id === highlightTaskId}
           showFocusToggle
-          // Every Upcoming row is deferred by construction, so the star could only
-          // ever refuse — disabled with the reason beats a tap that just toasts.
-          focusToggleDisabledLabel={section.type === 'upcoming' ? upcomingFocusBlockedLabel : undefined}
+          focusToggleDisabledLabel={section.type === 'upcoming' && !isTaskFutureFocusCandidate(item.task)
+            ? upcomingFocusBlockedLabel
+            : undefined}
           showFocusHighlight={section.type !== 'focus'}
           hideStatusBadge={section.type !== 'reviewDue'}
           hideDetails={!showDetails}
@@ -1405,16 +1315,10 @@ export default function FocusScreen() {
   }: RenderItemParams<Task>) => {
     const index = getIndex() ?? focusReorderData.findIndex((task) => task.id === item.id);
     const position = isActive && focusReorderPosition !== null ? focusReorderPosition : index;
-    const secondaryLabel = getFocusReorderSecondaryLabel(item);
+    const secondaryLabel = getReorderSecondaryLabel(item);
     const moveUpLabel = resolveText('projects.moveUp', 'Move up');
     const moveDownLabel = resolveText('projects.moveDown', 'Move down');
-    const positionLabel = resolveText(
-      'focus.reorderPosition',
-      '{{title}}. Position {{position}} of {{count}}',
-    )
-      .replace('{{position}}', String(index + 1))
-      .replace('{{count}}', String(focusReorderData.length))
-      .replace('{{title}}', item.title);
+    const positionLabel = getFocusReorderPositionLabel(t, item.title, index, focusReorderData.length);
     const reorderHint = resolveText('focus.reorderHint', 'Long press and drag to reorder');
     const accessibilityActions = [
       ...(index > 0 ? [{ name: 'moveUp', label: moveUpLabel }] : []),
@@ -1432,8 +1336,8 @@ export default function FocusScreen() {
             accessibilityHint={reorderHint}
             accessibilityActions={accessibilityActions}
             onAccessibilityAction={(event) => {
-              if (event.nativeEvent.actionName === 'moveUp') moveFocusReorderTask(item.id, -1);
-              if (event.nativeEvent.actionName === 'moveDown') moveFocusReorderTask(item.id, 1);
+              if (event.nativeEvent.actionName === 'moveUp') moveFocusReorderTaskBy(item.id, -1);
+              if (event.nativeEvent.actionName === 'moveDown') moveFocusReorderTaskBy(item.id, 1);
             }}
             activeOpacity={0.9}
             delayLongPress={180}
@@ -1477,9 +1381,10 @@ export default function FocusScreen() {
   }, [
     focusReorderData,
     focusReorderPosition,
-    getFocusReorderSecondaryLabel,
-    moveFocusReorderTask,
+    getReorderSecondaryLabel,
+    moveFocusReorderTaskBy,
     resolveText,
+    t,
     tc,
   ]);
   const listBottomPadding = FOCUS_LIST_BOTTOM_CLEARANCE + Math.max(0, insets.bottom);
@@ -1539,7 +1444,7 @@ export default function FocusScreen() {
       <SectionList
         sections={hasTasks ? sections : []}
         extraData={focusListVersion}
-        keyExtractor={(item) => item.type === 'task' ? item.task.id : item.type === 'project' ? `project:${item.project.id}` : item.id}
+        keyExtractor={(item) => item.type === 'task' ? (item.groupId ? `${item.groupId}:${item.task.id}` : item.task.id) : item.type === 'project' ? `project:${item.project.id}` : item.id}
         stickySectionHeadersEnabled={false}
         getItemLayout={getFocusItemLayout}
         initialNumToRender={FOCUS_LIST_INITIAL_RENDER_COUNT}
@@ -1779,7 +1684,7 @@ export default function FocusScreen() {
               <TouchableOpacity
                 accessibilityRole="button"
                 accessibilityLabel={resolveText('projects.reorderTasks', 'Reorder')}
-                accessibilityHint="Opens a focused screen for reordering these tasks"
+                accessibilityHint={resolveText('focus.reorderScreenHint', 'Opens a focused screen for reordering these tasks')}
                 onPress={enterFocusReorder}
                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                 activeOpacity={0.65}
@@ -1858,7 +1763,7 @@ export default function FocusScreen() {
               </Text>
               <View style={styles.sheetChipRow}>
                 {focusSortOptions.map((sortBy) => renderFilterChip(
-                  getFocusSortByLabel(sortBy),
+                  getFocusSortByLabel(sortBy, t),
                   effectiveFocusSortBy === sortBy,
                   () => updateFocusSortBy(sortBy),
                   `view-sort:${sortBy}`,
@@ -1866,11 +1771,11 @@ export default function FocusScreen() {
               </View>
 
               <Text style={[styles.sheetSectionLabel, { color: tc.secondaryText }]}>
-                {resolveText('focus.groupBy', 'Group by')}
+                {resolveText('focus.groupBy', 'Group next actions by')}
               </Text>
               <View style={styles.sheetChipRow}>
                 {focusGroupByOptions.map((groupBy) => renderFilterChip(
-                  getFocusGroupByLabel(groupBy),
+                  getFocusGroupByLabel(groupBy, t),
                   effectiveFocusGroupBy === groupBy,
                   () => updateFocusGroupBy(groupBy),
                   `view-group:${groupBy}`,
@@ -2046,6 +1951,7 @@ export default function FocusScreen() {
           mode="date"
           display="default"
           minimumDate={getStartDateOffset(1)}
+          maximumDate={safeParseDueDate(deferPickerTask.dueDate) ?? undefined}
           onChange={handleDeferDateChange}
         />
       ) : null}

@@ -1,8 +1,13 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { isValid, parseISO } from 'date-fns';
+import { buildCompletionDateSections } from './completion-grouping';
+import { createTaskDraft, setTaskDraftField, taskDraftToChangedUpdatePatch, toTaskDraftDateTimeLocalValue } from './task-draft';
+import type { Task } from './types';
 import {
     canUseJalaliCalendar,
     configureDateFormatting,
+    createDateFormatter,
+    getDateFormattingConfig,
     isActiveDateFormatDayFirst,
     isLocaleDateDayFirst,
     formatCalendarInputDate,
@@ -15,6 +20,7 @@ import {
     normalizeDateFormatSetting,
     normalizeTimeFormatSetting,
     getSystemWeekStart,
+    setHostSystemLocale,
     getShortWeekdayLabels,
     normalizeWeekStartPreference,
     normalizeWeekStartSetting,
@@ -243,6 +249,14 @@ describe('date utils', () => {
         });
         expect(safeFormatDate('2025-03-21', 'P')).toBe('1404/01/01');
         expect(safeFormatDate('2025-03-21', 'yyyy-MM-dd')).toBe('2025-03-21');
+        expect(safeFormatDate('2025-03-21T08:00:00', "yyyy-MM-dd'T'HH:mm")).toBe('2025-03-21T08:00');
+        expect(safeFormatDate('2025-03-21T08:00:05', 'yyyyMMdd-HHmmss')).toBe('20250321-080005');
+        expect(safeFormatDate('2025-03-21', 'LLLL yyyy')).toBe('مارس 2025');
+        expect(buildCompletionDateSections({ tasks: [{ completedAt: '2025-03-21T08:00:00' }], t: (key) => key, now: new Date('2025-05-01') })[0].title).toBe('مارس 2025');
+        const source: Task = { id: 'jalali-draft', title: 'Task', status: 'next', contexts: [], tags: [], createdAt: '', updatedAt: '', dueDate: '2025-03-21T08:00:00' };
+        expect(toTaskDraftDateTimeLocalValue(source.dueDate)).toBe('2025-03-21T08:00');
+        const draft = setTaskDraftField(createTaskDraft(source), 'dueDate', '2025-03-21T09:00');
+        expect(taskDraftToChangedUpdatePatch(draft, source)?.dueDate).toBe('2025-03-21T09:00');
         expect(formatCalendarInputDate('2025-03-21', 'jalali')).toBe('1404-01-01');
         expect(parseCalendarInputDate('1404-01-01', 'jalali')).toBe('2025-03-21');
 
@@ -274,6 +288,22 @@ describe('date utils', () => {
         configureDateFormatting({ language: 'uk', dateFormat: 'dmy', timeFormat: 'system', systemLocale: 'uk-UA' });
         expect(safeFormatDate('2026-08-08', 'PP')).toBe('8 серп. 2026 р.');
         expect(safeFormatDate('2026-08-08', 'PPPP')).toContain('серпня');
+        configureDateFormatting({ language: 'en', dateFormat: 'system', timeFormat: 'system', systemLocale: 'en-US' });
+    });
+
+    it('formats with an explicit configuration without touching the configured one', () => {
+        const german = { language: 'de', dateFormat: 'dmy', timeFormat: '24h', systemLocale: 'de-DE' };
+        configureDateFormatting({ language: 'en', dateFormat: 'system', timeFormat: 'system', systemLocale: 'en-US' });
+        expect(createDateFormatter(german)('2026-08-08T14:05', 'Pp')).toBe('08.08.2026 14:05');
+        expect(safeFormatDate('2026-08-08T14:05', 'Pp')).toBe('08/08/2026, 2:05 PM');
+        expect(getDateFormattingConfig()).toEqual({ language: 'en', dateFormat: 'system', timeFormat: 'system', systemLocale: 'en-US' });
+        configureDateFormatting(german);
+        expect(safeFormatDate('2026-08-08T14:05', 'Pp')).toBe(createDateFormatter(german)('2026-08-08T14:05', 'Pp'));
+        expect(createDateFormatter({ language: 'fa', calendarSystem: 'jalali' })('2026-08-08', 'P')).toBe('1405/05/17');
+        const jalali = createDateFormatter({ language: 'fa', calendarSystem: 'jalali' });
+        expect(jalali('2025-03-21', 'LLLL yyyy')).toBe('مارس 2025');
+        expect(createDateFormatter({ language: 'fa', calendarSystem: 'jalali' }, { jalaliMonthNames: true })('2025-03-21', 'LLLL yyyy')).toBe('فروردین 1404');
+        expect(createDateFormatter({})(undefined, 'P', 'none')).toBe('none');
         configureDateFormatting({ language: 'en', dateFormat: 'system', timeFormat: 'system', systemLocale: 'en-US' });
     });
 
@@ -315,6 +345,20 @@ describe('getShortWeekdayLabels (#929)', () => {
         expect(getShortWeekdayLabels('en-US')).toEqual(['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
     });
 
+    it('starts on Sunday after the time zone changes (no load-time anchor date)', () => {
+        const originalTz = process.env.TZ;
+        try {
+            // Fresh locales, so the per-locale cache cannot answer from an earlier zone.
+            for (const [zone, locale] of [['Pacific/Kiritimati', 'en-AU'], ['Pacific/Pago_Pago', 'en-NZ']]) {
+                process.env.TZ = zone;
+                expect(getShortWeekdayLabels(locale)[0]).toBe('Sun');
+            }
+        } finally {
+            if (originalTz === undefined) delete process.env.TZ;
+            else process.env.TZ = originalTz;
+        }
+    });
+
     it('returns Sunday at index 0', () => {
         const labels = getShortWeekdayLabels('en-US');
         const sunday = new Date(2023, 0, 1); // Jan 1, 2023 was a Sunday
@@ -338,5 +382,25 @@ describe('getShortWeekdayLabels (#929)', () => {
 
     it('falls back to narrow for Arabic, where truncation collides', () => {
         expect(getShortWeekdayLabels('ar')).toEqual(['ح', 'ن', 'ث', 'ر', 'خ', 'ج', 'س']);
+    });
+});
+
+describe('host system locale for week start', () => {
+    afterEach(() => setHostSystemLocale(null));
+
+    it('uses the locale a native host passed when the runtime gives none', () => {
+        // A native host (QuickJS) has no Intl locale; core must use the device locale the host sent.
+        setHostSystemLocale('de-DE');
+        expect(getSystemWeekStart()).toBe('monday');
+        setHostSystemLocale('en-US');
+        expect(getSystemWeekStart()).toBe('sunday');
+        expect(getWeekStartsOnIndex('system')).toBe(0);
+        setHostSystemLocale('ar-EG');
+        expect(getSystemWeekStart()).toBe('saturday');
+    });
+
+    it('lets an explicit locale argument win over the host locale', () => {
+        setHostSystemLocale('en-US');
+        expect(getSystemWeekStart('de-DE')).toBe('monday');
     });
 });

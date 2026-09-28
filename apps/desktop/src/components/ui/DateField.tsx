@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { CalendarDays, CalendarX, ChevronLeft, ChevronRight, type LucideIcon } from 'lucide-react';
 import {
     addCalendarMonths,
@@ -386,6 +386,11 @@ export function DateField({
     // the attribute each time makes a screen reader call the field invalid before
     // the user has finished entering a date that will parse fine.
     const announceInvalid = isDraftInvalid && announceDraftInvalid;
+    // Date-field buttons keep focus on the text field while pressed. WebKit on macOS does not
+    // focus a button on click, so without this the field blurs to nothing and deferred cleanup
+    // can undo the button action (#1254, #1265, #1266). Chromium and WebKitGTK focus the clicked
+    // button, which is why it never showed on Windows or Linux.
+    const keepFieldFocus = (event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault();
     const applyCalendarDate = (date: Date) => {
         const nextDateValue = safeFormatDate(date, 'yyyy-MM-dd');
         setDraftDateValue(formatDateInputDisplay(nextDateValue, dateInputOrder, calendarSystem));
@@ -461,6 +466,7 @@ export function DateField({
                         aria-label={calendarAriaLabel}
                         aria-haspopup="dialog"
                         aria-expanded={isCalendarOpen}
+                        onMouseDown={keepFieldFocus}
                         onClick={openCalendar}
                         className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                     >
@@ -471,6 +477,7 @@ export function DateField({
                 {onDateOnly ? (
                     <button
                         type="button"
+                        onMouseDown={keepFieldFocus}
                         onClick={onDateOnly}
                         className="shrink-0 whitespace-nowrap rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                         aria-label={`${dateOnlyText}: ${accessibleName}`}
@@ -481,6 +488,7 @@ export function DateField({
                 {!onClear ? null : hasValue ? (
                     <button
                         type="button"
+                        onMouseDown={keepFieldFocus}
                         onClick={() => {
                             setDraftDateValue('');
                             onClear();
@@ -509,6 +517,7 @@ export function DateField({
                             <button
                                 type="button"
                                 aria-label={previousMonthAriaLabel}
+                                onMouseDown={keepFieldFocus}
                                 onClick={() => setCalendarMonth((current) => addCalendarMonths(current, -1, calendarSystem))}
                                 className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                             >
@@ -520,6 +529,7 @@ export function DateField({
                             <button
                                 type="button"
                                 aria-label={nextMonthAriaLabel}
+                                onMouseDown={keepFieldFocus}
                                 onClick={() => setCalendarMonth((current) => addCalendarMonths(current, 1, calendarSystem))}
                                 className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                             >
@@ -545,7 +555,7 @@ export function DateField({
                                         type="button"
                                         aria-label={fullDateFormatter.format(day)}
                                         aria-pressed={isSelected}
-                                        onMouseDown={(event) => event.preventDefault()}
+                                        onMouseDown={keepFieldFocus}
                                         onClick={() => applyCalendarDate(day)}
                                         className={[
                                             'h-8 rounded text-xs transition-colors',
@@ -573,7 +583,7 @@ export function DateField({
                                     key={preset}
                                     type="button"
                                     aria-pressed={active}
-                                    onMouseDown={(event) => event.preventDefault()}
+                                    onMouseDown={keepFieldFocus}
                                     onClick={() => applyQuickDatePreset(preset)}
                                     className={[
                                         'rounded px-2 py-1.5 text-left text-xs transition-colors',

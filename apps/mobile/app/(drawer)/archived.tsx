@@ -3,32 +3,48 @@ import { Redirect, usePathname } from 'expo-router';
 import { View, Text, FlatList, Pressable, StyleSheet, Alert, TextInput } from 'react-native';
 import { workspaceSessionStorage as AsyncStorage } from '@/lib/workspace-session-storage';
 import {
+    ARCHIVE_SEGMENTS,
+    buildArchiveTaskItems,
+    filterArchivedTasksByArea,
+    getArchiveConfirmation,
+    getArchivedProjectRow,
+    getArchivedTaskRow,
+    getArchiveEmptyState,
+    getArchiveMenu,
+    getArchiveRowLabels,
+    getArchiveSegmentLabel,
+    getArchiveSummary,
+    getArchiveTokenFilterOptions,
+    formatI18nTemplate,
     getInlineMarkdownPreview,
+    getTaskGroupItemIds,
     getTaskMetadataFilterVisibility,
-    getUsedTaskTokens,
-    DONE_TASK_LIST_SORT_OPTIONS,
-    isTaskCancelled,
-    projectMatchesAreaFilterSelection,
+    moveArchivedTasksToInbox,
+    moveArchivedTaskToInbox,
+    reactivateArchivedProject,
+    resolveArchiveSortBy,
     resolveFeatureFlags,
-    resolveTaskSortByForFeatures,
     safeFormatDate,
+    selectArchivedProjects,
+    selectArchivedTasks,
+    setArchivedTaskCompletedAt,
     shallow,
-    sortDoneTasksForListView,
-    sortTasksBy,
-    taskMatchesAreaFilterSelection,
+    showArchiveSearch,
+    sortArchivedTasks,
     tFallback,
     TIME_ESTIMATE_OPTIONS,
     useTaskStore,
+    type ArchiveSegment,
+    type Area,
     type Project,
     type Task,
+    type TaskGroupItem,
     type TaskSortBy,
 } from '@mindwtr/core';
 import { TaskFilterSheet } from '@/components/task-filter-sheet';
 import { taskMatchesFilterSelections, useTaskFilterSelections } from '@/hooks/use-task-filter-selections';
 import { useLocalDayKey } from '@/hooks/use-local-day-key';
-import { buildTaskGroupSections, getTaskGroupByLabel, type TaskGroupItem } from '@/lib/task-group-sections';
 import {
-    ARCHIVED_LIST_GROUP_OPTIONS,
     ARCHIVED_LIST_VIEW_STATE_STORAGE_KEY,
     DEFAULT_ARCHIVED_LIST_VIEW_STATE,
     readArchivedListViewState,
@@ -50,7 +66,7 @@ import { settleStoreAction } from '@/components/store-action-result';
 import { useToast } from '@/contexts/toast-context';
 import { TASK_LIST_WINDOWING_PROPS } from '@/components/task-list-windowing';
 import { Swipeable, GestureHandlerRootView } from 'react-native-gesture-handler';
-import { Archive, ArrowUpDown, ChevronDown, ChevronRight, Folder, SlidersHorizontal } from 'lucide-react-native';
+import { Archive, ArrowUpDown, Check, ChevronDown, ChevronRight, Folder, RotateCcw, SlidersHorizontal, Trash2 } from 'lucide-react-native';
 import { ListOverflowMenu } from '@/components/list-overflow-menu';
 
 function ArchivedTaskItem({
@@ -63,8 +79,10 @@ function ArchivedTaskItem({
     onToggleSelect,
     completedLabel,
     cancelledLabel,
+    notSetLabel,
     editCompletedAtLabel,
     selectLabel,
+    openLabel,
     restoreLabel,
     deleteLabel,
     selectionMode,
@@ -80,8 +98,10 @@ function ArchivedTaskItem({
     onToggleSelect: () => void;
     completedLabel: string;
     cancelledLabel: string;
+    notSetLabel: string;
     editCompletedAtLabel: string;
     selectLabel: string;
+    openLabel: string;
     restoreLabel: string;
     deleteLabel: string;
     selectionMode: boolean;
@@ -89,13 +109,7 @@ function ArchivedTaskItem({
     isHighlighted?: boolean;
 }) {
     const swipeableRef = useRef<Swipeable>(null);
-    const cancelled = isTaskCancelled(task);
-    const completionTimestamp = cancelled
-        ? task.cancelledAt || task.updatedAt
-        : task.completedAt || task.updatedAt;
-    const completionDateLabel = completionTimestamp
-        ? safeFormatDate(completionTimestamp, 'Pp', completionTimestamp)
-        : 'Unknown';
+    const { cancelled, dateLabel: completionDateLabel } = getArchivedTaskRow(task, safeFormatDate, notSetLabel);
 
     const renderLeftActions = () => (
         <Pressable
@@ -105,7 +119,8 @@ function ArchivedTaskItem({
                 onRestore();
             }}
         >
-            <Text style={styles.swipeActionText}>↩️ {restoreLabel}</Text>
+            <RotateCcw size={18} color="#FFFFFF" />
+            <Text style={[styles.swipeActionText, { marginTop: 4 }]}>{restoreLabel}</Text>
         </Pressable>
     );
 
@@ -117,7 +132,8 @@ function ArchivedTaskItem({
                 onDelete();
             }}
         >
-            <Text style={styles.swipeActionText}>🗑️ {deleteLabel}</Text>
+            <Trash2 size={18} color="#FFFFFF" />
+            <Text style={[styles.swipeActionText, { marginTop: 4 }]}>{deleteLabel}</Text>
         </Pressable>
     );
 
@@ -131,7 +147,7 @@ function ArchivedTaskItem({
         >
             <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={selectionMode ? `${selectLabel} ${task.title}` : `Open archived task details: ${task.title}`}
+                accessibilityLabel={selectionMode ? `${selectLabel} ${task.title}` : openLabel}
                 accessibilityState={selectionMode ? { selected: isSelected } : undefined}
                 onPress={selectionMode ? onToggleSelect : onOpen}
                 style={({ pressed }) => [
@@ -149,7 +165,7 @@ function ArchivedTaskItem({
                             { borderColor: tc.tint, backgroundColor: isSelected ? tc.tint : 'transparent' },
                         ]}
                     >
-                        {isSelected && <Text style={[styles.selectionMark, { color: tc.onTint }]}>✓</Text>}
+                        {isSelected && <Check size={14} color={tc.onTint} strokeWidth={3} />}
                     </View>
                 )}
                 <View style={styles.taskContent}>
@@ -195,36 +211,37 @@ function ArchivedTaskItem({
     );
 }
 
-type ArchiveSegment = 'tasks' | 'projects';
-
 function ArchivedProjectItem({
     project,
     tc,
     areaName,
+    areaById,
     onOpen,
     onRestore,
     onDelete,
     completedLabel,
     cancelledLabel,
+    notSetLabel,
+    openLabel,
     restoreLabel,
     deleteLabel,
 }: {
     project: Project;
     tc: ThemeColors;
     areaName?: string;
+    areaById: Map<string, Area>;
     onOpen: () => void;
     onRestore: () => void;
     onDelete: () => void;
     completedLabel: string;
     cancelledLabel: string;
+    notSetLabel: string;
+    openLabel: string;
     restoreLabel: string;
     deleteLabel: string;
 }) {
     const swipeableRef = useRef<Swipeable>(null);
-    const outcomeTimestamp = project.cancelledAt || project.updatedAt;
-    const archivedDateLabel = outcomeTimestamp
-        ? safeFormatDate(outcomeTimestamp, 'Pp', outcomeTimestamp)
-        : 'Unknown';
+    const { cancelled, dateLabel: archivedDateLabel, indicatorColor } = getArchivedProjectRow(project, safeFormatDate, areaById, notSetLabel);
 
     const renderLeftActions = () => (
         <Pressable
@@ -234,7 +251,8 @@ function ArchivedProjectItem({
                 onRestore();
             }}
         >
-            <Text style={styles.swipeActionText}>↩️ {restoreLabel}</Text>
+            <RotateCcw size={18} color="#FFFFFF" />
+            <Text style={[styles.swipeActionText, { marginTop: 4 }]}>{restoreLabel}</Text>
         </Pressable>
     );
 
@@ -246,7 +264,8 @@ function ArchivedProjectItem({
                 onDelete();
             }}
         >
-            <Text style={styles.swipeActionText}>🗑️ {deleteLabel}</Text>
+            <Trash2 size={18} color="#FFFFFF" />
+            <Text style={[styles.swipeActionText, { marginTop: 4 }]}>{deleteLabel}</Text>
         </Pressable>
     );
 
@@ -260,7 +279,7 @@ function ArchivedProjectItem({
         >
             <Pressable
                 accessibilityRole="button"
-                accessibilityLabel={`Open archived project: ${project.title}`}
+                accessibilityLabel={openLabel}
                 onPress={onOpen}
                 style={({ pressed }) => [
                     styles.taskItem,
@@ -270,19 +289,19 @@ function ArchivedProjectItem({
             >
                 <View style={styles.taskContent}>
                     <Text
-                        style={[styles.taskTitle, !project.cancelledAt && styles.completedTitle, { color: tc.secondaryText }]}
+                        style={[styles.taskTitle, !cancelled && styles.completedTitle, { color: tc.secondaryText }]}
                         numberOfLines={2}
                     >
                         {project.title}
                     </Text>
                     <Text style={[styles.archivedDate, { color: tc.secondaryText }]}>
-                        {project.cancelledAt ? cancelledLabel : completedLabel}: {archivedDateLabel}
+                        {cancelled ? cancelledLabel : completedLabel}: {archivedDateLabel}
                     </Text>
                     {areaName ? (
                         <Text style={[styles.archivedDate, { color: tc.secondaryText }]}>{areaName}</Text>
                     ) : null}
                 </View>
-                <View style={[styles.statusIndicator, { backgroundColor: project.color || '#6B7280' }]} />
+                {indicatorColor ? <View style={[styles.statusIndicator, { backgroundColor: indicatorColor }]} /> : null}
             </Pressable>
         </Swipeable>
     );
@@ -359,7 +378,7 @@ export default function ArchivedScreen() {
 
     // A stored 'timeEstimate' sort falls back to default while the feature is
     // off, so the chip row and the ordering agree (#1107).
-    const sortBy: TaskSortBy = resolveTaskSortByForFeatures(viewState.sortBy ?? 'default', settings);
+    const sortBy: TaskSortBy = resolveArchiveSortBy(viewState.sortBy, settings);
     // Sorted once, then narrowed in stages. Every stage below only filters, and
     // filtering preserves relative order, so the visible order is the same as
     // sorting last would give — but the O(n log n) sort now hangs off _allTasks and
@@ -367,32 +386,20 @@ export default function ArchivedScreen() {
     // maps, the filter criteria), it re-sorts the whole archive several times per
     // interaction and blows the large-store select-all budget: 5000 archived tasks
     // measured ~360ms against a 150ms budget, from 5 sorts where 1 was needed.
-    const archivedByStatus = useMemo(
-        () => _allTasks.filter((task) => task.status === 'archived' && !task.deletedAt),
-        [_allTasks],
-    );
-    const sortedArchivedTasks = useMemo(() => (
-        // Archive is a log like Done: with no explicit sort, newest completion first
-        // beats the global task sort, which ranks by due date and priority — neither
-        // of which means anything once a task is filed away.
-        sortBy === 'default' ? sortDoneTasksForListView(archivedByStatus) : sortTasksBy(archivedByStatus, sortBy)
-    ), [archivedByStatus, sortBy]);
+    const archivedByStatus = useMemo(() => selectArchivedTasks(_allTasks), [_allTasks]);
+    // Archive is a log like Done: with no explicit sort, newest completion first
+    // beats the global task sort, which ranks by due date and priority — neither
+    // of which means anything once a task is filed away.
+    const sortedArchivedTasks = useMemo(() => sortArchivedTasks(archivedByStatus, sortBy), [archivedByStatus, sortBy]);
     // Everything archived in the current area, before the filter sheet and search
     // narrow it. The bulk "select all" and the counts work off the narrowed list
     // below, so acting on a filtered view never reaches a row that is not on screen.
     const allArchivedTasks = useMemo(
-        () => sortedArchivedTasks.filter((task) => taskMatchesAreaFilterSelection(task, resolvedAreaFilter, projectById, areaById)),
+        () => filterArchivedTasksByArea(sortedArchivedTasks, resolvedAreaFilter, projectById, areaById),
         [sortedArchivedTasks, resolvedAreaFilter, projectById, areaById],
     );
 
     const resolvedFeatureFlags = resolveFeatureFlags(settings);
-    // Same gate the shared sort modal applies (#1107).
-    const archivedSortOptions = useMemo(
-        () => DONE_TASK_LIST_SORT_OPTIONS.filter((option) => (
-            option !== 'timeEstimate' || resolvedFeatureFlags.timeEstimates
-        )),
-        [resolvedFeatureFlags.timeEstimates],
-    );
     const metadataFilterVisibility = useMemo(
         () => getTaskMetadataFilterVisibility(allArchivedTasks, {
             prioritiesEnabled: resolvedFeatureFlags.priorities,
@@ -410,10 +417,10 @@ export default function ArchivedScreen() {
     });
     // Only worth scanning every row for its tokens once the sheet is open; until
     // then the selected ones are the only chips anybody can see.
-    const tokenFilterOptions = useMemo(() => {
-        if (!filtersVisible) return Array.from(new Set([...selections.tokens, ...selections.excludedTokens]));
-        return getUsedTaskTokens(allArchivedTasks, (task) => [...(task.contexts ?? []), ...(task.tags ?? [])]);
-    }, [allArchivedTasks, filtersVisible, selections.tokens, selections.excludedTokens]);
+    const tokenFilterOptions = useMemo(() => getArchiveTokenFilterOptions(allArchivedTasks, filtersVisible, {
+        tokens: selections.tokens,
+        excludedTokens: selections.excludedTokens,
+    }), [allArchivedTasks, filtersVisible, selections.tokens, selections.excludedTokens]);
 
     const archivedTasks = useMemo(() => allArchivedTasks.filter((task) => taskMatchesFilterSelections(task, {
         criteria: selections.criteria,
@@ -426,12 +433,9 @@ export default function ArchivedScreen() {
     // Always the grouped row shape, even ungrouped: one list type keeps the FlatList
     // monomorphic instead of switching its data/renderItem/keyExtractor together.
     const listItems = useMemo<TaskGroupItem[]>(() => {
-        if (groupBy === 'none') {
-            return archivedTasks.map((task) => ({ type: 'task', task }));
-        }
         // localDayKey is not read; it is a dependency so crossing midnight re-buckets.
         void localDayKey;
-        return buildTaskGroupSections({
+        return buildArchiveTaskItems({
             groupBy,
             tasks: archivedTasks,
             areas,
@@ -442,19 +446,9 @@ export default function ArchivedScreen() {
     }, [archivedTasks, areas, collapsedGroupIds, groupBy, localDayKey, projectById, t]);
     // Rows a folded heading has removed are not "on screen", so Select all and the
     // selection prune below both work off this rather than the filtered list.
-    const visibleTaskIds = useMemo(
-        () => Array.from(new Set(
-            listItems.flatMap((item) => (item.type === 'task' ? [item.task.id] : [])),
-        )),
-        [listItems],
-    );
+    const visibleTaskIds = useMemo(() => getTaskGroupItemIds(listItems), [listItems]);
     const archivedProjects = useMemo(
-        () => projects
-            .filter((project) => (
-                project.status === 'archived'
-                && projectMatchesAreaFilterSelection(project, resolvedAreaFilter, areaById)
-            ))
-            .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')),
+        () => selectArchivedProjects(projects, resolvedAreaFilter, areaById),
         [projects, resolvedAreaFilter, areaById],
     );
     const selectedTask = useMemo(
@@ -483,7 +477,6 @@ export default function ArchivedScreen() {
         batchDeleteTasks,
         batchMoveTasks,
         batchUpdateTasks,
-        restoreActionLabel,
         restoreTask,
         t,
         tasksById,
@@ -538,7 +531,7 @@ export default function ArchivedScreen() {
     }, [showToast, t]);
 
     const handleRestore = useCallback((taskId: string) => {
-        void settleStoreAction(() => updateTask(taskId, { status: 'inbox' }))
+        void settleStoreAction(() => moveArchivedTaskToInbox({ updateTask }, taskId))
             .then((outcome) => {
                 if (!outcome.ok) showTaskUpdateError(outcome.message);
             });
@@ -551,7 +544,7 @@ export default function ArchivedScreen() {
     const handleBulkRestore = useCallback(async () => {
         if (selectedIdsArray.length === 0) return;
         await runBulkAction(restoreActionLabel, async () => {
-            assertBulkActionSucceeded(await batchMoveTasks(selectedIdsArray, 'inbox'));
+            assertBulkActionSucceeded(await moveArchivedTasksToInbox({ batchMoveTasks }, selectedIdsArray));
             exitSelectionMode();
         });
     }, [batchMoveTasks, exitSelectionMode, restoreActionLabel, runBulkAction, selectedIdsArray]);
@@ -565,50 +558,72 @@ export default function ArchivedScreen() {
         const taskId = completedAtTaskId;
         setCompletedAtTaskId(null);
         if (!taskId) return;
-        void settleStoreAction(() => updateTask(taskId, { completedAt: iso }))
+        void settleStoreAction(() => setArchivedTaskCompletedAt({ updateTask }, taskId, iso))
             .then((outcome) => {
                 if (!outcome.ok) showTaskUpdateError(outcome.message);
             });
     }, [completedAtTaskId, showTaskUpdateError, updateTask]);
 
     const handleDelete = useCallback((taskId: string) => {
+        const confirmation = getArchiveConfirmation({ kind: 'task' }, t);
         Alert.alert(
-            tFallback(t, 'common.delete', 'Delete'),
-            tFallback(t, 'task.deleteConfirmBody', 'Move this task to Trash?'),
+            confirmation.title,
+            confirmation.message,
             [
-                { text: tFallback(t, 'common.cancel', 'Cancel'), style: 'cancel' },
+                { text: confirmation.cancelLabel, style: 'cancel' },
                 {
-                    text: tFallback(t, 'common.delete', 'Delete'),
+                    text: confirmation.confirmLabel,
                     style: 'destructive',
                     onPress: () => {
-                        void deleteTask(taskId);
+                        void settleStoreAction(() => deleteTask(taskId))
+                            .then((outcome) => {
+                                if (!outcome.ok) showTaskUpdateError(outcome.message);
+                            });
                     },
                 },
             ]
         );
-    }, [deleteTask, t]);
+    }, [deleteTask, showTaskUpdateError, t]);
 
     const handleRestoreProject = useCallback((projectId: string) => {
-        void updateProject(projectId, { status: 'active' });
-    }, [updateProject]);
+        void settleStoreAction(() => reactivateArchivedProject({ updateProject }, projectId))
+            .then((outcome) => {
+                if (outcome.ok) return;
+                showToast({
+                    title: tFallback(t, 'common.error', 'Error'),
+                    message: outcome.message || tFallback(t, 'projects.reactivateFailed', 'Failed to reactivate project'),
+                    tone: 'error',
+                    durationMs: 4200,
+                });
+            });
+    }, [showToast, t, updateProject]);
 
     const handleDeleteProject = useCallback((projectId: string) => {
-        const project = projects.find((item) => item.id === projectId);
+        const confirmation = getArchiveConfirmation({ kind: 'project', project: projects.find((item) => item.id === projectId) }, t);
         Alert.alert(
-            project?.title || tFallback(t, 'common.delete', 'Delete'),
-            tFallback(t, 'projects.deleteConfirm', 'Delete this project? Tasks in this project will be kept and moved to unassigned.'),
+            confirmation.title,
+            confirmation.message,
             [
-                { text: tFallback(t, 'common.cancel', 'Cancel'), style: 'cancel' },
+                { text: confirmation.cancelLabel, style: 'cancel' },
                 {
-                    text: tFallback(t, 'common.delete', 'Delete'),
+                    text: confirmation.confirmLabel,
                     style: 'destructive',
                     onPress: () => {
-                        void deleteProject(projectId);
+                        void settleStoreAction(() => deleteProject(projectId))
+                            .then((outcome) => {
+                                if (outcome.ok) return;
+                                showToast({
+                                    title: tFallback(t, 'common.error', 'Error'),
+                                    message: outcome.message || tFallback(t, 'projects.deleteFailed', 'Failed to delete project'),
+                                    tone: 'error',
+                                    durationMs: 4200,
+                                });
+                            });
                     },
                 },
             ],
         );
-    }, [deleteProject, projects, t]);
+    }, [deleteProject, projects, showToast, t]);
 
     const handleSegmentChange = useCallback((next: ArchiveSegment) => {
         setSegment((current) => {
@@ -618,20 +633,28 @@ export default function ArchivedScreen() {
         });
     }, [exitSelectionMode]);
 
+    const rowLabels = useMemo(() => getArchiveRowLabels(t), [t]);
+    const openLabels = useMemo(() => ({
+        task: tFallback(t, 'archived.openTaskDetails', 'Open archived task details: {{title}}'),
+        project: tFallback(t, 'archived.openProject', 'Open archived project: {{title}}'),
+    }), [t]);
     const renderArchivedProject = useCallback(({ item }: { item: Project }) => (
         <ArchivedProjectItem
             project={item}
             tc={tc}
             areaName={item.areaId ? areaById.get(item.areaId)?.name : undefined}
+            areaById={areaById}
             onOpen={() => openProjectScreen(item.id)}
             onRestore={() => handleRestoreProject(item.id)}
             onDelete={() => handleDeleteProject(item.id)}
-            completedLabel={tFallback(t, 'list.done', 'Completed')}
-            cancelledLabel={tFallback(t, 'projects.cancelled', 'Cancelled')}
-            restoreLabel={tFallback(t, 'trash.restore', 'Restore')}
-            deleteLabel={tFallback(t, 'common.delete', 'Delete')}
+            completedLabel={rowLabels.completed}
+            cancelledLabel={rowLabels.projectCancelled}
+            notSetLabel={rowLabels.notSet}
+            openLabel={formatI18nTemplate(openLabels.project, { title: item.title })}
+            restoreLabel={rowLabels.restore}
+            deleteLabel={rowLabels.delete}
         />
-    ), [tc, areaById, handleRestoreProject, handleDeleteProject, t]);
+    ), [tc, areaById, handleRestoreProject, handleDeleteProject, openLabels, rowLabels]);
 
     const renderArchivedTask = useCallback(({ item }: { item: Task }) => (
         <ArchivedTaskItem
@@ -642,17 +665,19 @@ export default function ArchivedScreen() {
             onDelete={() => handleDelete(item.id)}
             onEditCompletedAt={() => setCompletedAtTaskId(item.id)}
             onToggleSelect={() => toggleMultiSelect(item.id)}
-            completedLabel={tFallback(t, 'list.done', 'Completed')}
-            cancelledLabel={tFallback(t, 'task.cancelled', 'Cancelled')}
-            editCompletedAtLabel={tFallback(t, 'task.editCompletedAt', 'Edit completion time')}
-            selectLabel={tFallback(t, 'bulk.select', 'Select')}
-            restoreLabel={tFallback(t, 'trash.restore', 'Restore')}
-            deleteLabel={tFallback(t, 'common.delete', 'Delete')}
+            completedLabel={rowLabels.completed}
+            cancelledLabel={rowLabels.taskCancelled}
+            notSetLabel={rowLabels.notSet}
+            editCompletedAtLabel={rowLabels.editCompletedAt}
+            selectLabel={rowLabels.select}
+            openLabel={formatI18nTemplate(openLabels.task, { title: item.title })}
+            restoreLabel={rowLabels.restore}
+            deleteLabel={rowLabels.delete}
             selectionMode={selectionMode}
             isSelected={selectedIds.has(item.id)}
             isHighlighted={item.id === highlightTaskId}
         />
-    ), [tc, handleDelete, handleOpenTask, handleRestore, highlightTaskId, selectedIds, selectionMode, t, toggleMultiSelect]);
+    ), [tc, handleDelete, handleOpenTask, handleRestore, highlightTaskId, openLabels, rowLabels, selectedIds, selectionMode, toggleMultiSelect]);
 
     const renderGroupedItem = useCallback(({ item }: { item: TaskGroupItem }) => {
         if (item.type === 'section') {
@@ -692,6 +717,14 @@ export default function ArchivedScreen() {
         [],
     );
 
+    const menu = getArchiveMenu({ sortBy, groupBy, settings }, t);
+    const summary = getArchiveSummary(segment, segment === 'tasks' ? archivedTasks.length : archivedProjects.length, t);
+    const emptyState = getArchiveEmptyState({
+        segment,
+        hasActiveFilters: selections.hasActive,
+        filterChipLabels: selections.chips.map((chip) => chip.label),
+    }, t);
+
     if (pathname === '/archived') {
         return <Redirect href={{ pathname: '/history', params: { tab: 'archived' } } as never} />;
     }
@@ -700,9 +733,9 @@ export default function ArchivedScreen() {
         <GestureHandlerRootView style={{ flex: 1 }}>
             <View style={[styles.container, { backgroundColor: tc.bg }]}>
                 <View style={styles.segmentRow}>
-                    {(['tasks', 'projects'] as ArchiveSegment[]).map((value) => {
+                    {ARCHIVE_SEGMENTS.map((value) => {
                         const selected = segment === value;
-                        const label = value === 'tasks' ? tFallback(t, 'archived.tasksSegment', 'Tasks') : tFallback(t, 'projects.title', 'Projects');
+                        const label = getArchiveSegmentLabel(value, t);
                         return (
                             <Pressable
                                 key={value}
@@ -722,7 +755,7 @@ export default function ArchivedScreen() {
                         );
                     })}
                 </View>
-                {segment === 'tasks' && (allArchivedTasks.length > 0 || selections.hasActive) && (
+                {showArchiveSearch(segment, allArchivedTasks.length, selections.hasActive) && (
                     <View style={styles.searchRow}>
                         <TextInput
                             value={selections.searchQuery}
@@ -738,7 +771,7 @@ export default function ArchivedScreen() {
                             <Pressable
                                 onPress={() => setFiltersVisible(true)}
                                 accessibilityRole="button"
-                                accessibilityLabel={`${tFallback(t, 'filters.title', 'Filters')} · ${selections.activeCount}`}
+                                accessibilityLabel={`${menu.filtersLabel} · ${selections.activeCount}`}
                                 accessibilityState={{ selected: true }}
                                 style={[
                                     styles.filtersButton,
@@ -748,7 +781,7 @@ export default function ArchivedScreen() {
                             >
                                 <SlidersHorizontal size={16} color={tc.tint} strokeWidth={1.75} />
                                 <Text style={[styles.filtersButtonText, { color: tc.tint }]}>
-                                    {tFallback(t, 'filters.title', 'Filters')} · {selections.activeCount}
+                                    {menu.filtersLabel} · {selections.activeCount}
                                 </Text>
                             </Pressable>
                         ) : null}
@@ -756,7 +789,7 @@ export default function ArchivedScreen() {
                             actions={[
                                 {
                                     id: 'filters',
-                                    label: tFallback(t, 'filters.title', 'Filters'),
+                                    label: menu.filtersLabel,
                                     icon: (color) => <SlidersHorizontal size={19} color={color} strokeWidth={2} />,
                                     onPress: () => setFiltersVisible(true),
                                     selected: selections.hasActive,
@@ -764,45 +797,42 @@ export default function ArchivedScreen() {
                                 },
                                 {
                                     id: 'sort',
-                                    label: tFallback(t, 'sort.label', 'Sort'),
-                                    accessibilityLabel: `${tFallback(t, 'sort.label', 'Sort')}: ${t(`sort.${sortBy}`)}`,
+                                    label: menu.sort.label,
+                                    accessibilityLabel: `${menu.sort.label}: ${menu.sort.value}`,
                                     icon: (color) => <ArrowUpDown size={19} color={color} strokeWidth={2} />,
-                                    value: t(`sort.${sortBy}`),
+                                    value: menu.sort.value,
                                     testID: 'archived-sort-action',
                                     submenu: {
-                                        title: tFallback(t, 'sort.label', 'Sort'),
-                                        actions: archivedSortOptions.map((option) => ({
-                                            id: `sort:${option}`,
-                                            label: t(`sort.${option}`),
-                                            accessibilityLabel: `${tFallback(t, 'sort.label', 'Sort')}: ${t(`sort.${option}`)}`,
+                                        title: menu.sort.label,
+                                        actions: menu.sort.options.map((option) => ({
+                                            id: `sort:${option.id}`,
+                                            label: option.label,
+                                            accessibilityLabel: `${menu.sort.label}: ${option.label}`,
                                             icon: (color) => <ArrowUpDown size={18} color={color} strokeWidth={2} />,
-                                            onPress: () => updateViewState({ sortBy: option }),
-                                            selected: sortBy === option,
-                                            testID: `archived-sort-${option}`,
+                                            onPress: () => updateViewState({ sortBy: option.id }),
+                                            selected: option.selected,
+                                            testID: `archived-sort-${option.id}`,
                                         })),
                                     },
                                 },
                                 {
                                     id: 'group',
-                                    label: tFallback(t, 'list.groupBy', 'Group'),
-                                    accessibilityLabel: `${tFallback(t, 'list.groupBy', 'Group')}: ${getTaskGroupByLabel(groupBy, t)}`,
+                                    label: menu.group.label,
+                                    accessibilityLabel: `${menu.group.label}: ${menu.group.value}`,
                                     icon: (color) => <Folder size={19} color={color} strokeWidth={2} />,
-                                    value: getTaskGroupByLabel(groupBy, t),
+                                    value: menu.group.value,
                                     testID: 'archived-group-action',
                                     submenu: {
-                                        title: tFallback(t, 'list.groupBy', 'Group'),
-                                        actions: ARCHIVED_LIST_GROUP_OPTIONS.map((option) => {
-                                            const label = getTaskGroupByLabel(option, t);
-                                            return {
-                                                id: `group:${option}`,
-                                                label,
-                                                accessibilityLabel: `${tFallback(t, 'list.groupBy', 'Group')}: ${label}`,
-                                                icon: (color: string) => <Folder size={18} color={color} strokeWidth={2} />,
-                                                onPress: () => updateViewState({ groupBy: option }),
-                                                selected: groupBy === option,
-                                                testID: `archived-group-${option}`,
-                                            };
-                                        }),
+                                        title: menu.group.label,
+                                        actions: menu.group.options.map((option) => ({
+                                            id: `group:${option.id}`,
+                                            label: option.label,
+                                            accessibilityLabel: `${menu.group.label}: ${option.label}`,
+                                            icon: (color: string) => <Folder size={18} color={color} strokeWidth={2} />,
+                                            onPress: () => updateViewState({ groupBy: option.id }),
+                                            selected: option.selected,
+                                            testID: `archived-group-${option.id}`,
+                                        })),
                                     },
                                 },
                             ]}
@@ -814,10 +844,10 @@ export default function ArchivedScreen() {
                         />
                     </View>
                 )}
-                {segment === 'tasks' && archivedTasks.length > 0 && (
+                {segment === 'tasks' && summary !== null && (
                     <View style={styles.summaryRow}>
                         <Text style={[styles.summaryText, { color: tc.secondaryText }]}>
-                            {archivedTasks.length} {tFallback(t, 'common.tasks', 'tasks')}
+                            {summary}
                         </Text>
                         <Pressable
                             onPress={selectionMode ? exitSelectionMode : () => setSelectionMode(true)}
@@ -831,10 +861,10 @@ export default function ArchivedScreen() {
                         </Pressable>
                     </View>
                 )}
-                {segment === 'projects' && archivedProjects.length > 0 && (
+                {segment === 'projects' && summary !== null && (
                     <View style={styles.summaryRow}>
                         <Text style={[styles.summaryText, { color: tc.secondaryText }]}>
-                            {archivedProjects.length} {tFallback(t, 'projects.title', 'projects')}
+                            {summary}
                         </Text>
                     </View>
                 )}
@@ -899,10 +929,10 @@ export default function ArchivedScreen() {
                             <View style={styles.emptyState}>
                                 <Archive size={48} color={tc.secondaryText} strokeWidth={1.5} style={styles.emptyIcon} />
                                 <Text style={[styles.emptyTitle, { color: tc.text }]}>
-                                    {tFallback(t, 'archived.emptyProjects', 'No archived projects')}
+                                    {emptyState.title}
                                 </Text>
                                 <Text style={[styles.emptyText, { color: tc.secondaryText }]}>
-                                    {tFallback(t, 'archived.emptyProjectsHint', 'Projects you archive will appear here')}
+                                    {emptyState.message}
                                 </Text>
                             </View>
                         }
@@ -924,24 +954,20 @@ export default function ArchivedScreen() {
                         <View style={styles.emptyState}>
                             <Archive size={48} color={tc.secondaryText} strokeWidth={1.5} style={styles.emptyIcon} />
                             <Text style={[styles.emptyTitle, { color: tc.text }]}>
-                                {selections.hasActive
-                                    ? tFallback(t, 'filters.noMatch', 'No tasks match these filters.')
-                                    : (tFallback(t, 'archived.empty', 'No archived tasks'))}
+                                {emptyState.title}
                             </Text>
                             <Text style={[styles.emptyText, { color: tc.secondaryText }]}>
-                                {selections.hasActive
-                                    ? selections.chips.slice(0, 3).map((chip) => chip.label).join(', ')
-                                    : (tFallback(t, 'archived.emptyHint', 'Tasks you archive will appear here'))}
+                                {emptyState.message}
                             </Text>
-                            {selections.hasActive ? (
+                            {emptyState.clearLabel ? (
                                 <Pressable
                                     onPress={selections.clear}
                                     accessibilityRole="button"
-                                    accessibilityLabel={tFallback(t, 'filters.clear', 'Clear')}
+                                    accessibilityLabel={emptyState.clearLabel}
                                     style={[styles.selectButton, { borderColor: tc.border, backgroundColor: tc.cardBg }]}
                                 >
                                     <Text style={[styles.selectButtonText, { color: tc.text }]}>
-                                        {tFallback(t, 'filters.clear', 'Clear')}
+                                        {emptyState.clearLabel}
                                     </Text>
                                 </Pressable>
                             ) : null}

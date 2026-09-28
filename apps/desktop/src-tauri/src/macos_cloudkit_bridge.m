@@ -72,23 +72,30 @@ static char *ck_copy_json(id object) {
 // rather than guess one. A partial failure carries the real reason, including
 // that interval, on its per-item errors instead of the top-level one, so look
 // there too. Read whenever CloudKit supplies the key, not for one error code.
-static NSNumber *ck_retry_after_seconds(NSError *error) {
-    if (!error) return nil;
+static NSNumber *ck_retry_after_seconds_at_depth(NSError *error, NSUInteger depth) {
+    if (!error || depth >= 8) return nil;
     id retryAfter = [error userInfo][CKErrorRetryAfterKey];
-    if ([retryAfter isKindOfClass:[NSNumber class]]) return (NSNumber *)retryAfter;
+    NSNumber *longest = [retryAfter isKindOfClass:[NSNumber class]] ? (NSNumber *)retryAfter : nil;
+    id underlying = [error userInfo][NSUnderlyingErrorKey];
+    if ([underlying isKindOfClass:[NSError class]]) {
+        NSNumber *nested = ck_retry_after_seconds_at_depth((NSError *)underlying, depth + 1);
+        if (nested && (!longest || nested.doubleValue > longest.doubleValue)) longest = nested;
+    }
     id partial = [error userInfo][CKPartialErrorsByItemIDKey];
     if ([partial isKindOfClass:[NSDictionary class]]) {
-        NSNumber *longest = nil;
         for (id value in [(NSDictionary *)partial allValues]) {
             if (![value isKindOfClass:[NSError class]]) continue;
-            NSNumber *nested = ck_retry_after_seconds((NSError *)value);
+            NSNumber *nested = ck_retry_after_seconds_at_depth((NSError *)value, depth + 1);
             if (nested && (!longest || [nested doubleValue] > [longest doubleValue])) {
                 longest = nested;
             }
         }
-        return longest;
     }
-    return nil;
+    return longest;
+}
+
+static NSNumber *ck_retry_after_seconds(NSError *error) {
+    return ck_retry_after_seconds_at_depth(error, 0);
 }
 
 static char *ck_error_json(NSError *error) {
@@ -309,6 +316,26 @@ static void ck_get_field_specs(NSString *recordType,
 // MARK: - Record mapping (JSON ↔ CKRecord)
 // ---------------------------------------------------------------------------
 
+static void ck_set_field(CKRecord *record, NSString *key, id value) {
+    id current = record[key];
+    if ((!current && !value) || [current isEqual:value]) return;
+    record[key] = value;
+}
+
+static void ck_set_json_field(CKRecord *record, NSString *key, NSString *value) {
+    NSString *old = record[key];
+    if ([old isKindOfClass:[NSString class]] && ![old isEqualToString:value]) {
+        id oldJSON = [NSJSONSerialization JSONObjectWithData:[old dataUsingEncoding:NSUTF8StringEncoding]
+                                                    options:0 error:nil];
+        id newJSON = [NSJSONSerialization JSONObjectWithData:[value dataUsingEncoding:NSUTF8StringEncoding]
+                                                    options:0 error:nil];
+        NSData *oldCanonical = oldJSON ? [NSJSONSerialization dataWithJSONObject:oldJSON options:NSJSONWritingSortedKeys error:nil] : nil;
+        NSData *newCanonical = newJSON ? [NSJSONSerialization dataWithJSONObject:newJSON options:NSJSONWritingSortedKeys error:nil] : nil;
+        if (oldCanonical && [oldCanonical isEqualToData:newCanonical]) return;
+    }
+    ck_set_field(record, key, value);
+}
+
 static void ck_apply_fields(NSDictionary *json, CKRecord *record, NSString *recordType) {
     const MWFieldSpec *specs; size_t count;
     ck_get_field_specs(recordType, &specs, &count);
@@ -319,31 +346,31 @@ static void ck_apply_fields(NSDictionary *json, CKRecord *record, NSString *reco
         id value = json[jsKey];
 
         if (!value || [value isKindOfClass:[NSNull class]]) {
-            record[ckKey] = nil;
+            ck_set_field(record, ckKey, nil);
             continue;
         }
         switch (specs[i].kind) {
             case MWFieldKindString:
             case MWFieldKindDate:
-                if ([value isKindOfClass:[NSString class]]) record[ckKey] = value;
+                if ([value isKindOfClass:[NSString class]]) ck_set_field(record, ckKey, value);
                 break;
             case MWFieldKindInt:
-                if ([value isKindOfClass:[NSNumber class]]) record[ckKey] = @([value longLongValue]);
+                if ([value isKindOfClass:[NSNumber class]]) ck_set_field(record, ckKey, @([value longLongValue]));
                 break;
             case MWFieldKindBool:
-                if ([value isKindOfClass:[NSNumber class]]) record[ckKey] = @([value boolValue] ? 1LL : 0LL);
+                if ([value isKindOfClass:[NSNumber class]]) ck_set_field(record, ckKey, @([value boolValue] ? 1LL : 0LL));
                 break;
             case MWFieldKindStringArray:
-                if ([value isKindOfClass:[NSArray class]]) record[ckKey] = value;
+                if ([value isKindOfClass:[NSArray class]]) ck_set_field(record, ckKey, value);
                 break;
             case MWFieldKindJsonString:
                 if ([value isKindOfClass:[NSString class]]) {
-                    record[ckKey] = value;
+                    ck_set_json_field(record, ckKey, value);
                 } else if ([NSJSONSerialization isValidJSONObject:value]) {
-                    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+                    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingSortedKeys error:nil];
                     if (data) {
                         NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                        if (str) record[ckKey] = str;
+                        if (str) ck_set_json_field(record, ckKey, str);
                     }
                 }
                 break;
@@ -606,7 +633,10 @@ char *mindwtr_cloudkit_fetch_all_records(const char *record_type_cstr) {
             [_ckPrivateDB addOperation:op];
 
             long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kTimeoutSec * NSEC_PER_SEC));
-            if (waited != 0) return ck_copy_json(@{@"error": @"fetch-timeout"});
+            if (waited != 0) {
+                [op cancel];
+                return ck_copy_json(@{@"error": @"fetch-timeout"});
+            }
             if (batchError) {
                 // Record type not yet created in CloudKit schema — treat as empty.
                 // The type is auto-created on first save in the Development environment.
@@ -704,7 +734,10 @@ char *mindwtr_cloudkit_fetch_changes(const char *change_token_base64_cstr) {
         [_ckPrivateDB addOperation:op];
         long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kTimeoutSec * NSEC_PER_SEC));
 
-        if (waited != 0) return ck_copy_json(@{@"error": @"timeout"});
+        if (waited != 0) {
+            [op cancel];
+            return ck_copy_json(@{@"error": @"timeout"});
+        }
         if (tokenExpired) return ck_copy_json(@{@"tokenExpired": @YES, @"records": @{}, @"deletedIDs": @{}});
         if (zoneError) return ck_error_json(zoneError);
 
@@ -761,12 +794,24 @@ ck_fetch_records_by_id(NSArray<CKRecordID *> *ids, NSError **outError) {
     long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kTimeoutSec * NSEC_PER_SEC));
 
     if (waited != 0) {
+        [op cancel];
         if (outError) *outError = [NSError errorWithDomain:CKErrorDomain code:CKErrorNetworkFailure
                                                   userInfo:@{NSLocalizedDescriptionKey: @"fetch-by-id-timeout"}];
         return nil;
     }
     if (perRecordErrors.count > 0) {
-        if (outError) *outError = perRecordErrors.firstObject;
+        if (outError) {
+            NSError *primary = perRecordErrors.firstObject;
+            NSMutableDictionary *details = [primary.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+            for (NSError *candidate in perRecordErrors) {
+                NSNumber *delay = ck_retry_after_seconds(candidate);
+                NSNumber *longest = details[CKErrorRetryAfterKey];
+                if (delay && (!longest || delay.doubleValue > longest.doubleValue)) {
+                    details[CKErrorRetryAfterKey] = delay;
+                }
+            }
+            *outError = [NSError errorWithDomain:primary.domain code:primary.code userInfo:details];
+        }
         return nil;
     }
     return results;
@@ -868,7 +913,7 @@ char *mindwtr_cloudkit_save_attachment_asset(const char *record_name_cstr,
         NSError *fetchError = nil;
         NSDictionary *fetched = ck_fetch_records_by_id(@[recordID], &fetchError);
         if (!fetched && fetchError) {
-            return ck_copy_json(@{@"error": fetchError.localizedDescription ?: @"fetch-existing-attachment-failed"});
+            return ck_error_json(fetchError);
         }
         CKRecord *record = fetched[recordID] ?: [[CKRecord alloc] initWithRecordType:kMindwtrAttachmentRecordType recordID:recordID];
         ck_apply_attachment_metadata(metadata, record);
@@ -899,7 +944,7 @@ char *mindwtr_cloudkit_fetch_attachment_asset(const char *record_name_cstr,
                     @"errorCode": kAttachmentNotFoundErrorCode
                 });
             }
-            return ck_copy_json(@{@"error": fetchError.localizedDescription ?: @"fetch-attachment-failed"});
+            return ck_error_json(fetchError);
         }
         CKRecord *record = fetched[recordID];
         if (!record) {
@@ -974,7 +1019,7 @@ char *mindwtr_cloudkit_save_records(const char *record_type_cstr, const char *re
             NSError *fetchError = nil;
             NSDictionary *fetched = ck_fetch_records_by_id(batch, &fetchError);
             if (!fetched) {
-                return ck_copy_json(@{@"error": fetchError.localizedDescription ?: @"fetch-existing-failed"});
+                return ck_error_json(fetchError);
             }
             [existingByID addEntriesFromDictionary:fetched];
         }
@@ -989,7 +1034,9 @@ char *mindwtr_cloudkit_save_records(const char *record_type_cstr, const char *re
             CKRecord *existing = existingByID[recordID];
             if (existing) {
                 ck_apply_fields(json, existing, recordType);
-                [recordsToSave addObject:existing];
+                if (existing.changedKeys.count > 0) {
+                    [recordsToSave addObject:existing];
+                }
             } else {
                 CKRecord *newRecord = [[CKRecord alloc] initWithRecordType:recordType recordID:recordID];
                 ck_apply_fields(json, newRecord, recordType);
@@ -1042,7 +1089,10 @@ char *mindwtr_cloudkit_save_records(const char *record_type_cstr, const char *re
 
             [_ckPrivateDB addOperation:saveOp];
             long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kTimeoutSec * NSEC_PER_SEC));
-            if (waited != 0) return ck_copy_json(@{@"error": @"save-timeout"});
+            if (waited != 0) {
+                [saveOp cancel];
+                return ck_copy_json(@{@"error": @"save-timeout"});
+            }
 
             [conflictIDs addObjectsFromArray:batchConflicts];
             [nonConflictErrors addObjectsFromArray:batchErrors];
@@ -1050,7 +1100,21 @@ char *mindwtr_cloudkit_save_records(const char *record_type_cstr, const char *re
 
         if (nonConflictErrors.count > 0) {
             NSMutableDictionary *result = [NSMutableDictionary dictionary];
-            result[@"error"] = [[nonConflictErrors firstObject] localizedDescription] ?: @"save-failed";
+            NSError *primary = nonConflictErrors.firstObject;
+            NSNumber *retryAfter = nil;
+            for (NSError *candidate in nonConflictErrors) {
+                NSNumber *candidateDelay = ck_retry_after_seconds(candidate);
+                if (candidateDelay && (!retryAfter || candidateDelay.doubleValue > retryAfter.doubleValue)) {
+                    retryAfter = candidateDelay;
+                }
+                if (primary.code == CKErrorBatchRequestFailed && candidate.code != CKErrorBatchRequestFailed) {
+                    primary = candidate;
+                }
+            }
+            NSString *message = primary.localizedDescription ?: @"save-failed";
+            result[@"error"] = retryAfter
+                ? [NSString stringWithFormat:@"%@ [retryAfter=%@]", message, retryAfter]
+                : message;
             result[@"errorCount"] = @(nonConflictErrors.count);
             result[@"conflictIDs"] = conflictIDs;
             return ck_copy_json(result);

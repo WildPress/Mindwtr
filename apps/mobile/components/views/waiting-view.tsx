@@ -1,7 +1,5 @@
 import { View, Text, ScrollView, StyleSheet, TouchableOpacity, Platform } from 'react-native';
-import { getWaitingPerson, shallow, tFallback, useTaskStore,
-    baseTextCollator,
-} from '@mindwtr/core';
+import { buildWaitingViewModel, shallow, tFallback, useTaskStore } from '@mindwtr/core';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Task, TaskStatus } from '@mindwtr/core';
 import { useTheme } from '../../contexts/theme-context';
@@ -10,15 +8,16 @@ import { PauseCircle } from 'lucide-react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { useToast } from '@/contexts/toast-context';
 import { useThemeColors } from '@/hooks/use-theme-colors';
 import { useVisibleTaskContext } from '@/hooks/use-visible-tasks';
-import { compareWaitingTasks } from '@/lib/list-order';
 import { openContextsScreen, openProjectScreen } from '@/lib/task-meta-navigation';
 import { TaskEditModal } from '../task-edit-modal';
 import { getBulkMoveStatusOptions } from '../task-list/TaskListBulkBar';
 import { useTaskListSelection } from '../use-task-list-selection';
+import { settleStoreAction } from '../store-action-result';
 import { TaskListView } from '../task-list-view';
-import { DeferredProjectsSection, selectDeferredProjects } from './deferred-projects-section';
+import { DeferredProjectsSection } from './deferred-projects-section';
 
 export function WaitingView() {
   const { tasks, projects, updateTask, updateProject, deleteTask, restoreTask, batchMoveTasks, batchDeleteTasks, batchUpdateTasks, highlightTaskId, setHighlightTask } = useTaskStore((state) => ({
@@ -36,10 +35,10 @@ export function WaitingView() {
   }), shallow);
   const { isDark } = useTheme();
   const { t } = useLanguage();
+  const { showToast } = useToast();
   const [editingTask, setEditingTask] = useState<Task | null>(null);
   const [selectedWaitingPerson, setSelectedWaitingPerson] = useState('');
   const router = useRouter();
-  const restoreActionLabel = tFallback(t, 'trash.restoreToInbox', 'Restore');
 
   const tc = useThemeColors();
   const insets = useSafeAreaInsets();
@@ -56,50 +55,25 @@ export function WaitingView() {
     [navBarInset],
   );
 
-  const waitingTasks = useMemo(() => {
-    return visibleTasks
-      .filter((task) => task.status === 'waiting')
-      .sort(compareWaitingTasks);
-  }, [visibleTasks]);
-  const waitingPeople = useMemo(() => {
-    const people = new Map<string, string>();
-    for (const task of waitingTasks) {
-      const person = getWaitingPerson(task);
-      if (!person) continue;
-      const key = person.toLowerCase();
-      if (!people.has(key)) people.set(key, person);
-    }
-    return [...people.values()].sort((a, b) => baseTextCollator.compare(a, b));
-  }, [waitingTasks]);
-  const filteredWaitingTasks = useMemo(() => {
-    return waitingTasks.filter((task) => {
-      if (selectedWaitingPerson) {
-        const person = getWaitingPerson(task);
-        if (!person || person.toLowerCase() !== selectedWaitingPerson.toLowerCase()) {
-          return false;
-        }
-      }
-      return true;
-    });
-  }, [selectedWaitingPerson, waitingTasks]);
-  const deferredProjects = useMemo(
-    () => selectDeferredProjects(projects, 'waiting', resolvedAreaFilter, areaById),
-    [projects, resolvedAreaFilter, areaById],
-  );
+  // Rows, people, counts and parked projects come from core, shared with the native host.
+  const model = useMemo(() => buildWaitingViewModel({
+    tasks: visibleTasks,
+    projects,
+    resolvedAreaFilter,
+    areaById,
+    person: selectedWaitingPerson,
+    t,
+  }), [areaById, projects, resolvedAreaFilter, selectedWaitingPerson, t, visibleTasks]);
+  const { deferredProjects, labels, people: waitingPeople, tasks: filteredWaitingTasks } = model;
 
   useEffect(() => {
-    if (!selectedWaitingPerson) return;
-    const selected = selectedWaitingPerson.toLowerCase();
-    if (!waitingPeople.some((person) => person.toLowerCase() === selected)) {
-      setSelectedWaitingPerson('');
-    }
-  }, [selectedWaitingPerson, waitingPeople]);
+    if (!model.personOffered) setSelectedWaitingPerson('');
+  }, [model.personOffered]);
 
   const selection = useTaskListSelection({
     batchDeleteTasks,
     batchMoveTasks,
     batchUpdateTasks,
-    restoreActionLabel,
     restoreTask,
     t,
     tasksById,
@@ -110,7 +84,15 @@ export function WaitingView() {
     return updateTask(task.id, { status });
   };
   const handleActivateProject = (projectId: string) => {
-    updateProject(projectId, { status: 'active' });
+    void settleStoreAction(() => updateProject(projectId, { status: 'active' })).then((outcome) => {
+      if (outcome.ok) return;
+      showToast({
+        title: tFallback(t, 'common.error', 'Error'),
+        message: outcome.message || tFallback(t, 'projects.reactivateFailed', 'Failed to reactivate project'),
+        tone: 'error',
+        durationMs: 4200,
+      });
+    });
   };
   const handleOpenProject = (projectId: string) => {
     router.push({ pathname: '/projects-screen', params: { projectId } });
@@ -140,35 +122,33 @@ export function WaitingView() {
     <View style={[styles.container, { backgroundColor: tc.bg }]}>
       <View style={[styles.stats, { backgroundColor: tc.cardBg, borderBottomColor: tc.border }]}>
         <View style={styles.statItem}>
-          <Text style={styles.statValue}>{filteredWaitingTasks.length}</Text>
-          <Text style={styles.statLabel}>{t('waiting.count')}</Text>
+          <Text style={styles.statValue}>{model.count}</Text>
+          <Text style={[styles.statLabel, { color: tc.secondaryText }]}>{labels.count}</Text>
         </View>
         <View style={styles.statItem}>
-          <Text style={styles.statValue}>
-            {filteredWaitingTasks.filter((task) => task.dueDate).length}
-          </Text>
-          <Text style={styles.statLabel}>{t('waiting.withDeadline')}</Text>
+          <Text style={styles.statValue}>{model.withDeadlineCount}</Text>
+          <Text style={[styles.statLabel, { color: tc.secondaryText }]}>{labels.withDeadline}</Text>
         </View>
       </View>
 
       <View style={[styles.filterSection, { backgroundColor: tc.cardBg, borderBottomColor: tc.border }]}>
         <Text style={[styles.filterLabel, { color: tc.secondaryText }]}>
-          {t('process.delegateWhoLabel')}
+          {labels.filter}
         </Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterChips}>
           <TouchableOpacity
             onPress={() => setSelectedWaitingPerson('')}
             style={[
               styles.filterChip,
-              { borderColor: tc.border, backgroundColor: !selectedWaitingPerson ? tc.tint : tc.filterBg },
+              { borderColor: tc.border, backgroundColor: !model.person ? tc.tint : tc.filterBg },
             ]}
           >
-            <Text style={[styles.filterChipText, { color: !selectedWaitingPerson ? tc.onTint : tc.text }]}>
-              {t('common.all')}
+            <Text style={[styles.filterChipText, { color: !model.person ? tc.onTint : tc.text }]}>
+              {labels.all}
             </Text>
           </TouchableOpacity>
           {waitingPeople.map((person) => {
-            const isActive = selectedWaitingPerson.toLowerCase() === person.toLowerCase();
+            const isActive = model.person.toLowerCase() === person.toLowerCase();
             return (
               <TouchableOpacity
                 key={person}
@@ -185,12 +165,12 @@ export function WaitingView() {
             );
           })}
         </ScrollView>
-        {selectedWaitingPerson && (
+        {model.person && (
           <TouchableOpacity
             onPress={() => setSelectedWaitingPerson('')}
             style={[styles.clearFilterButton, { borderColor: tc.border, backgroundColor: tc.filterBg }]}
           >
-            <Text style={[styles.clearFilterText, { color: tc.text }]}>{t('common.clear')}</Text>
+            <Text style={[styles.clearFilterText, { color: tc.text }]}>{labels.clear}</Text>
           </TouchableOpacity>
         )}
       </View>
@@ -220,9 +200,9 @@ export function WaitingView() {
         ListEmptyComponent={deferredProjects.length === 0 ? (
           <View style={styles.emptyState}>
             <PauseCircle size={48} color={tc.secondaryText} strokeWidth={1.5} style={styles.emptyIcon} />
-            <Text style={[styles.emptyTitle, { color: tc.text }]}>{t('waiting.empty')}</Text>
+            <Text style={[styles.emptyTitle, { color: tc.text }]}>{labels.emptyTitle}</Text>
             <Text style={[styles.emptyText, { color: tc.secondaryText }]}>
-              {t('waiting.emptyHint')}
+              {labels.emptyHint}
             </Text>
           </View>
         ) : null}
@@ -301,7 +281,6 @@ const styles = StyleSheet.create({
   },
   statLabel: {
     fontSize: 12,
-    color: '#6B7280',
     marginTop: 4,
   },
   taskListContent: {

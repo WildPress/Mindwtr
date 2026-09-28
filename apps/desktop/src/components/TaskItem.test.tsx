@@ -860,6 +860,74 @@ describe('TaskItem', () => {
         });
     });
 
+    // #1255: %Person was the one title token nothing claimed, so an accepted suggestion was typed
+    // into the title as "%Stefan" and Assigned To stayed empty.
+    it('applies an accepted %person suggestion to Assigned To without keeping the token in the title', async () => {
+        const editableTask: Task = {
+            ...mockTask,
+            id: 'editor-title-person-task',
+            title: 'Call',
+            status: 'next',
+        };
+        const personSourceTask: Task = {
+            ...mockTask,
+            id: 'editor-title-person-source',
+            title: 'Person source',
+            assignedTo: 'Stefan',
+        };
+        act(() => {
+            useTaskStore.setState((state) => ({
+                ...state,
+                tasks: [editableTask, personSourceTask],
+                _allTasks: [editableTask, personSourceTask],
+                _tasksById: new Map([
+                    [editableTask.id, editableTask],
+                    [personSourceTask.id, personSourceTask],
+                ]),
+                projects: [],
+                _allProjects: [],
+                _projectsById: new Map(),
+                sections: [],
+                _allSections: [],
+                _sectionsById: new Map(),
+                areas: [],
+                _allAreas: [],
+                _areasById: new Map(),
+            }));
+        });
+
+        const { findByRole, getAllByRole, getByDisplayValue, getByRole } = render(
+            <LanguageProvider>
+                <TaskItem task={editableTask} />
+            </LanguageProvider>
+        );
+
+        await act(async () => {
+            fireEvent.click(getAllByRole('button', { name: /edit/i })[0]);
+        });
+        const titleInput = getByDisplayValue('Call') as HTMLInputElement;
+        fireEvent.change(titleInput, { target: { value: 'Call %St today' } });
+        titleInput.setSelectionRange('Call %St'.length, 'Call %St'.length);
+        fireEvent.click(titleInput);
+
+        expect(await findByRole('option', { name: /Stefan/ })).toBeInTheDocument();
+        await act(async () => {
+            fireEvent.keyDown(titleInput, { key: 'Enter' });
+        });
+
+        await waitFor(() => expect(titleInput.value).toBe('Call today'));
+
+        await act(async () => {
+            fireEvent.click(getByRole('button', { name: 'Save' }));
+        });
+
+        await waitFor(() => {
+            const updatedTask = useTaskStore.getState()._allTasks.find((task) => task.id === 'editor-title-person-task');
+            expect(updatedTask?.title).toBe('Call today');
+            expect(updatedTask?.assignedTo).toBe('Stefan');
+        });
+    });
+
     it('applies accepted slash date commands as metadata without keeping the command in the title', async () => {
         const editableTask: Task = {
             ...mockTask,
@@ -1168,6 +1236,16 @@ describe('TaskItem', () => {
         );
         fireEvent.doubleClick(getByRole('button', { name: /toggle task details/i }));
         expect(getByDisplayValue('Test Task')).toBeInTheDocument();
+    });
+
+    it('does not edit when double-clicking a nested row action', () => {
+        const { getByRole, queryByDisplayValue } = render(
+            <LanguageProvider>
+                <TaskItem task={mockTask} enableDoubleClickEdit />
+            </LanguageProvider>
+        );
+        fireEvent.doubleClick(getByRole('button', { name: /more options/i }));
+        expect(queryByDisplayValue('Test Task')).not.toBeInTheDocument();
     });
 
     it('opens a single editor when the same task renders in multiple rows (Focus grouped by tags)', async () => {
@@ -1867,14 +1945,13 @@ describe('TaskItem', () => {
     });
 
     it('includes archived in the task status selector', () => {
-        const { getByLabelText } = render(
+        const { getByLabelText, getByRole } = render(
             <LanguageProvider>
                 <TaskItem task={mockTask} />
             </LanguageProvider>
         );
-        const statusSelect = getByLabelText(/task status/i) as HTMLSelectElement;
-        const archivedOption = Array.from(statusSelect.options).find((option) => option.value === 'archived');
-        expect(archivedOption).toBeTruthy();
+        fireEvent.click(getByLabelText(/task status/i));
+        expect(getByRole('option', { name: 'Archived' })).toBeInTheDocument();
     });
 
     it('prompts for assigned to when changing status to waiting', async () => {
@@ -1899,11 +1976,12 @@ describe('TaskItem', () => {
             </LanguageProvider>
         );
 
-        const statusSelect = getByLabelText(/task status/i) as HTMLSelectElement;
+        const statusSelect = getByLabelText(/task status/i) as HTMLButtonElement;
         statusSelect.focus();
         expect(statusSelect).toHaveFocus();
 
-        fireEvent.change(statusSelect, { target: { value: 'waiting' } });
+        fireEvent.click(statusSelect);
+        fireEvent.click(getByRole('option', { name: 'Waiting' }));
 
         expect(getByText('Who/what are you waiting for?')).toBeInTheDocument();
         expect(statusSelect).not.toHaveFocus();
@@ -1951,7 +2029,8 @@ describe('TaskItem', () => {
                 <TaskItem task={guardedTask} project={activeProject} />
             </LanguageProvider>
         );
-        fireEvent.change(view.getByLabelText(/task status/i), { target: { value: 'waiting' } });
+        fireEvent.click(view.getByLabelText(/task status/i));
+        fireEvent.click(view.getByRole('option', { name: 'Waiting' }));
         fireEvent.change(view.getByPlaceholderText('Who is this waiting for?'), { target: { value: 'Alex' } });
         const staleSave = view.getByRole('button', { name: 'Save' });
         const archivedProject = { ...activeProject, status: 'archived' as const };
@@ -2017,7 +2096,8 @@ describe('TaskItem', () => {
                 <TaskItem task={guardedTask} project={activeProject} />
             </LanguageProvider>
         );
-        fireEvent.change(view.getByLabelText(/task status/i), { target: { value: 'waiting' } });
+        fireEvent.click(view.getByLabelText(/task status/i));
+        fireEvent.click(view.getByRole('option', { name: 'Waiting' }));
         fireEvent.change(view.getByPlaceholderText('Who is this waiting for?'), { target: { value: 'Alex' } });
         fireEvent.click(view.getByRole('button', { name: 'Save' }));
         expect(moveTask).toHaveBeenCalledWith(guardedTask.id, 'waiting');

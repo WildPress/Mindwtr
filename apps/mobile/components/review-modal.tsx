@@ -1,10 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, FlatList, Modal, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { formatI18nTemplate, safeFormatDate, safeParseDate, type Task } from '@mindwtr/core';
+import {
+    WEEKLY_REVIEW_PREVIEW,
+    formatI18nTemplate,
+    getReviewSuggestionActionLabel,
+    getWeeklyReviewCalendar,
+    getWeeklyReviewCalendarNotice,
+    getWeeklyReviewContextMoreLabel,
+    safeFormatDate,
+    type Task,
+    type WeeklyReviewCalendarDay,
+} from '@mindwtr/core';
 import {
     Brain,
     Calendar as CalendarIcon,
+    Check,
     CheckCircle2,
     ChevronDown,
     ChevronRight,
@@ -30,12 +41,7 @@ import { TaskEditModal } from './task-edit-modal';
 import { InboxProcessingModal } from './inbox-processing-modal';
 import { MindSweepModalContent } from './mind-sweep-modal-content';
 import { ErrorBoundary } from './ErrorBoundary';
-import {
-    type CalendarTaskReviewEntry,
-    type ContextReviewGroup,
-    type ExternalCalendarDaySummary,
-    useReviewModalController,
-} from './review/useReviewModalController';
+import { type ContextReviewGroup, useReviewModalController } from './review/useReviewModalController';
 import { styles } from './review-modal.styles';
 import { SandboxWorkspaceCue } from './sandbox-workspace-cue';
 import { ShareCardModal } from './share-card-modal';
@@ -68,6 +74,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         canGoBack,
         closeEditModal,
         closeProjectTaskPrompt,
+        completion,
         contextReviewGroups,
         currentStep,
         editModalTab,
@@ -75,7 +82,6 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         expandedContextGroups,
         expandedExternalDays,
         expandedProject,
-        estimatedLookBackDuration,
         externalCalendarError,
         externalCalendarLoading,
         externalCalendarReviewItems,
@@ -99,20 +105,14 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         projectReviewEntries,
         projectTaskPrompt,
         projectTaskTitle,
-        reviewLookBack,
-        reviewSummary,
         runAiAnalysis,
         staleProjectItems,
         staleTasks,
         safeStepIndex,
-        scheduledSomedayTasks,
-        scheduledWaitingTasks,
         setProjectTaskTitle,
         showEditModal,
-        showEstimateLookBack,
-        showTrackedLookBack,
-        somedayTasks,
-        staleItemTitleMap,
+        somedayList,
+        stepRail,
         steps,
         submitProjectTask,
         tc,
@@ -120,10 +120,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         toggleExpandedProject,
         toggleExternalDayExpanded,
         toggleSuggestion,
-        trackedLookBackDuration,
-        visibleSomedayTasks,
-        visibleWaitingTasks,
-        waitingTasks,
+        waitingList,
     } = useReviewModalController({ visible, onClose });
     const closeLabel = t('common.close');
     const closeText = closeLabel && closeLabel !== 'common.close' ? closeLabel : 'Close';
@@ -151,6 +148,9 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
             setShowShareCard(false);
         }
     }, [showInboxProcessing, showMindSweep, showShareCard, visible]);
+
+    // Formatted each render: the app's date settings can change while the review is open.
+    const calendarView = getWeeklyReviewCalendar(externalCalendarReviewItems, calendarReviewItems, labels, safeFormatDate);
 
     const renderSummaryRow = (good: boolean, text: string) => (
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
@@ -193,10 +193,9 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
             style={[styles.stepRail, { borderBottomColor: tc.border }]}
             contentContainerStyle={styles.stepRailContent}
         >
-            {steps.map((step, index) => {
-                const skipped = !step.hasWork && step.id !== 'completed';
-                const complete = skipped || index < safeStepIndex;
-                const current = step.id === currentStep;
+            {stepRail.map((step) => {
+                const complete = step.state === 'complete';
+                const current = step.state === 'current';
                 return (
                     <View
                         key={step.id}
@@ -227,7 +226,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                             {complete ? (
                                 <CheckCircle2 size={12} color={tc.text} strokeWidth={2.8} />
                             ) : (
-                                <Text style={[styles.stepRailBadgeText, { color: current ? tc.onTint : tc.text }]}>{index + 1}</Text>
+                                <Text style={[styles.stepRailBadgeText, { color: current ? tc.onTint : tc.text }]}>{step.number}</Text>
                             )}
                         </View>
                         <CompactText
@@ -278,7 +277,8 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         />
     );
 
-    const renderScheduledGroup = (scheduled: Task[], expanded: boolean, onToggle: () => void) => {
+    const renderScheduledGroup = (list: { scheduled: Task[]; scheduledLabel: string }, expanded: boolean, onToggle: () => void) => {
+        const { scheduled, scheduledLabel } = list;
         if (scheduled.length === 0) return null;
         const Chevron = expanded ? ChevronDown : ChevronRight;
         return (
@@ -287,11 +287,11 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                     style={styles.scheduledToggle}
                     onPress={onToggle}
                     accessibilityRole="button"
-                    accessibilityLabel={`${labels.notDueYet} (${scheduled.length})`}
+                    accessibilityLabel={scheduledLabel}
                 >
                     <Chevron size={14} color={tc.secondaryText} strokeWidth={2.2} />
                     <Text style={[styles.scheduledToggleText, { color: tc.secondaryText }]}>
-                        {labels.notDueYet} ({scheduled.length})
+                        {scheduledLabel}
                     </Text>
                 </AppPressable>
                 {expanded && scheduled.map((task) => (
@@ -307,51 +307,47 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         );
     };
 
-    const renderExternalCalendarList = (days: ExternalCalendarDaySummary[]) => {
+    const renderExternalCalendarList = (days: WeeklyReviewCalendarDay[]) => {
+        const notice = getWeeklyReviewCalendarNotice(
+            { loading: externalCalendarLoading, error: externalCalendarError, dayCount: days.length },
+            labels,
+        );
         if (externalCalendarLoading) {
             return (
                 <View style={styles.loadingRow}>
                     <ActivityIndicator size="small" color={tc.tint} />
-                    <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{labels.loading}</Text>
+                    <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{notice}</Text>
                 </View>
             );
         }
-        if (externalCalendarError) {
-            return <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{externalCalendarError}</Text>;
-        }
-        if (days.length === 0) {
-            return <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{labels.calendarEmpty}</Text>;
+        if (notice !== null) {
+            return <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{notice}</Text>;
         }
         return (
             <View style={styles.calendarEventList}>
                 {days.map((day) => {
-                    const dayKey = day.dayStart.toISOString();
-                    const isExpanded = expandedExternalDays.has(dayKey);
-                    const visibleEvents = isExpanded ? day.events : day.events.slice(0, 2);
+                    const isExpanded = expandedExternalDays.has(day.key);
+                    const visibleEvents = isExpanded ? day.events : day.events.slice(0, WEEKLY_REVIEW_PREVIEW.dayEvents);
 
                     return (
-                        <View key={dayKey} style={[styles.calendarDayCard, { borderColor: tc.border }]}>
+                        <View key={day.key} style={[styles.calendarDayCard, { borderColor: tc.border }]}>
                             <Text style={[styles.calendarDayTitle, { color: tc.secondaryText }]}>
-                                {safeFormatDate(day.dayStart, 'EEEE, PP')} · {day.totalCount}
+                                {day.title}
                             </Text>
-                            {visibleEvents.map((event) => {
-                                const start = safeParseDate(event.start);
-                                const timeLabel = event.allDay || !start ? labels.allDay : safeFormatDate(start, 'p');
-                                return (
-                                    <View key={`${event.sourceId}-${event.id}-${event.start}`} style={styles.calendarEventRow}>
-                                        <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>
-                                            {timeLabel}
-                                        </Text>
-                                        <Text style={[styles.calendarEventTitle, { color: tc.text }]} numberOfLines={1}>
-                                            {event.title}
-                                        </Text>
-                                    </View>
-                                );
-                            })}
-                            {day.totalCount > 2 && (
-                                <TouchableOpacity onPress={() => toggleExternalDayExpanded(dayKey)}>
+                            {visibleEvents.map((event) => (
+                                <View key={event.key} style={styles.calendarEventRow}>
+                                    <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>
+                                        {event.timeLabel}
+                                    </Text>
+                                    <Text style={[styles.calendarEventTitle, { color: tc.text }]} numberOfLines={1}>
+                                        {event.title}
+                                    </Text>
+                                </View>
+                            ))}
+                            {day.moreLabel && (
+                                <TouchableOpacity onPress={() => toggleExternalDayExpanded(day.key)}>
                                     <Text style={[styles.calendarEventMeta, styles.calendarToggleText, { color: tc.secondaryText }]}>
-                                        {isExpanded ? labels.less : `+${day.totalCount - visibleEvents.length} ${labels.more}`}
+                                        {isExpanded ? labels.less : day.moreLabel}
                                     </Text>
                                 </TouchableOpacity>
                             )}
@@ -362,22 +358,19 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
         );
     };
 
-    const renderCalendarTaskList = (items: CalendarTaskReviewEntry[]) => {
+    const renderCalendarTaskList = (items: { key: string; title: string; meta: string }[]) => {
         if (items.length === 0) {
             return <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>{labels.calendarTasksEmpty}</Text>;
         }
         return (
             <View style={styles.calendarEventList}>
-                {items.slice(0, 12).map((entry) => (
-                    <View
-                        key={`${entry.kind}-${entry.task.id}-${entry.date.toISOString()}`}
-                        style={[styles.calendarDayCard, { borderColor: tc.border }]}
-                    >
+                {items.map((entry) => (
+                    <View key={entry.key} style={[styles.calendarDayCard, { borderColor: tc.border }]}>
                         <Text style={[styles.calendarEventTitle, { color: tc.text }]} numberOfLines={1}>
-                            {entry.task.title}
+                            {entry.title}
                         </Text>
                         <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>
-                            {(entry.kind === 'due' ? labels.dueLabel : labels.startLabel)} · {safeFormatDate(entry.date, 'Pp')}
+                            {entry.meta}
                         </Text>
                     </View>
                 ))}
@@ -401,7 +394,8 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                 renderItem={({ item: group }) => {
                     const contextKey = group.context;
                     const isExpanded = expandedContextGroups.has(contextKey);
-                    const visibleTasks = isExpanded ? group.tasks : group.tasks.slice(0, 4);
+                    const visibleTasks = isExpanded ? group.tasks : group.tasks.slice(0, WEEKLY_REVIEW_PREVIEW.contextTasks);
+                    const moreLabel = getWeeklyReviewContextMoreLabel(group.tasks.length, labels);
                     return (
                         <View style={[styles.contextGroupCard, { borderColor: tc.border, backgroundColor: tc.cardBg }]}>
                             <View style={styles.contextGroupHeader}>
@@ -419,10 +413,10 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                                     </Text>
                                 </TouchableOpacity>
                             ))}
-                            {group.tasks.length > 4 && (
+                            {moreLabel && (
                                 <TouchableOpacity onPress={() => toggleContextGroupExpanded(contextKey)}>
                                     <Text style={[styles.contextMoreText, { color: tc.secondaryText }]}>
-                                        {isExpanded ? labels.less : `+${group.tasks.length - visibleTasks.length} ${labels.more}`}
+                                        {isExpanded ? labels.less : moreLabel}
                                     </Text>
                                 </TouchableOpacity>
                             )}
@@ -520,7 +514,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                                         {item.title}
                                     </Text>
                                     <Text style={[styles.calendarEventMeta, { color: tc.secondaryText }]}>
-                                        {formatI18nTemplate(labels.staleDaysInactive, { days: item.daysStale })}
+                                        {item.daysLabel}
                                     </Text>
                                 </View>
                             ))}
@@ -556,13 +550,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
 
                                     {aiSuggestions.map((suggestion) => {
                                     const actionable = isActionableSuggestion(suggestion);
-                                    const label = suggestion.action === 'someday'
-                                        ? labels.aiActionSomeday
-                                        : suggestion.action === 'archive'
-                                            ? labels.aiActionArchive
-                                            : suggestion.action === 'breakdown'
-                                                ? labels.aiActionBreakdown
-                                                : labels.aiActionKeep;
+                                    const label = getReviewSuggestionActionLabel(suggestion.action, labels);
                                     return (
                                         <TouchableOpacity
                                             key={suggestion.id}
@@ -579,11 +567,11 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                                                     },
                                                 ]}
                                             >
-                                                {aiSelectedIds.has(suggestion.id) && <Text style={[styles.aiCheckboxText, { color: tc.onTint }]}>✓</Text>}
+                                                {aiSelectedIds.has(suggestion.id) && <Check size={12} color={tc.onTint} strokeWidth={3} />}
                                             </View>
                                             <View style={{ flex: 1 }}>
                                                 <Text style={[styles.aiItemTitle, { color: tc.text }]}>
-                                                    {staleItemTitleMap[suggestion.id] || suggestion.id}
+                                                    {suggestion.title}
                                                 </Text>
                                                 <Text style={[styles.aiItemMeta, { color: tc.secondaryText }]}>
                                                     {label} · {suggestion.reason}
@@ -633,11 +621,11 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                         </Text>
                         <View style={[styles.calendarColumn, { backgroundColor: tc.cardBg, borderColor: tc.border }]}>
                             <Text style={[styles.calendarColumnTitle, { color: tc.secondaryText }]}>{labels.calendarUpcoming}</Text>
-                            {renderExternalCalendarList(externalCalendarReviewItems)}
+                            {renderExternalCalendarList(calendarView.days)}
                         </View>
                         <View style={[styles.calendarColumn, { backgroundColor: tc.cardBg, borderColor: tc.border, marginTop: 12 }]}>
                             <Text style={[styles.calendarColumnTitle, { color: tc.secondaryText }]}>{labels.calendarTasks}</Text>
-                            {renderCalendarTaskList(calendarReviewItems)}
+                            {renderCalendarTaskList(calendarView.tasks)}
                         </View>
                     </ScrollView>
                 );
@@ -654,7 +642,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                         <Text style={[styles.hint, { color: tc.secondaryText }]}>
                             {labels.waitingGuide}
                         </Text>
-                        {waitingTasks.length === 0 ? (
+                        {waitingList.total === 0 ? (
                             <View style={styles.emptyState}>
                                 <Text style={[styles.emptyText, { color: tc.secondaryText }]}>
                                     {labels.nothingWaiting}
@@ -662,9 +650,9 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                             </View>
                         ) : (
                             renderTaskList(
-                                visibleWaitingTasks,
+                                waitingList.visible,
                                 renderScheduledGroup(
-                                    scheduledWaitingTasks,
+                                    waitingList,
                                     showScheduledWaiting,
                                     () => setShowScheduledWaiting((prev) => !prev),
                                 ),
@@ -719,7 +707,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                                                 onPress={() => toggleExpandedProject(entry.project.id)}
                                             >
                                                 <View style={styles.projectHeader}>
-                                                    <View style={[styles.projectDot, { backgroundColor: entry.areaColor }]} />
+                                                    <View style={[styles.projectDot, { backgroundColor: entry.areaColor ?? tc.tint }]} />
                                                     <Text style={[styles.projectTitle, { color: tc.text }]}>{entry.project.title}</Text>
                                                     <TouchableOpacity
                                                         style={[styles.reviewProjectAddTaskButton, { borderColor: tc.border }]}
@@ -732,30 +720,15 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                                                             {labels.addTask}
                                                         </Text>
                                                     </TouchableOpacity>
-                                                    <View
-                                                        style={[styles.statusBadge, {
-                                                            backgroundColor: entry.nextActionState === 'next'
-                                                                ? '#10B98120'
-                                                                // Delegated (waiting) is amber, not the red alarm (#1086).
-                                                                : entry.nextActionState === 'waiting' ? '#F59E0B20' : '#EF444420',
-                                                        }]}
-                                                    >
-                                                        <Text
-                                                            style={[styles.statusText, {
-                                                                color: entry.nextActionState === 'next'
-                                                                    ? '#10B981'
-                                                                    : entry.nextActionState === 'waiting' ? '#F59E0B' : '#EF4444',
-                                                            }]}
-                                                        >
-                                                            {entry.nextActionState === 'next'
-                                                                ? labels.hasNext
-                                                                : entry.nextActionState === 'waiting' ? labels.waitingStatus : labels.needsAction}
+                                                    <View style={[styles.statusBadge, { backgroundColor: entry.badge.background }]}>
+                                                        <Text style={[styles.statusText, { color: entry.badge.color }]}>
+                                                            {entry.badge.label}
                                                         </Text>
                                                     </View>
                                                 </View>
                                                 <View style={styles.projectMeta}>
                                                     <Text style={[styles.taskCount, { color: tc.secondaryText }]}>
-                                                        {entry.tasks.length} {labels.activeTasks}
+                                                        {entry.countLabel}
                                                     </Text>
                                                     <Text style={[styles.expandIcon, { color: tc.secondaryText }]}>
                                                         {isExpanded ? '▾' : '▸'}
@@ -803,7 +776,7 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                         <Text style={[styles.hint, { color: tc.secondaryText }]}>
                             {labels.somedayGuide}
                         </Text>
-                        {somedayTasks.length === 0 ? (
+                        {somedayList.total === 0 ? (
                             <View style={styles.emptyState}>
                                 <Text style={[styles.emptyText, { color: tc.secondaryText }]}>
                                     {labels.listEmpty}
@@ -811,9 +784,9 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                             </View>
                         ) : (
                             renderTaskList(
-                                visibleSomedayTasks,
+                                somedayList.visible,
                                 renderScheduledGroup(
-                                    scheduledSomedayTasks,
+                                    somedayList,
                                     showScheduledSomeday,
                                     () => setShowScheduledSomeday((prev) => !prev),
                                 ),
@@ -838,53 +811,19 @@ export function ReviewModal({ visible, onClose }: ReviewModalProps) {
                             {labels.completeDesc}
                         </Text>
                         <View style={{ alignSelf: 'stretch', borderWidth: 1, borderColor: tc.border, borderRadius: 10, padding: 14, gap: 10, marginBottom: 16 }}>
-                            {reviewLookBack.completedCount > 0 && (
+                            {completion.week && (
                                 <View style={{ gap: 10, borderBottomWidth: 1, borderBottomColor: tc.border, paddingBottom: 10 }}>
                                     <Text style={{ color: tc.secondaryText, fontSize: 14, fontWeight: '600' }}>
-                                        {labels.weekHeading}
+                                        {completion.week.heading}
                                     </Text>
-                                    {renderSummaryRow(
-                                        true,
-                                        formatI18nTemplate(labels.weekCompletedCount, { count: reviewLookBack.completedCount }),
-                                    )}
-                                    {reviewLookBack.projectsMovedCount > 0 && renderSummaryRow(
-                                        true,
-                                        formatI18nTemplate(labels.weekProjectsMovedCount, { count: reviewLookBack.projectsMovedCount }),
-                                    )}
-                                    {showEstimateLookBack && (
-                                        <>
-                                            {renderSummaryRow(
-                                                true,
-                                                formatI18nTemplate(labels.weekEstimatedTasksCount, { count: reviewLookBack.estimatedTaskCount }),
-                                            )}
-                                            {estimatedLookBackDuration && renderSummaryRow(
-                                                true,
-                                                formatI18nTemplate(labels.weekEstimatedTotal, { duration: estimatedLookBackDuration }),
-                                            )}
-                                            {showTrackedLookBack && renderSummaryRow(
-                                                true,
-                                                formatI18nTemplate(labels.weekTrackedTotal, { duration: trackedLookBackDuration }),
-                                            )}
-                                        </>
-                                    )}
+                                    {completion.week.rows.map((row) => (
+                                        <React.Fragment key={row}>{renderSummaryRow(true, row)}</React.Fragment>
+                                    ))}
                                 </View>
                             )}
-                            {renderSummaryRow(
-                                reviewSummary.inboxCount === 0,
-                                reviewSummary.inboxCount === 0
-                                    ? labels.summaryInboxEmpty
-                                    : formatI18nTemplate(labels.summaryInboxCount, { count: reviewSummary.inboxCount }),
-                            )}
-                            {reviewSummary.activeProjectCount > 0 && renderSummaryRow(
-                                reviewSummary.projectsWithoutNextAction === 0,
-                                reviewSummary.projectsWithoutNextAction === 0
-                                    ? labels.summaryProjectsOk
-                                    : formatI18nTemplate(labels.summaryProjectsMissing, { count: reviewSummary.projectsWithoutNextAction }),
-                            )}
-                            {reviewSummary.staleWaitingCount > 0 && renderSummaryRow(
-                                false,
-                                formatI18nTemplate(labels.summaryWaitingStale, { count: reviewSummary.staleWaitingCount }),
-                            )}
+                            {completion.checks.map((check) => (
+                                <React.Fragment key={check.text}>{renderSummaryRow(check.good, check.text)}</React.Fragment>
+                            ))}
                         </View>
                         {renderMindSweepNudge()}
                     </ScrollView>

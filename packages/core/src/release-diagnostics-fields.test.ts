@@ -13,6 +13,8 @@ import { sanitizeLogContext } from './log-sanitize';
  * Update this list when the ledger's version section changes.
  */
 const RELEASE_CHECK_FIELD_NAMES = [
+    // automation concurrent-write replay; capture routing reuses outcome below.
+    'retryCount',
     // calendar-mirror-filter reuses releaseCheck, platform, stage, and count below.
     // calendar-date-color-diagnostics uses only aggregate counts; no dates, names, ids, or colors.
     'calendarCount', 'eventCount', 'allDayCount', 'timedCount',
@@ -46,8 +48,6 @@ const RELEASE_CHECK_FIELD_NAMES = [
     // share-card-export (local PNG export adapters)
     'cardKind', 'exportMethod', 'failureStage', 'errorType', 'nativeCode',
     // file-sync-attachment-failure reuses errorType/nativeCode and stage/backend/operation/releaseCheck below.
-    // linux-notification-delivery reuses releaseCheck/backend/outcome/errorType below.
-    // linux-notification-icon reuses releaseCheck/backend/outcome below.
     // android-system-bars reuses releaseCheck/backend/outcome below.
     // sandbox-workspace (desktop/mobile entry drain and immutable workspace bootstrap)
     'workspace', 'stage',
@@ -56,6 +56,8 @@ const RELEASE_CHECK_FIELD_NAMES = [
     // derived-token-timestamps reuses releaseCheck below.
     // sqlite-snapshot-append reuses releaseCheck and count below.
     // sqlite-snapshot-statements reuses releaseCheck and count below.
+    // sqlite-kept-omitted-live-rows: SQLite table name; reuses releaseCheck and count below.
+    'table',
     // ai-request-stop-once (desktop/mobile AI configuration adapters)
     'provider', 'timeoutMs',
     // sync-attachment-copy-elision reuses releaseCheck and count below.
@@ -83,6 +85,10 @@ const RELEASE_CHECK_FIELD_NAMES = [
     'batches',
     // attachment-only-task-replace (store-settings.ts) / section-conversion-canonical (store-tasks.ts)
     'count',
+    // someday-sections-keep-others reuses releaseCheck and count: stored entries this build cannot show, kept.
+    'hiddenCount',
+    // saved-filters-kept-as-stored reuses releaseCheck, count and hiddenCount: whose list order the merge kept.
+    'order',
     // android-http-connect-timeout (apps/mobile/hooks/root-layout/use-root-layout-startup.ts)
     'connectTimeoutMs',
     // fence-mutation-horizon (packages/core/src/sync-remote-fence.ts)
@@ -97,12 +103,19 @@ const RELEASE_CHECK_FIELD_NAMES = [
     'focusItems', 'todayItems', 'totalItems',
     // android-widget-lists (bounded GTD snapshots and Compact fallback, #1211)
     'nextItems', 'inboxItems', 'listKind', 'available',
-    // android-widget-list-budget (measured direct RemoteViews collection size, #1225)
+    // Android widget list budget (measured direct RemoteViews collection size)
     'collectionBytes',
     // Apple Watch capture, command and Focus/timer snapshot (#1175)
     'action', 'focusCount', 'timerPhase', 'timerRunning',
     // Cloud Focus creation and PATCH policy (apps/cloud/src/server.ts)
     'operation',
+    // cloudkit-retry-hint (desktop and mobile cloudkit-sync.ts)
+    'retryAfterMs',
+    // font-family-applied (apps/desktop/src/App.tsx, #1244) — the chosen font's name, and
+    // whether the renderer found a real bold face for it or is faking one.
+    'family', 'boldFace',
+    // native-android-legacy-json-import reuses releaseCheck, outcome, path, and reason above.
+    'rnState', 'backupTasks', 'sqliteTasks', 'mergedTasks', 'tasksFromBackup',
     // ios-share-capture (mobile incoming share host and capture form)
     'stage', 'type', 'providerReady', 'dataReady', 'disabled',
     'fileCount', 'candidateCount', 'attachedCount', 'skippedCount',

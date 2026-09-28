@@ -1,6 +1,7 @@
 import React from 'react';
 import {
     areDraftAttachmentsDirty,
+    clearInvalidTaskDraftSection,
     flushPendingSave,
     generateUUID,
     type Attachment,
@@ -8,6 +9,7 @@ import {
     type MarkdownSelection,
     type RecurrenceWeekday,
     type Task,
+    useTaskStore,
 } from '@mindwtr/core';
 import {
     setTaskDraftField,
@@ -148,6 +150,8 @@ export function useTaskEditState({
     const baseTaskRef = React.useRef<Task | null>(null);
     const attachmentDraftSettledRef = React.useRef(true);
     const saveAwaitingDurabilityRef = React.useRef(false);
+    const pendingCancellationPatchRef = React.useRef<Partial<Task> | null>(null);
+    const [cancelRetryPending, setCancelRetryPending] = React.useState(false);
     const setDraftField = React.useCallback<SetTaskEditDraftField>((field, value, markDirty = true) => {
         if (markDirty) isDirtyRef.current = true;
         setTaskEditDraftState((current) => {
@@ -393,21 +397,13 @@ export function useTaskEditState({
     const saveDraft = React.useCallback(async (mode: 'save' | 'cancel' = 'save'): Promise<boolean> => {
         const currentTask = baseTaskRef.current ?? liveTask;
         if (!currentTask || !taskEditDraft) return Promise.resolve(false);
+        if (mode === 'cancel') isDirtyRef.current = true;
         clearPendingTextChanges();
 
         let saveDraftState = taskEditDraft;
-        const nextProjectId = saveDraftState.draft.projectId;
-        const nextSectionId = saveDraftState.draft.sectionId;
-        if (nextProjectId && nextSectionId) {
-            const isValid = sections.some((section) =>
-                section.id === nextSectionId && section.projectId === nextProjectId && !section.deletedAt
-            );
-            if (!isValid) {
-                saveDraftState = {
-                    ...saveDraftState,
-                    draft: setTaskDraftField(saveDraftState.draft, 'sectionId', ''),
-                };
-            }
+        const validSectionDraft = clearInvalidTaskDraftSection(saveDraftState.draft, sections);
+        if (validSectionDraft !== saveDraftState.draft) {
+            saveDraftState = { ...saveDraftState, draft: validSectionDraft };
         }
 
         const pendingChecklistTitle = checklistDraftRef.current.trim();
@@ -442,6 +438,27 @@ export function useTaskEditState({
                 completedAt: undefined,
             };
         }
+        const pendingCancellation = pendingCancellationPatchRef.current;
+        if (pendingCancellation) {
+            if (mode === 'cancel' && updates) {
+                updates = { ...updates, cancelledAt: pendingCancellation.cancelledAt };
+            }
+            try {
+                await useTaskStore.getState().persistSnapshot();
+                await flushPendingSave();
+            } catch (error) {
+                onSaveError(getUnknownErrorMessage(error));
+                return false;
+            }
+            saveAwaitingDurabilityRef.current = false;
+            if (mode === 'cancel' && JSON.stringify(updates) === JSON.stringify(pendingCancellation)) {
+                updates = null;
+            }
+            if (mode !== 'cancel') {
+                pendingCancellationPatchRef.current = null;
+                setCancelRetryPending(false);
+            }
+        }
         const wasAwaitingDurability = saveAwaitingDurabilityRef.current;
         if (updates && Object.keys(updates).length > 0) {
             const attachmentSaveRequiresDurability = areDraftAttachmentsDirty(
@@ -456,6 +473,10 @@ export function useTaskEditState({
                 saveAwaitingDurabilityRef.current = wasAwaitingDurability;
                 return false;
             }
+            if (mode === 'cancel') {
+                pendingCancellationPatchRef.current = updates;
+                setCancelRetryPending(true);
+            }
         }
         if (saveAwaitingDurabilityRef.current) {
             try {
@@ -469,6 +490,8 @@ export function useTaskEditState({
             }
         }
         saveAwaitingDurabilityRef.current = false;
+        pendingCancellationPatchRef.current = null;
+        setCancelRetryPending(false);
         if (mode === 'cancel') {
             void logInfo('Mobile task cancellation draft saved', {
                 scope: 'task-edit',
@@ -553,7 +576,9 @@ export function useTaskEditState({
         };
         const applyReference = (saved: boolean) => {
             if (!saved) return false;
-            const nextBaseTask = { ...currentTask, ...referenceUpdate };
+            // The store also ends a relative start for Reference, and so does the draft
+            // below: clearing the dates clears the offset.
+            const nextBaseTask = { ...currentTask, ...referenceUpdate, relativeStartOffset: undefined };
             baseTaskRef.current = nextBaseTask;
             setTaskEditDraftState((current) => {
                 if (!current) return current;
@@ -596,6 +621,8 @@ export function useTaskEditState({
             settleCurrentAttachmentDraft(currentTask?.attachments);
             setTaskEditDraftState(null);
             baseTaskRef.current = null;
+            pendingCancellationPatchRef.current = null;
+            setCancelRetryPending(false);
             isDirtyRef.current = false;
             setShowDescriptionPreview(false);
             if (titleDebounceRef.current) {
@@ -625,6 +652,8 @@ export function useTaskEditState({
                     activityInputRef.current = null;
                     setRecoveredActivityInput(null);
                     settleCurrentAttachmentDraft(baseTaskRef.current?.attachments);
+                    pendingCancellationPatchRef.current = null;
+                    setCancelRetryPending(false);
                 }
                 setCustomWeekdays(byDay);
                 setTaskEditDraftState(createTaskEditDraft(liveTask));
@@ -655,6 +684,8 @@ export function useTaskEditState({
             setRecoveredActivityInput(null);
             setTaskEditDraftState(null);
             baseTaskRef.current = null;
+            pendingCancellationPatchRef.current = null;
+            setCancelRetryPending(false);
             isDirtyRef.current = false;
             setShowDescriptionPreview(false);
             if (titleDebounceRef.current) {
@@ -725,6 +756,7 @@ export function useTaskEditState({
         aiModal,
         acknowledgeRecoveredActivityInput,
         checklistDraftRef,
+        cancelRetryPending,
         contextInputDraft,
         customWeekdays,
         descriptionDebounceRef,

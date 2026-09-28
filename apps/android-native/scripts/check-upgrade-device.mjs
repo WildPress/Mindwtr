@@ -1,0 +1,748 @@
+// Upgrade check: a real RN v1.3.2 install, replaced in place by the native
+// upgradetest build, then by a newer RN recovery build.
+//
+//   node apps/android-native/scripts/build-upgrade-harness.mjs
+//   node apps/android-native/scripts/check-upgrade-device.mjs <adb-serial> [--only=1,4,2,4b,2b,3,3b,5,5b] [--keep]
+//
+// Scenarios, each from a fresh RN v1.3.2 install:
+//   1   happy upgrade: the native app shows the RN data, captures once, keeps
+//       every pre-upgrade row and every non-database file, and leaves a
+//       .prewrite checkpoint that holds the pre-upgrade rows;
+//   4   recovery (continues 1): the RN 154 build opens the database and keeps
+//       the native edit. While the recovery source is v1.3.2 a failure is
+//       reported as BLOCKED (RN startup snapshot bug) and does not fail the run;
+//   2   json-ahead import: RN's JSON backup holds a task SQLite never took and
+//       the json-ahead marker is set. The native app imports the task once,
+//       clears the marker after a byte checkpoint of RKStorage, changes nothing
+//       else, and imports nothing on a relaunch;
+//   4b  recovery after the import (continues 2): RN 154 shows the imported task
+//       once and, with its marker gone, imports nothing again;
+//   2b  json-ahead marker with a corrupt backup: the native app abandons it as
+//       RN would, clears the marker, and keeps SQLite as it was;
+//   3   damaged database, empty WAL: the native app changes no file;
+//   3b  damaged database with WAL frames: the native app changes no file;
+//   5   database missing, no JSON backup, other RN state present: the native app creates nothing;
+//   5b  database missing with RN's JSON backup: the native app migrates it; every persisted
+//       field of every entity and the settings equal core's plan for the backup.
+//
+// RN writes every seed row through its own code: queued captures in
+// files/pending-captures, which RN imports at launch (tasks, a +Project task,
+// a widget check-off), and one switch in RN Settings. Faults are injected on
+// the host and printed as INJECTED. The script touches only
+// tech.dongdongbh.mindwtr.upgradetest: it refuses any other APK, uninstalls
+// only that package (before each scenario and at the end; --keep leaves it
+// installed), installs with -g so no permission dialog can appear, and sends
+// input only while that package is in front. Exit 0 = pass, 1 = fail,
+// 2 = refused, 3 = stopped.
+import { execFileSync } from 'node:child_process';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
+import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { bootFailure, button, check, connect, draftText, evidenced, fail, field, hasText, Stopped, inboxCount } from './device.mjs';
+
+const SCENARIOS = ['1', '4', '2', '4b', '2b', '3', '3b', '5', '5b'];
+const USAGE = `usage: node check-upgrade-device.mjs <adb-serial> [--only=${SCENARIOS.join(',')}] [--keep]`;
+const args = process.argv.slice(2);
+const serials = args.filter((arg) => !arg.startsWith('--'));
+const onlyArg = args.find((arg) => arg.startsWith('--only='));
+const only = onlyArg?.slice('--only='.length).split(',');
+if (serials.length !== 1 || args.some((arg) => arg.startsWith('--') && arg !== '--keep' && arg !== onlyArg)
+    || (only && only.some((scenario) => !SCENARIOS.includes(scenario)))) {
+    console.error(USAGE);
+    process.exit(2);
+}
+const [serial] = serials;
+const want = (scenario) => !only || only.includes(scenario)
+    || (scenario === '1' && only.includes('4')) || (scenario === '2' && only.includes('4b'));
+const PKG = 'tech.dongdongbh.mindwtr.upgradetest';
+const V132 = 'ee82a9e3e9a1d4e0c406f5ffff80e768a1f1f812';
+const app = resolve(import.meta.dirname, '..');
+const harness = process.env.MINDWTR_HARNESS_DIR ?? '/home/dd/.mindwtr-harness';
+const aapt2 = process.env.AAPT2 ?? '/home/dd/Android/Sdk/build-tools/36.1.0/aapt2';
+let built;
+try {
+    built = JSON.parse(readFileSync(resolve(harness, 'apks/manifest.json'), 'utf8'));
+} catch {
+    console.error(`REFUSED: no ${harness}/apks/manifest.json; run build-upgrade-harness.mjs first`);
+    process.exit(2);
+}
+if (built.rnSource !== V132 || !built.recoverySource) {
+    console.error('REFUSED: apks/manifest.json predates the pinned sources; rerun build-upgrade-harness.mjs');
+    process.exit(2);
+}
+const APKS = { rn152: built.rn152.path, native153: built.native153.path, rn154: built.rn154.path };
+// install -r would upgrade whatever package the APK names: allow only the throwaway one.
+for (const apk of Object.values(APKS)) {
+    const apkPackage = execFileSync(aapt2, ['dump', 'packagename', apk], { encoding: 'utf8' }).trim();
+    if (apkPackage !== PKG) {
+        console.error(`REFUSED: ${apk} is package "${apkPackage}", not ${PKG}`);
+        process.exit(2);
+    }
+}
+
+// Expo prebuild derives the Java namespace from the harness package, so the
+// harness RN activity is not the store app's `tech.dongdongbh.mindwtr.MainActivity`.
+const RN_ACTIVITY = `${PKG}/${PKG}.MainActivity`;
+const NATIVE_ACTIVITY = `${PKG}/tech.dongdongbh.mindwtr.pilot.MainActivity`;
+const TAG = 'MindwtrNativeDev';
+const GUARD = 'releaseCheck=v1.3.3/native-android-legacy-json-ahead-guard';
+const IMPORT = 'v1.3.3/native-android-legacy-json-import';
+const MARKER = 'mindwtr-data:json-ahead-of-sqlite';
+const RECONCILED = 'mindwtr-data:sqlite-json-reconcile-v1';
+const JSON_BACKUP = 'mindwtr-data';
+const ASYNC_STORAGE = 'databases/RKStorage';
+// The native app's byte copy of RKStorage, taken once before its first RKStorage write.
+const RN_CHECKPOINT = 'files/SQLite/RKStorage.prewrite';
+const AUTO_CLEAN_LABEL = 'Clean up quick add text'; // RN v1.3.2 English label of settings.quickAddAutoClean
+const TMP = '/data/local/tmp/mindwtr-upgradetest';
+const DB = 'files/SQLite/mindwtr.db';
+const TABLES = ['tasks', 'projects', 'areas', 'people', 'sections', 'settings', 'saved_filters', 'schema_migrations', 'calendar_sync'];
+const TASK_SQL = 'SELECT id, title, status, projectId, deletedAt FROM tasks ORDER BY id';
+const work = resolve(app, 'android/build/upgrade-check');
+// Digits only for typed titles: some keyboards hold letters in a composition strip.
+const run = `${String(Date.now()).slice(-6)}${String(randomInt(1_000_000)).padStart(6, '0')}`;
+const titlesFor = (n) => ({
+    inbox: [1, 2, 3, 4].map((i) => `${n}${i}${run}`),
+    project: `${n}5${run}`, done: `${n}6${run}`, queued: `${n}7${run}`, native: `${n}8${run}`, backupOnly: `${n}9${run}`,
+    projectName: `Upgrade${n}${run}`,
+});
+
+const device = connect({ serial, pkg: PKG, uiFile: `${TMP}-ui.xml` });
+const { adbRaw, sh, home, front, requireAppFront, pid, screen, waitFor, tap, type, pull } = device;
+const runAs = (command) => sh(`run-as ${PKG} ${command}`);
+
+// ---- device ----
+const installed = () => sh(`pm list packages ${PKG}`).split('\n').some((line) => line.trim() === `package:${PKG}`);
+const install = (apk, replace) => {
+    console.log(`install ${replace ? '-r ' : ''}-g ${basename(apk)}`);
+    // -g grants every runtime permission, so the app never shows a permission dialog.
+    adbRaw('install', ...(replace ? ['-r'] : []), '-g', apk);
+};
+const fresh = () => {
+    if (installed()) sh(`pm uninstall ${PKG}`);
+    install(APKS.rn152, false);
+};
+const until = async (description, predicate, timeoutMs = 30_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        try { if (await predicate()) return; } catch { /* not ready yet */ }
+        await sleep(1000);
+    }
+    fail(`timed out waiting for ${description}`);
+};
+const stopApp = async () => {
+    sh(`am force-stop ${PKG}`);
+    await until('the app process to end', () => pid() === '', 10_000);
+};
+const openLink = (url) => {
+    const current = front();
+    if (!current.includes(`${PKG}/`) && !current.includes(`${home}/`)) {
+        throw new Stopped(`another app is in front; not opening a link over it: ${current.trim()}`);
+    }
+    sh(`am start -W -a android.intent.action.VIEW -d '${url}' ${PKG}`);
+};
+const pushPrivate = (local, remote) => {
+    const staged = `${TMP}-${basename(local)}`;
+    adbRaw('push', local, staged);
+    try { runAs(`cp ${staged} ${remote}`); } finally { sh(`rm -f ${staged}`); }
+};
+// RN's own capture queue: one JSON file per item, imported through RN's store at launch.
+const queue = (items) => {
+    runAs('mkdir -p files/pending-captures');
+    for (const item of items) {
+        const local = resolve(work, `${item.id}.json`);
+        writeFileSync(local, JSON.stringify(item));
+        pushPrivate(local, `files/pending-captures/${item.id}.json`);
+    }
+};
+const drained = (items, description) => until(`RN to import ${description}`, () => {
+    const present = runAs('ls files/pending-captures');
+    return items.every((item) => !present.includes(item.id));
+}, 90_000);
+// path -> sha256 of every file the app keeps outside cache/ and code_cache/. A find
+// error (an unreadable folder) exits non-zero, and adb then throws: never a silent gap.
+const snapshot = () => new Map(runAs(
+    `sh -c 'set --; for dir in files shared_prefs databases no_backup; do if [ -e "$dir" ]; then set -- "$@" "$dir"; fi; done; find "$@" -type f -exec sha256sum {} +'`,
+).split('\n').filter(Boolean).map((line) => {
+    const [hash, path] = line.split(/\s+/, 2);
+    return [path, hash];
+}));
+// androidx profileinstaller rewrites this marker after every package update, and Samsung's One UI framework counts launches
+// in the IDS file (`IDSCount`, S23 2026-09-27); neither holds user data.
+const PLATFORM_STATE = new Set(['files/profileInstalled', 'shared_prefs/android.app.ActivityThread.IDS.xml']);
+const differences = (before, after, { changedOk = () => false, newOk = () => false } = {}) => [
+    ...[...before].filter(([path, hash]) => !PLATFORM_STATE.has(path) && !changedOk(path) && after.get(path) !== hash)
+        .map(([path]) => `${after.has(path) ? 'changed' : 'removed'} ${path}`),
+    ...[...after.keys()].filter((path) => !before.has(path) && !PLATFORM_STATE.has(path) && !newOk(path)).map((path) => `new ${path}`),
+];
+const isDatabase = (path) => /^files\/SQLite\/mindwtr\.db(-wal|-shm)?$/.test(path);
+const isAsyncStorage = (path) => /^databases\/RKStorage(-wal|-shm|-journal)?$/.test(path);
+const isRnCheckpoint = (path) => path.startsWith(`${RN_CHECKPOINT}/`);
+
+// ---- database (host sqlite3 on pulled copies) ----
+const sql = (db, statement, json = true) => execFileSync('sqlite3', [...(json ? ['-json'] : []), db, statement], { encoding: 'utf8', maxBuffer: 256 << 20 }).trim();
+const rows = (db, statement) => { const text = sql(db, statement); return text ? JSON.parse(text) : []; };
+const pullDatabase = (name) => {
+    const dir = resolve(work, name);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    // .db, -wal and -shm together: committed rows can live only in -wal.
+    const present = runAs('ls files/SQLite').split(/\s+/);
+    for (const file of ['mindwtr.db', 'mindwtr.db-wal', 'mindwtr.db-shm']) {
+        if (present.includes(file)) pull(`files/SQLite/${file}`, resolve(dir, file));
+    }
+    return resolve(dir, 'mindwtr.db');
+};
+const counts = (db) => Object.fromEntries(TABLES.map((table) => [table, Number(sql(db, `SELECT COUNT(*) FROM ${table}`, false))]));
+const settingsOf = (db) => rows(db, "SELECT json_extract(data, '$.quickAddAutoClean') AS autoClean FROM settings WHERE id = 1")[0] ?? {};
+// Every column of every core table as an SQL literal (quote() keeps the type and the exact bytes).
+const tableRows = (db, table, names) => rows(db, `SELECT ${names.map((name) => `quote("${name}") AS "${name}"`).join(', ')} FROM "${table}"`);
+const allRows = (db) => Object.fromEntries(TABLES.map((table) => {
+    const columns = rows(db, `PRAGMA table_info("${table}")`);
+    const names = columns.map((column) => column.name);
+    const keys = columns.filter((column) => column.pk > 0).map((column) => column.name);
+    return [table, { names, keys: keys.length ? keys : names, rows: tableRows(db, table, names) }];
+}));
+const rowCount = (snapshotRows) => Object.values(snapshotRows).reduce((total, table) => total + table.rows.length, 0);
+// Names only (never values) of the top-level JSON keys that differ, for a changed JSON column.
+const changedKeys = (before, after) => {
+    try {
+        const parse = (literal) => JSON.parse(literal.slice(1, -1).replaceAll("''", "'"));
+        const [a, b] = [parse(before), parse(after)];
+        return ` (keys ${[...new Set([...Object.keys(a), ...Object.keys(b)])].filter((key) => !isDeepStrictEqual(a[key], b[key])).join(', ')})`;
+    } catch {
+        return '';
+    }
+};
+// Core's saveData writes an absent settings.savedFilters as []: the same value, so not a change.
+const sameCell = (table, name, before, after) => {
+    if (before === after) return true;
+    if (table !== 'settings' || name !== 'data') return false;
+    try {
+        const parse = (literal) => JSON.parse(literal.slice(1, -1).replaceAll("''", "'"));
+        const [a, b] = [parse(before), parse(after)];
+        for (const doc of [a, b]) if (Array.isArray(doc.savedFilters) && doc.savedFilters.length === 0) delete doc.savedFilters;
+        return isDeepStrictEqual(a, b);
+    } catch {
+        return false;
+    }
+};
+// Pre-upgrade rows that are gone, or differ in any pre-upgrade column. Only columns a later
+// schema added may differ, and they are not read. New rows are allowed.
+const rowChanges = (pre, db) => Object.entries(pre).flatMap(([table, { names, keys, rows: preRows }]) => {
+    const keyOf = (row) => keys.map((name) => row[name]).join('|');
+    const now = new Map(tableRows(db, table, names).map((row) => [keyOf(row), row]));
+    return preRows.flatMap((row) => {
+        const current = now.get(keyOf(row));
+        if (!current) return [`${table} ${keyOf(row)} missing`];
+        return names.filter((name) => !sameCell(table, name, row[name], current[name]))
+            .map((name) => `${table} ${keyOf(row)} ${name}${changedKeys(row[name], current[name])}`);
+    });
+});
+const readState = (db) => ({ counts: counts(db), rows: allRows(db), tasks: rows(db, TASK_SQL) });
+const shortList = (items) => (items.length ? `: ${items.slice(0, 10).join('; ')}${items.length > 10 ? ` (+${items.length - 10} more)` : ''}` : '');
+
+// ---- AsyncStorage (host sqlite3 on pulled copies of RKStorage; never opened on the phone) ----
+const pullAsyncStorage = (name) => {
+    const dir = resolve(work, name);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const present = runAs('ls databases').split(/\s+/);
+    for (const file of ['RKStorage', 'RKStorage-wal', 'RKStorage-journal']) {
+        if (present.includes(file)) pull(`databases/${file}`, resolve(dir, file));
+    }
+    return resolve(dir, 'RKStorage');
+};
+const asyncStorage = (name) => new Map(rows(pullAsyncStorage(name), 'SELECT key, value FROM catalystLocalStorage').map(({ key, value }) => [key, value]));
+// INJECTED: runs `statements` on a host copy of RKStorage, then pushes it back as one main file.
+const rewriteAsyncStorage = (name, statements) => {
+    const copy = pullAsyncStorage(name);
+    sql(copy, `${statements} PRAGMA wal_checkpoint(TRUNCATE);`, false);
+    pushPrivate(copy, ASYNC_STORAGE);
+    runAs(`rm -f ${ASYNC_STORAGE}-wal ${ASYNC_STORAGE}-shm ${ASYNC_STORAGE}-journal`);
+};
+// Names (never values) of the AsyncStorage rows that differ, other than the marker and a newly set reconcile flag.
+const asyncChanges = (before, after) => [...new Set([...before.keys(), ...after.keys()])].filter((name) => name !== MARKER
+    && before.get(name) !== after.get(name) && !(name === RECONCILED && !before.has(name) && after.get(name) === '1'));
+// The RKStorage checkpoint must hold exactly the pre-import RKStorage files, byte for byte.
+const checkpointMatches = (before, after) => ['', '-wal', '-journal', '-shm'].every((suffix) =>
+    before.get(`${ASYNC_STORAGE}${suffix}`) === after.get(`${RN_CHECKPOINT}/RKStorage${suffix}`))
+    && [...after.keys()].filter(isRnCheckpoint).every((path) => before.has(`databases/${path.slice(RN_CHECKPOINT.length + 1)}`));
+// Loads a pulled database through core's own SqliteAdapter (Bun runs core's TypeScript) and compares it,
+// every persisted field of every entity plus the settings, with core's plan for the RN backup: the
+// same row writers and normalizations the native host confirms with. Prints the first mismatching table or "match".
+const coreSrc = resolve(app, '../../packages/core/src');
+const importMismatch = (db, state, backupFile) => execFileSync('bun', ['-e', `
+    import { Database } from 'bun:sqlite';
+    import { readFileSync } from 'node:fs';
+    import { SqliteAdapter } from '${coreSrc}/sqlite-adapter.ts';
+    import { legacyImportMismatch, planLegacyJsonImport } from '${coreSrc}/legacy-json-import.ts';
+    const db = new Database(process.env.CHECK_DB);
+    const client = {
+        run: async (sql, params = []) => { db.query(sql).run(...params); },
+        all: async (sql, params = []) => db.query(sql).all(...params),
+        get: async (sql, params = []) => db.query(sql).get(...params) ?? undefined,
+        exec: async (sql) => { db.exec(sql); },
+    };
+    const saved = await new SqliteAdapter(client).getData();
+    const empty = { tasks: [], projects: [], sections: [], areas: [], people: [], settings: {} };
+    const state = { ...JSON.parse(process.env.CHECK_STATE), backupJson: readFileSync(process.env.CHECK_BACKUP, 'utf8') };
+    const plan = planLegacyJsonImport(state, empty, false);
+    // Core's startup after the import adds its own settings: the daily tombstone cleanup stamps
+    // migrations, load migrations add versioned defaults (gtd.focusGroupByDefaultsVersion), and a
+    // missing deviceId is generated (RN's migrate keeps only synced settings). So every PLANNED
+    // setting must survive with its value; keys core adds later are allowed.
+    const kept = (planned, stored) => (planned && typeof planned === 'object' && !Array.isArray(planned)
+        ? Boolean(stored) && typeof stored === 'object' && Object.keys(planned).every((key) => kept(planned[key], stored[key]))
+        : JSON.stringify(planned) === JSON.stringify(stored));
+    if (plan.merged) {
+        delete saved.settings.migrations;
+        delete plan.merged.settings.migrations;
+        if (kept(plan.merged.settings, saved.settings)) saved.settings = plan.merged.settings;
+    }
+    console.log(plan.merged ? legacyImportMismatch(plan.merged, saved) ?? 'match' : 'no-plan');
+`], { encoding: 'utf8', env: { ...process.env, CHECK_DB: db, CHECK_STATE: JSON.stringify(state), CHECK_BACKUP: backupFile } }).trim();
+const liveInbox = (tasks) => tasks.filter((task) => task.status === 'inbox' && !task.deletedAt).map((task) => task.title).sort();
+
+// ---- UI ----
+// The Inbox count: the Process Inbox button's spoken count, or 0 for RN's empty Inbox (device.mjs inboxCount).
+const header = inboxCount;
+// A failed boot shows only its message (tagged `boot-failure`) and no command control.
+const unavailable = bootFailure;
+const nativeScreen = () => waitFor('the native screen', (nodes) => Number.isFinite(header(nodes)) || unavailable(nodes) !== undefined, 60_000);
+const autoCleanSwitch = (nodes) => nodes.find((node) => node.class === 'android.widget.Switch' && node['content-desc'] === AUTO_CLEAN_LABEL);
+const nativeGuardLog = () => device.logs(pid(), TAG).split('\n').find((line) => line.includes(GUARD)) ?? '';
+// The JS host's log `extra` is a JSON string, so its quotes arrive escaped.
+const importLines = () => device.logs(pid(), TAG).replace(/\\/g, '').split('\n').filter((line) => line.includes(IMPORT));
+const importLine = (label, fields) => {
+    const lines = importLines();
+    check(lines.length === 1 && Object.entries(fields).every(([name, value]) => lines[0].includes(`"${name}":"${value}"`)),
+        `(${label}) one import line with ${JSON.stringify(fields)}: ${lines.map((line) => line.slice(line.indexOf('{'))).join(' | ')}`);
+};
+// Installs the native build over the prepared RN state and checks it fails closed.
+const expectBlocked = async (label, reason, message) => {
+    install(APKS.native153, true);
+    device.launch(NATIVE_ACTIVITY);
+    const nodes = await nativeScreen();
+    check((unavailable(nodes) ?? '').startsWith(message), `(${label}) native app shows: ${unavailable(nodes)}`);
+    check(nativeGuardLog().includes(`${GUARD} outcome=blocked reason=${reason}`), `(${label}) guard logged outcome=blocked reason=${reason}`);
+    check(!field(nodes) && !nodes.some((node) => node.package === PKG && node.clickable === 'true'), `(${label}) no capture field and no control is offered`);
+    await stopApp();
+};
+
+// ---- RN seeding ----
+const seed = async (n) => {
+    const t = titlesFor(n);
+    const now = () => new Date().toISOString();
+    const capture = (title) => ({ id: randomUUID(), title, createdAt: now(), source: 'android-quick-capture' });
+    const inbox = t.inbox.map(capture);
+    const inProject = capture(`${t.project} +${t.projectName}`); // quick-add syntax: RN creates the project
+    const toComplete = capture(t.done);
+    queue([...inbox, inProject, toComplete]);
+    device.launch(RN_ACTIVITY);
+    await drained([...inbox, inProject, toComplete], 'six queued captures');
+    await stopApp();
+    // A widget check-off, applied through RN's store on the next launch.
+    const checkoff = { id: randomUUID(), kind: 'complete', taskId: toComplete.id, completedAt: now(), source: 'android-widget' };
+    queue([checkoff]);
+    device.launch(RN_ACTIVITY);
+    await drained([checkoff], 'the widget check-off');
+    // One synced setting (GTD group), changed in RN's own Settings screen.
+    openLink('mindwtr-upgradetest://settings?settingsScreen=gtd-capture');
+    let nodes = await waitFor('RN Settings > Capture', (current) => Boolean(autoCleanSwitch(current)), 60_000);
+    check(autoCleanSwitch(nodes).checked === 'false', `(${n}) RN shows "${AUTO_CLEAN_LABEL}" off by default`);
+    await tap(autoCleanSwitch(nodes));
+    nodes = await waitFor('the switch to turn on', (current) => autoCleanSwitch(current)?.checked === 'true', 10_000);
+    requireAppFront();
+    sh('input keyevent KEYCODE_HOME');
+    await until('RN to save the setting', () => settingsOf(pullDatabase(`${n}-poll`)).autoClean === 1, 30_000);
+    await stopApp();
+
+    const db = pullDatabase(`${n}-seeded`);
+    const tasks = rows(db, TASK_SQL);
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    check(inbox.every((item) => byId.get(item.id)?.title === item.title && byId.get(item.id)?.status === 'inbox'),
+        `(${n}) RN imported ${inbox.length} Inbox tasks through its capture queue`);
+    const project = rows(db, `SELECT id FROM projects WHERE title = '${t.projectName}' AND deletedAt IS NULL`)[0];
+    check(Boolean(project) && byId.get(inProject.id)?.title === t.project && byId.get(inProject.id)?.projectId === project.id,
+        `(${n}) RN created project ${t.projectName} and filed a task in it`);
+    check(byId.get(toComplete.id)?.status === 'done', `(${n}) RN applied the widget check-off (status done)`);
+    check(settingsOf(db).autoClean === 1, `(${n}) RN saved quickAddAutoClean = true in the settings row`);
+    return t;
+};
+
+// INJECTED: every committed row moved into the main file, optionally new WAL frames that
+// touch only the settings row, then the tasks root page overwritten in the main file.
+const damageDatabase = (label, withWal) => {
+    const db = pullDatabase(`${label}-damaged`);
+    sql(db, 'PRAGMA wal_checkpoint(TRUNCATE);', false);
+    const pageSize = Number(sql(db, 'PRAGMA page_size', false));
+    const root = Number(sql(db, "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'tasks'", false));
+    if (withWal) {
+        // no_ckpt_on_close keeps the frames in -wal when sqlite3 exits.
+        execFileSync('sqlite3', [db, '.dbconfig no_ckpt_on_close on', 'PRAGMA wal_autocheckpoint = 0;',
+            "UPDATE settings SET data = json_set(data, '$.harnessWalProbe', 1) WHERE id = 1;"], { stdio: 'ignore' });
+        check(statSync(`${db}-wal`).size > 32, `INJECTED (${label}): -wal holds ${statSync(`${db}-wal`).size} bytes of frames for the settings row`);
+    }
+    const bytes = readFileSync(db);
+    bytes.fill(0xa5, (root - 1) * pageSize, root * pageSize);
+    writeFileSync(db, bytes);
+    const probe = resolve(work, `${label}-probe`);
+    rmSync(probe, { recursive: true, force: true });
+    mkdirSync(probe, { recursive: true });
+    copyFileSync(db, resolve(probe, 'mindwtr.db'));
+    if (withWal) copyFileSync(`${db}-wal`, resolve(probe, 'mindwtr.db-wal'));
+    let quickCheck; // sqlite3 prints the problems, then exits 1 on the damaged page
+    try { quickCheck = sql(resolve(probe, 'mindwtr.db'), 'PRAGMA quick_check', false); } catch (error) { quickCheck = String(error.stdout ?? error.message).trim(); }
+    check(quickCheck !== 'ok', `INJECTED (${label}): tasks root page ${root} overwritten; quick_check on a host copy says: ${quickCheck.split('\n')[1] ?? quickCheck}`);
+    pushPrivate(db, DB);
+    if (withWal) pushPrivate(`${db}-wal`, `${DB}-wal`);
+    runAs(withWal ? `rm -f ${DB}-shm` : `rm -f ${DB}-wal ${DB}-shm`);
+};
+
+// ---- scenarios ----
+const scenarioUpgrade = async () => {
+    console.log('\n# 1 happy upgrade');
+    fresh();
+    const t = await seed('1');
+    // RN is stopped and never runs again before the native app: this capture stays un-imported.
+    const queued = { id: randomUUID(), title: t.queued, createdAt: new Date().toISOString(), source: 'android-quick-capture' };
+    queue([queued]);
+    const queuedPath = `files/pending-captures/${queued.id}.json`;
+    const before = snapshot();
+    const pre = readState(pullDatabase('1-pre'));
+    const expected = pre.tasks.filter((task) => task.status === 'inbox' && !task.deletedAt).map((task) => task.title).sort();
+    console.log(`pre-upgrade rows: ${JSON.stringify(pre.counts)}; ${before.size} files hashed`);
+
+    install(APKS.native153, true);
+    device.launch(NATIVE_ACTIVITY);
+    let nodes = await nativeScreen();
+    check(!unavailable(nodes), `(1) native boot succeeded ${unavailable(nodes) ?? ''}`);
+    check(header(nodes) === expected.length, `(1) native Inbox counts ${expected.length} RN Inbox tasks`);
+    for (const title of expected) check(hasText(nodes, title), `(1) native Inbox shows RN task ${title}`);
+    check(!hasText(nodes, t.done), '(1) the completed RN task is not in the native Inbox');
+    check(nativeGuardLog().includes(`${GUARD} outcome=clear`), '(1) guard logged outcome=clear');
+    await type(t.native);
+    await tap(button(await screen(), 'Save'));
+    nodes = await waitFor('the native capture', (current) => header(current) === expected.length + 1 && draftText(current) === '');
+    check(hasText(nodes, t.native), '(1) native capture is listed');
+    await stopApp();
+
+    const after = snapshot();
+    const post = pullDatabase('1-post');
+    check(rows(post, TASK_SQL).filter((task) => task.title === t.native && !task.deletedAt).length === 1, '(1) native capture stored exactly once');
+    const changes = rowChanges(pre.rows, post);
+    check(changes.length === 0, `(1) all ${rowCount(pre.rows)} pre-upgrade rows of every core table, settings included, are unchanged in every pre-upgrade column${shortList(changes)}`);
+    const checkpoint = resolve(work, '1-post/mindwtr.db.prewrite');
+    check(runAs('ls files/SQLite').split(/\s+/).includes('mindwtr.db.prewrite'), '(1) .prewrite checkpoint exists beside the RN database');
+    pull(`${DB}.prewrite`, checkpoint);
+    check(isDeepStrictEqual(counts(checkpoint), pre.counts), '(1) .prewrite has the pre-upgrade row count of every core table');
+    const checkpointChanges = rowChanges(pre.rows, checkpoint);
+    check(checkpointChanges.length === 0, `(1) .prewrite holds every pre-upgrade row exactly${shortList(checkpointChanges)}`);
+    const changed = differences(before, after, { changedOk: isDatabase, newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` });
+    check(changed.length === 0, `(1) every non-database file is unchanged (${[...before.keys()].filter((path) => !isDatabase(path)).length} files)${shortList(changed)}`);
+    check(before.has(queuedPath) && after.get(queuedPath) === before.get(queuedPath), '(1) the un-imported pending capture is byte-identical');
+    return { t, pre, queued };
+};
+
+const scenarioRecovery = async ({ t, pre, queued }) => {
+    console.log('\n# 4 recovery: RN 154 over the native build');
+    install(APKS.rn154, true);
+    device.launch(RN_ACTIVITY);
+    openLink('mindwtr-upgradetest://inbox');
+    const nodes = await waitFor('the RN Inbox with the native task', (current) => hasText(current, t.native), 90_000);
+    for (const title of [t.native, ...t.inbox]) check(hasText(nodes, title), `(4) RN recovery Inbox shows ${title}`);
+    await drained([queued], 'the queued capture');
+    const rnPid = pid();
+    await stopApp();
+    const db = pullDatabase('4-post');
+    check(rows(db, TASK_SQL).filter((task) => task.title === t.native && !task.deletedAt).length === 1, '(4) the native-created task is present once');
+    check(rows(db, TASK_SQL).filter((task) => task.title === t.queued && !task.deletedAt).length === 1, '(4) RN imported the capture the native app left queued, once');
+    const changes = rowChanges(pre.rows, db);
+    check(changes.length === 0, `(4) every pre-upgrade row, settings included, is unchanged${shortList(changes)}`);
+    // Findings, not assertions: RN warnings or errors while it opened a database the native app wrote.
+    const log = resolve(work, '4-rn-logcat.txt');
+    writeFileSync(log, adbRaw('logcat', '-d', `--pid=${rnPid}`, '*:W').toString('utf8'));
+    const suspicious = readFileSync(log, 'utf8').split('\n').filter((line) => /sqlite|schema|migrat|merge|corrupt/i.test(line));
+    console.log(`RN recovery warnings mentioning sqlite/schema/migration/merge/corrupt: ${suspicious.length} (full log ${log})`);
+    for (const line of suspicious.slice(0, 20)) console.log(`  ${line}`);
+};
+
+// Seeds through RN, then INJECTS into RN's own JSON backup one task SQLite never took, and the
+// json-ahead marker: the state RN leaves after a save reached only its JSON backup (#964).
+const scenarioJsonAhead = async () => {
+    console.log('\n# 2 json-ahead import');
+    fresh();
+    const t = await seed('2');
+    const seeded = asyncStorage('2-seeded-rkstorage');
+    check(seeded.has(JSON_BACKUP), `(2) RN wrote its AsyncStorage ${JSON_BACKUP} backup`);
+    const backup = JSON.parse(seeded.get(JSON_BACKUP));
+    const source = backup.tasks.find((task) => task.status === 'inbox' && !task.deletedAt);
+    check(Boolean(source), '(2) the backup holds an RN Inbox task to model the injected task on');
+    const now = new Date().toISOString();
+    const description = `Imported ü 😀 ${run}`;
+    const extra = { ...source, id: randomUUID(), title: t.backupOnly, description, createdAt: now, updatedAt: now, rev: 1 };
+    backup.tasks.push(extra);
+    const backupFile = resolve(work, '2-backup.json');
+    writeFileSync(backupFile, JSON.stringify(backup));
+    rewriteAsyncStorage('2-rkstorage', `UPDATE catalystLocalStorage SET value = CAST(readfile('${backupFile}') AS TEXT) WHERE key = '${JSON_BACKUP}'; `
+        + `INSERT OR REPLACE INTO catalystLocalStorage (key, value) VALUES ('${MARKER}', '1');`);
+    console.log(`INJECTED (2): one Inbox task (rev 1, fresh timestamps, a non-ASCII description) in AsyncStorage ${JSON_BACKUP} that SQLite never took, and ${MARKER} = '1'`);
+    const before = snapshot();
+    const pre = readState(pullDatabase('2-pre'));
+    const preAsync = asyncStorage('2-pre-rkstorage');
+    check(pre.tasks.every((task) => task.id !== extra.id), '(2) SQLite does not hold the backup-only task before the upgrade');
+    const expected = [...liveInbox(pre.tasks), t.backupOnly].sort();
+
+    install(APKS.native153, true);
+    device.launch(NATIVE_ACTIVITY);
+    let nodes = await nativeScreen();
+    check(!unavailable(nodes), `(2) native boot succeeded ${unavailable(nodes) ?? ''}`);
+    check(header(nodes) === expected.length, `(2) native Inbox counts ${expected.length} tasks: the RN Inbox plus the imported one`);
+    check(hasText(nodes, t.backupOnly), '(2) native Inbox shows the task only the JSON backup held');
+    check(nativeGuardLog().includes(`${GUARD} outcome=clear`), '(2) guard logged outcome=clear');
+    importLine('2', { outcome: 'imported', path: 'json-ahead', rnState: 'updated' });
+    await stopApp();
+
+    const after = snapshot();
+    const postDb = pullDatabase('2-post');
+    const stored = rows(postDb, `SELECT title, description, rev, updatedAt FROM tasks WHERE id = '${extra.id}'`);
+    check(stored.length === 1 && stored[0].title === t.backupOnly, '(2) SQLite holds the imported task exactly once');
+    check(stored[0].description === description, '(2) the imported description is byte-exact (non-ASCII and an emoji)');
+    const changes = rowChanges(pre.rows, postDb);
+    check(changes.length === 0, `(2) all ${rowCount(pre.rows)} pre-import rows are unchanged in every pre-import column${shortList(changes)}`);
+    const postAsync = asyncStorage('2-post-rkstorage');
+    check(!postAsync.has(MARKER), '(2) the json-ahead marker is gone');
+    const asyncChanged = asyncChanges(preAsync, postAsync);
+    check(asyncChanged.length === 0, `(2) no other AsyncStorage row changed, ${JSON_BACKUP} included${shortList(asyncChanged)}`);
+    check(checkpointMatches(before, after), `(2) ${RN_CHECKPOINT} holds the pre-import RKStorage files byte for byte`);
+    const changed = differences(before, after, {
+        changedOk: (path) => isDatabase(path) || isAsyncStorage(path),
+        newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` || isAsyncStorage(path) || isRnCheckpoint(path),
+    });
+    check(changed.length === 0, `(2) every other file is unchanged${shortList(changed)}`);
+    pull(`${DB}.prewrite`, resolve(work, '2-post/mindwtr.db.prewrite'));
+    check(rowChanges(pre.rows, resolve(work, '2-post/mindwtr.db.prewrite')).length === 0, '(2) .prewrite holds every pre-import row');
+
+    // A relaunch must not import again: the marker is gone and the reconcile flag is set.
+    device.launch(NATIVE_ACTIVITY);
+    nodes = await nativeScreen();
+    check(!unavailable(nodes) && header(nodes) === expected.length && hasText(nodes, t.backupOnly), '(2) relaunch shows the same Inbox');
+    check(importLines().length === 0, '(2) relaunch logs no import line');
+    await stopApp();
+    const relaunch = snapshot();
+    const again = pullDatabase('2-relaunch');
+    const storedAgain = rows(again, `SELECT rev, updatedAt FROM tasks WHERE id = '${extra.id}'`);
+    check(storedAgain.length === 1 && storedAgain[0].rev === stored[0].rev && storedAgain[0].updatedAt === stored[0].updatedAt
+        && counts(again).tasks === counts(postDb).tasks, `(2) relaunch imported nothing: the task keeps rev ${stored[0].rev}, ${counts(postDb).tasks} task rows`);
+    check(relaunch.get(ASYNC_STORAGE) === after.get(ASYNC_STORAGE), '(2) relaunch left RKStorage unchanged');
+    return { t, id: extra.id, stored: stored[0], post: readState(again) };
+};
+
+// Continues 2: RN 154 over the native build that imported the backup.
+const scenarioRecoveryAfterImport = async ({ t, id, stored, post }) => {
+    console.log('\n# 4b recovery after the json-ahead import: RN 154 over the native build');
+    install(APKS.rn154, true);
+    device.launch(RN_ACTIVITY);
+    openLink('mindwtr-upgradetest://inbox');
+    const nodes = await waitFor('the RN Inbox with the imported task', (current) => hasText(current, t.backupOnly), 90_000);
+    check(nodes.filter((node) => node.text === t.backupOnly).length === 1, '(4b) RN recovery Inbox shows the imported task once');
+    await stopApp();
+    const db = pullDatabase('4b-post');
+    const row = rows(db, `SELECT rev, updatedAt FROM tasks WHERE id = '${id}'`);
+    check(row.length === 1 && row[0].rev === stored.rev && row[0].updatedAt === stored.updatedAt, '(4b) the imported task is stored once, unchanged');
+    check(!asyncStorage('4b-rkstorage').has(MARKER), '(4b) RKStorage has no json-ahead marker, so RN had nothing to recover again');
+    check(counts(db).tasks === post.counts.tasks, `(4b) RN added no task (${post.counts.tasks} task rows)`);
+    const changes = rowChanges(post.rows, db);
+    check(changes.length === 0, `(4b) every row the native app left is unchanged${shortList(changes)}`);
+};
+
+const scenarioCorruptBackup = async () => {
+    console.log('\n# 2b json-ahead marker with a corrupt backup');
+    fresh();
+    await seed('7'); // digit prefixes keep seed titles digits-only
+    rewriteAsyncStorage('2b-rkstorage', `UPDATE catalystLocalStorage SET value = '{"tasks": [' WHERE key = '${JSON_BACKUP}'; `
+        + `INSERT OR REPLACE INTO catalystLocalStorage (key, value) VALUES ('${MARKER}', '1');`);
+    console.log(`INJECTED (2b): AsyncStorage ${JSON_BACKUP} cut to text that does not parse, and ${MARKER} = '1'`);
+    const before = snapshot();
+    const pre = readState(pullDatabase('2b-pre'));
+    const preAsync = asyncStorage('2b-pre-rkstorage');
+
+    install(APKS.native153, true);
+    device.launch(NATIVE_ACTIVITY);
+    const nodes = await nativeScreen();
+    check(!unavailable(nodes), `(2b) native boot succeeded ${unavailable(nodes) ?? ''}`);
+    check(header(nodes) === liveInbox(pre.tasks).length, '(2b) native Inbox shows the RN Inbox as SQLite held it');
+    importLine('2b', { outcome: 'abandoned', path: 'json-ahead', reason: 'backup-corrupt', rnState: 'updated' });
+    await stopApp();
+
+    const after = snapshot();
+    const postDb = pullDatabase('2b-post');
+    const changes = rowChanges(pre.rows, postDb);
+    check(changes.length === 0, `(2b) every pre-upgrade row is unchanged${shortList(changes)}`);
+    const dataTables = TABLES.filter((table) => table !== 'schema_migrations');
+    const postCounts = counts(postDb);
+    check(dataTables.every((table) => postCounts[table] === pre.counts[table]), `(2b) SQLite gained no data row: ${JSON.stringify(postCounts)}`);
+    const postAsync = asyncStorage('2b-post-rkstorage');
+    check(!postAsync.has(MARKER), '(2b) the json-ahead marker is cleared');
+    const asyncChanged = asyncChanges(preAsync, postAsync);
+    check(asyncChanged.length === 0, `(2b) no other AsyncStorage row changed; the corrupt backup stays as RN left it${shortList(asyncChanged)}`);
+    check(checkpointMatches(before, after), `(2b) ${RN_CHECKPOINT} holds the pre-upgrade RKStorage files byte for byte`);
+    const changed = differences(before, after, {
+        changedOk: (path) => isDatabase(path) || isAsyncStorage(path),
+        newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` || isAsyncStorage(path) || isRnCheckpoint(path),
+    });
+    check(changed.length === 0, `(2b) every other file is unchanged${shortList(changed)}`);
+};
+
+const scenarioUnreadable = async (label, withWal) => {
+    console.log(`\n# ${label} damaged database, ${withWal ? 'WAL holds frames' : 'empty WAL'}`);
+    fresh();
+    await seed(withWal ? '6' : '3'); // digit prefixes keep seed titles digits-only
+    damageDatabase(label, withWal);
+    const before = snapshot();
+    for (const path of [DB, `${DB}-wal`]) if (before.has(path)) console.log(`sha256 ${path} ${before.get(path)}`);
+    if (withWal) check(before.has(`${DB}-wal`), `(${label}) the phone holds the damaged database and its -wal`);
+
+    await expectBlocked(label, 'database-unreadable', "The previous app version's database failed its integrity check");
+    const after = snapshot();
+    check(after.get(DB) === before.get(DB), `(${label}) database bytes are unchanged`);
+    check(after.get(`${DB}-wal`) === before.get(`${DB}-wal`), `(${label}) -wal bytes are unchanged (${withWal ? 'frames kept, no checkpoint' : 'still absent'})`);
+    const changed = differences(before, after);
+    check(changed.length === 0, `(${label}) every file is unchanged and none is new, so no .prewrite and no task write (${before.size} files)${shortList(changed)}`);
+};
+
+const scenarioMissing = async () => {
+    console.log('\n# 5 database missing, no JSON backup, while other RN state exists');
+    fresh();
+    await seed('5');
+    runAs(`rm -f ${DB} ${DB}-wal ${DB}-shm`);
+    rewriteAsyncStorage('5-rkstorage', "DELETE FROM catalystLocalStorage WHERE key IN ('mindwtr-data', 'focus-gtd-data', 'gtd-todo-data', 'gtd-data');");
+    console.log(`INJECTED (5): deleted ${DB} and its -wal and -shm, and RN's AsyncStorage JSON backup; shared_prefs, files/ and other AsyncStorage rows stay`);
+    const before = snapshot();
+    check(![...before.keys()].some((path) => path.startsWith(DB)) && before.has(ASYNC_STORAGE), '(5) no database file, RN AsyncStorage present');
+
+    await expectBlocked('5', 'database-missing', "The previous app version's database is missing");
+    const changed = differences(before, snapshot());
+    check(changed.length === 0, `(5) nothing was created or changed, so no empty database (${before.size} files)${shortList(changed)}`);
+};
+
+const scenarioMissingWithBackup = async () => {
+    console.log('\n# 5b database missing, RN JSON backup present: migrate');
+    fresh();
+    const t = await seed('8');
+    const seeded = asyncStorage('5b-seeded-rkstorage');
+    check(seeded.has(JSON_BACKUP), `(5b) RN wrote its AsyncStorage ${JSON_BACKUP} backup`);
+    // INJECTED: fields the RN seed never sets, so the content check covers notes, dates, people, areas and settings keys.
+    const backup = JSON.parse(seeded.get(JSON_BACKUP));
+    const at = new Date(Date.now() - 60_000).toISOString();
+    const stamp = { rev: 1, revBy: 'harness', createdAt: at, updatedAt: at };
+    const areaId = randomUUID();
+    const personId = randomUUID();
+    backup.areas = [...(backup.areas ?? []), { id: areaId, name: `Area${run}`, color: '#123456', order: 0, ...stamp }];
+    backup.people = [...(backup.people ?? []), { id: personId, name: `Person${run}`, note: 'Harness note ü', ...stamp }];
+    const rich = {
+        id: randomUUID(), title: t.backupOnly, status: 'inbox', description: `Notes ü 😀 ${run}\nsecond line`, priority: 'high',
+        dueDate: '2030-01-15', startTime: '2029-12-01T09:30', reviewAt: '2030-02-01', tags: ['#harness'], contexts: ['@desk'],
+        checklist: [{ id: randomUUID(), title: 'Step', isCompleted: true }], areaId, assignedTo: `Person${run}`, ...stamp,
+    };
+    backup.tasks.push(rich);
+    // Synced keys: the RN merge keeps them (it drops unknown and device-local keys, as RN's own migration does).
+    const settingsProbe = { weekStart: 'monday', dateFormat: 'dmy' };
+    backup.settings = { ...backup.settings, ...settingsProbe };
+    const backupFile = resolve(work, '5b-backup.json');
+    writeFileSync(backupFile, JSON.stringify(backup));
+    rewriteAsyncStorage('5b-rkstorage', `UPDATE catalystLocalStorage SET value = CAST(readfile('${backupFile}') AS TEXT) WHERE key = '${JSON_BACKUP}';`);
+    runAs(`rm -f ${DB} ${DB}-wal ${DB}-shm`);
+    console.log(`INJECTED (5b): added to AsyncStorage ${JSON_BACKUP} one task with notes, dates, tags, a checklist and an assignee, one area, one person and two synced settings; deleted ${DB} and its -wal and -shm`);
+    const preAsync = asyncStorage('5b-pre-rkstorage');
+    const before = snapshot();
+    const expected = liveInbox(backup.tasks);
+
+    install(APKS.native153, true);
+    device.launch(NATIVE_ACTIVITY);
+    const nodes = await nativeScreen();
+    check(!unavailable(nodes), `(5b) native boot succeeded ${unavailable(nodes) ?? ''}`);
+    check(header(nodes) === expected.length, `(5b) native Inbox counts the backup's ${expected.length} Inbox tasks`);
+    for (const title of expected) check(hasText(nodes, title), `(5b) native Inbox shows backup task ${title}`);
+    check(nativeGuardLog().includes(`${GUARD} outcome=clear`), '(5b) guard logged outcome=clear');
+    const flagWasSet = preAsync.has(RECONCILED);
+    importLine('5b', { outcome: 'imported', path: 'migrate', rnState: flagWasSet ? 'unchanged' : 'updated' });
+    await stopApp();
+
+    const after = snapshot();
+    const postDb = pullDatabase('5b-post');
+    for (const [table, items] of [['tasks', backup.tasks], ['projects', backup.projects ?? []], ['areas', backup.areas], ['sections', backup.sections ?? []], ['people', backup.people]]) {
+        const ids = rows(postDb, `SELECT id FROM ${table}`).map((item) => item.id).sort();
+        check(isDeepStrictEqual(ids, items.map((item) => item.id).sort()), `(5b) SQLite ${table} are exactly the backup's ${items.length}`);
+    }
+    const state = { jsonAhead: preAsync.has(MARKER), reconciled: flagWasSet, backupVersion: preAsync.get('mindwtr-data:startup-backup-version') ?? null };
+    const mismatch = importMismatch(postDb, state, backupFile);
+    check(mismatch === 'match', `(5b) every persisted field of every entity, and the settings, equal core's migration of the backup: ${mismatch}`);
+    // The same facts read straight from the columns, without core.
+    const [stored] = rows(postDb, `SELECT description, dueDate, startTime, reviewAt, assignedTo FROM tasks WHERE id = '${rich.id}'`);
+    check(isDeepStrictEqual(stored, { description: rich.description, dueDate: rich.dueDate, startTime: rich.startTime, reviewAt: rich.reviewAt, assignedTo: rich.assignedTo }),
+        '(5b) the rich task keeps its notes, dates and assignee byte-exact');
+    check(rows(postDb, `SELECT note FROM people WHERE id = '${personId}'`)[0]?.note === 'Harness note ü', '(5b) the person keeps its note');
+    check(isDeepStrictEqual(rows(postDb, "SELECT json_extract(data, '$.weekStart') AS weekStart, json_extract(data, '$.dateFormat') AS dateFormat FROM settings WHERE id = 1")[0],
+        settingsProbe), '(5b) the settings row keeps the backup settings');
+    const postAsync = asyncStorage('5b-post-rkstorage');
+    check(postAsync.get(RECONCILED) === '1', '(5b) the reconcile flag is set');
+    const asyncChanged = asyncChanges(preAsync, postAsync);
+    check(asyncChanged.length === 0, `(5b) no other AsyncStorage row changed, ${JSON_BACKUP} included${shortList(asyncChanged)}`);
+    check(flagWasSet ? after.get(ASYNC_STORAGE) === before.get(ASYNC_STORAGE) && ![...after.keys()].some(isRnCheckpoint) : checkpointMatches(before, after),
+        flagWasSet ? '(5b) RN had set the reconcile flag, so RKStorage is untouched and not checkpointed' : `(5b) ${RN_CHECKPOINT} holds the pre-upgrade RKStorage files`);
+    const changed = differences(before, after, {
+        changedOk: (path) => isAsyncStorage(path),
+        newOk: (path) => isDatabase(path) || path === `${DB}.prewrite` || isAsyncStorage(path) || isRnCheckpoint(path),
+    });
+    check(changed.length === 0, `(5b) every other file is unchanged${shortList(changed)}`);
+};
+
+let blocked4 = '';
+try {
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    console.log(`device: ${sh('getprop ro.product.model')} / Android ${sh('getprop ro.build.version.release')} (API ${sh('getprop ro.build.version.sdk')})`);
+    for (const [name, apk] of Object.entries(APKS)) console.log(`${name}: ${apk} sha256 ${createHash('sha256').update(readFileSync(apk)).digest('hex')}`);
+    console.log(`RN source ${built.rnSource}; recovery source ${built.recoverySource}`);
+    const current = front();
+    if (!current.includes(`${PKG}/`) && !current.includes(`${home}/`)) throw new Stopped(`another app is in front: ${current.trim()}`);
+    if (want('1')) {
+        const upgraded = await scenarioUpgrade();
+        if (want('4') && built.recoverySource !== V132) await scenarioRecovery(upgraded);
+        else if (want('4')) {
+            // v1.3.2 applies its stale AsyncStorage startup snapshot, and the capture drain then
+            // drops the canonical SQLite load. Report it; the RN fix repoints RECOVERY_COMMIT.
+            try {
+                await scenarioRecovery(upgraded);
+                console.log('(4) passed although the recovery source is still v1.3.2');
+            } catch (error) {
+                if (error instanceof Stopped) throw error;
+                blocked4 = `(4) BLOCKED by the RN startup snapshot bug (task mobile-drain-after-canonical): ${error.message}`;
+                console.log(blocked4);
+            }
+        }
+    }
+    if (want('2')) {
+        const imported = await scenarioJsonAhead();
+        if (want('4b')) await scenarioRecoveryAfterImport(imported);
+    }
+    if (want('2b')) await scenarioCorruptBackup();
+    if (want('3')) await scenarioUnreadable('3', false);
+    if (want('3b')) await scenarioUnreadable('3b', true);
+    if (want('5')) await scenarioMissing();
+    if (want('5b')) await scenarioMissingWithBackup();
+    console.log(`\nUpgrade device check passed${blocked4 ? '; scenario 4 BLOCKED (see above)' : ''}`);
+} catch (error) {
+    evidenced(error);
+    console.error(error instanceof Stopped ? `STOPPED: ${error.message}` : `FAIL: ${error.message}`);
+    process.exitCode = error instanceof Stopped ? 3 : 1;
+} finally {
+    try { sh(`rm -f ${TMP}-*`); } catch { /* device gone */ }
+    if (!args.includes('--keep')) {
+        try { if (installed()) sh(`pm uninstall ${PKG}`); } catch { /* device gone */ }
+    }
+}

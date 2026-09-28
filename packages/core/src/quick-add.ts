@@ -7,7 +7,7 @@ import { normalizeTaskStatus } from './task-status';
 import { normalizeLinkAttachmentInput } from './attachment-link-utils';
 import { getActiveLanguage, getMonthNamesForLanguage, isActiveDateFormatDayFirst, normalizeClockTimeInput } from './date';
 import type { Language } from './i18n/i18n-types';
-import { getUsedTaskTokens } from './task-token-usage';
+import { getRetainedTaskContexts, getUsedTaskTokens } from './task-token-usage';
 import { getPersonOptionNames } from './people';
 
 // The live capture preview rides this module's barrel line
@@ -80,6 +80,7 @@ export interface QuickAddParseSettings {
 /** Everything the bag is derived from; `useTaskStore.getState()` satisfies it. */
 export interface QuickAddParseSource {
     tasks?: Task[];
+    _allTasks?: Task[];
     people?: readonly Person[];
 }
 
@@ -95,7 +96,7 @@ export function buildQuickAddParseOptions(
 ): QuickAddParseOptions {
     const tasks = source.tasks ?? [];
     return {
-        knownContexts: getUsedTaskTokens(tasks, (task) => task.contexts, { prefix: '@' }),
+        knownContexts: getRetainedTaskContexts(source._allTasks ?? tasks),
         knownTags: getUsedTaskTokens(tasks, (task) => task.tags, { prefix: '#' }),
         knownPeople: getPersonOptionNames(source.people, tasks),
         defaultScheduleTime: normalizeClockTimeInput(settings?.gtd?.defaultScheduleTime) || undefined,
@@ -205,6 +206,8 @@ export interface QuickAddDateCommandsResult {
     invalidDateCommands?: string[];
 }
 
+// By design (maintainer, 2026-09-24): a blank line anywhere, a trailing one
+// included, joins the lines into one task (a pasted paragraph).
 export function splitQuickAddBulkLines(input: string): string[] {
     const normalized = String(input || '').replace(/\r\n?/g, '\n');
     const lines = normalized
@@ -255,7 +258,12 @@ const NATURAL_TIME_HINT_RE = /\b(?:\d{1,2}:\d{2}(?:\s*[ap]m)?|\d{1,2}\s*[ap]m|no
 const PURE_TIME_ONLY_RE = /^(?:at\s+)?(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|noon|midnight)$/i;
 const BARE_MONTH_RE = /^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)$/i;
 const TRAILING_DATE_SUFFIX_RE = /^[\s).,!?:;'"\]]*$/u;
-const TRAILING_DATE_SEPARATOR_RE = /[\s,;:()[\]{}\-–—]+$/u;
+// The hyphen is written as \x2D on purpose. `\-` inside a Unicode-mode class is
+// valid ECMAScript, but the QuickJS build embedded by the native Android pilot
+// (wang.harlon.quickjs:wrapper-android 3.2.x) refuses it while reading the file,
+// so the whole core failed to load there. A bare `-` would be wrong here too:
+// `}-–` would then read as a character range.
+const TRAILING_DATE_SEPARATOR_RE = /[\s,;:()[\]{}\x2D–—]+$/u;
 
 function protectEscapes(input: string): string {
     let result = '';

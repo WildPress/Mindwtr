@@ -1,16 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import {
-    Archive,
-    ArrowRight,
     AtSign,
     BatteryCharging,
     BatteryFull,
     BatteryLow,
     BatteryMedium,
-    BookOpen,
-    CalendarDays,
-    Check,
-    CircleDot,
     CircleSlash,
     Flag,
     Hourglass,
@@ -20,9 +14,11 @@ import {
     User,
     type LucideIcon,
 } from 'lucide-react';
+import { TASK_STATUS_ICONS } from '../../../lib/task-status-icons';
 import {
     createCustomTimeEstimate,
     formatTimeEstimateLabel,
+    getTaskContextMatches,
     isCustomTimeEstimate,
     parseTimeEstimateInput,
     tFallback,
@@ -63,15 +59,8 @@ const selectedPillClassName = 'border-primary bg-primary text-primary-foreground
 // Choice-chip icons added in front of each option's label (never replacing it,
 // except for the icon-only None pill above). Statuses and energy levels map to
 // a fixed lucide glyph so options stay scannable without text length alone.
-const STATUS_OPTION_ICONS: Record<TaskStatus, LucideIcon> = {
-    inbox: CircleDot,
-    next: ArrowRight,
-    waiting: Hourglass,
-    someday: CalendarDays,
-    reference: BookOpen,
-    done: Check,
-    archived: Archive,
-};
+// One status, one glyph across the app: the map lives in lib/task-status-icons (#1256).
+const STATUS_OPTION_ICONS = TASK_STATUS_ICONS;
 
 const ENERGY_OPTION_ICONS: Record<TaskEnergyLevel, LucideIcon> = {
     low: BatteryLow,
@@ -317,6 +306,7 @@ function ToggleTokenField({
     labelToken,
     options,
     suggestions = options,
+    rankContextSuggestions = false,
     placeholder,
     value,
     onChange,
@@ -328,6 +318,7 @@ function ToggleTokenField({
     labelToken?: string;
     options: string[];
     suggestions?: string[];
+    rankContextSuggestions?: boolean;
     placeholder: string;
     value: string;
     onChange: (value: string) => void;
@@ -349,12 +340,13 @@ function ToggleTokenField({
     const filteredSuggestions = useMemo(() => {
         if (!focused || !query) return [];
         const trimmedQuery = query.trim().toLowerCase();
-        return suggestionOptions
-            .filter((option) => matchesOption(option, query))
+        return (rankContextSuggestions
+            ? getTaskContextMatches(suggestionOptions, query, suggestionOptions.length)
+            : suggestionOptions.filter((option) => matchesOption(option, query)))
             .filter((option) => option.trim().toLowerCase() !== trimmedQuery)
             .filter((option) => !otherTokenKeys.has(canonicalToken(option)))
             .slice(0, 6);
-    }, [focused, otherTokenKeys, query, suggestionOptions]);
+    }, [focused, otherTokenKeys, query, rankContextSuggestions, suggestionOptions]);
 
     useEffect(() => {
         setActiveIndex(0);
@@ -882,6 +874,7 @@ export function ContextsField({
             labelToken={QUICK_ADD_FIELD_TOKENS.contexts}
             options={options}
             suggestions={suggestions}
+            rankContextSuggestions
             placeholder={t('taskEdit.contextsPlaceholder')}
             value={value}
             onChange={onChange}

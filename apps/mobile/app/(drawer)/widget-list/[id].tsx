@@ -14,7 +14,7 @@ import { openContextsScreen, openProjectScreen } from '@/lib/task-meta-navigatio
 
 /** An exact widget list destination, not an additional main navigation item. */
 export default function WidgetListScreen() {
-  const { id } = useLocalSearchParams<{ id?: string | string[] }>();
+  const { id, source } = useLocalSearchParams<{ id?: string | string[]; source?: string }>();
   const data = useTaskStore((state) => ({
     // Match widget publication's canonical pools: parent tombstones must remain
     // present so the shared visibility predicate can exclude their children.
@@ -30,6 +30,13 @@ export default function WidgetListScreen() {
   const list = useMemo(() => resolveWidgetListDestination(data, language, id), [data, id, language]);
   const title = list?.title ?? t('search.noResults');
   const available = Boolean(list);
+  useEffect(() => {
+    if (source !== 'shortcut') return;
+    void logInfo('Saved list shortcut destination resolved', {
+      scope: 'shortcuts',
+      extra: { releaseCheck: 'v1.3.3/saved-list-shortcut', available },
+    });
+  }, [source, id, available]);
   const listKind = id === 'next' ? 'next' : typeof id === 'string' && id.startsWith('project:') ? 'project' : 'filter';
   const { updateTask, deleteTask, fetchData } = useTaskStore((state) => ({
     updateTask: state.updateTask,
@@ -60,17 +67,6 @@ export default function WidgetListScreen() {
     setRefreshing(true);
     try { await fetchData(); } finally { setRefreshing(false); }
   }, [fetchData]);
-  useEffect(() => {
-    void logInfo('Widget list destination resolved', {
-      scope: 'widget',
-      extra: {
-        releaseCheck: 'v1.3.1/widget-list-navigation',
-        listKind,
-        available: String(available),
-      },
-    });
-    // Report route resolution, not every task edit or store refresh.
-  }, [id, available, listKind]);
   return (
     <View style={{ flex: 1, backgroundColor: tc.bg }}>
       <Stack.Screen options={{ title }} />

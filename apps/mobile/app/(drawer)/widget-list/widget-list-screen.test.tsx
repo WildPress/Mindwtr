@@ -8,7 +8,9 @@ const state = vi.hoisted(() => ({
   data: { tasks: [], projects: [], sections: [], areas: [], settings: {} } as AppData,
   canonical: {} as { _allTasks?: AppData['tasks']; _allProjects?: AppData['projects'] },
   id: 'next' as string | string[],
-  updateTask: vi.fn(), deleteTask: vi.fn(), fetchData: vi.fn(), logInfo: vi.fn(),
+  source: undefined as string | undefined,
+  logInfo: vi.fn(),
+  updateTask: vi.fn(), deleteTask: vi.fn(), fetchData: vi.fn(),
 }));
 vi.mock('@mindwtr/core', async (original) => ({
   ...await original<typeof import('@mindwtr/core')>(),
@@ -17,15 +19,15 @@ vi.mock('@mindwtr/core', async (original) => ({
 vi.mock('expo-router', () => ({
   router: { push: vi.fn() },
   Stack: { Screen: (props: object) => React.createElement('StackScreen', props) },
-  useLocalSearchParams: () => ({ id: state.id }),
+  useLocalSearchParams: () => ({ id: state.id, source: state.source }),
 }));
+vi.mock('@/lib/app-log', () => ({ logInfo: state.logInfo }));
 vi.mock('@/contexts/language-context', () => ({ useLanguage: () => ({ language: 'en', t: (id: string) => id }) }));
 vi.mock('@/contexts/theme-context', () => ({ useTheme: () => ({ isDark: false }) }));
 vi.mock('@/hooks/use-theme-colors', () => {
   const tc = { bg: '#fff', text: '#111', secondaryText: '#555' };
   return { useThemeColors: () => tc };
 });
-vi.mock('@/lib/app-log', () => ({ logInfo: state.logInfo }));
 vi.mock('@/lib/task-meta-navigation', () => ({ openProjectScreen: vi.fn(), openContextsScreen: vi.fn() }));
 vi.mock('@/components/swipeable-task-item', () => ({ SwipeableTaskItem: (props: object) => React.createElement('TaskRow', props) }));
 vi.mock('@/components/task-edit-modal', () => ({ TaskEditModal: (props: object) => React.createElement('TaskModal', props) }));
@@ -41,10 +43,11 @@ describe('WidgetListScreen', () => {
   beforeEach(() => {
     state.data = { tasks: [], projects: [], sections: [], areas: [], settings: {} };
     state.id = 'next';
+    state.source = undefined;
     state.canonical = {};
     vi.clearAllMocks();
   });
-  it('keeps the full live list, refreshes after completion, and logs no content', async () => {
+  it('keeps the full live list and refreshes after completion', async () => {
     state.data.tasks = Array.from({ length: 90 }, (_, i) => task(`task-${i}`));
     let tree!: ReactTestRenderer;
     await act(async () => { tree = create(<WidgetListScreen />); });
@@ -54,12 +57,11 @@ describe('WidgetListScreen', () => {
     state.data.tasks = state.data.tasks.map((item, i) => i === 0 ? { ...item, status: 'done' } : item);
     await act(async () => { tree.update(<WidgetListScreen />); });
     expect(rows().data).toHaveLength(89);
-    expect(state.logInfo).toHaveBeenCalledTimes(1);
-    expect(state.logInfo.mock.calls[0][1].extra).toEqual({ releaseCheck: 'v1.3.1/widget-list-navigation', listKind: 'next', available: 'true' });
     await act(async () => { tree.unmount(); });
   });
   it('uses a saved filter by ID and becomes empty when that filter is deleted', async () => {
     state.id = 'filter:desk';
+    state.source = 'shortcut';
     state.data.tasks = [task('Zebra'), task('Alpha')];
     state.data.settings.savedFilters = [{ id: 'desk', name: 'Desk', view: 'next', criteria: {}, sortBy: 'title', sortOrder: 'asc', createdAt: '2026-01-01', updatedAt: '2026-01-01' }];
     let tree!: ReactTestRenderer;
@@ -67,9 +69,15 @@ describe('WidgetListScreen', () => {
     const rows = () => tree.root.findByType('TaskRows' as never).props.data as Task[];
     expect(rows().map((item) => item.id)).toEqual(['Alpha', 'Zebra']);
     expect(tree.root.findByType('StackScreen' as never).props.options.title).toBe('Desk');
+    expect(state.logInfo).toHaveBeenLastCalledWith('Saved list shortcut destination resolved', { scope: 'shortcuts', extra: { releaseCheck: 'v1.3.3/saved-list-shortcut', available: true } });
+    state.data.settings.savedFilters![0].name = 'Renamed';
+    state.data.settings = { ...state.data.settings };
+    await act(async () => { tree.update(<WidgetListScreen />); });
+    expect(tree.root.findByType('StackScreen' as never).props.options.title).toBe('Renamed');
     state.data.settings = { savedFilters: [] };
     await act(async () => { tree.update(<WidgetListScreen />); });
     expect(rows()).toEqual([]);
+    expect(state.logInfo).toHaveBeenLastCalledWith('Saved list shortcut destination resolved', { scope: 'shortcuts', extra: { releaseCheck: 'v1.3.3/saved-list-shortcut', available: false } });
     await act(async () => { tree.unmount(); });
   });
   it('fails closed for ambiguous route parameters', async () => {

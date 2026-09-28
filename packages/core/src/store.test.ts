@@ -12,10 +12,12 @@ import {
 import { buildEntityMap } from './store-helpers';
 import { computeSyncPayloadFingerprint } from './sync-helpers';
 import { mergeAppData } from './sync';
-import { shouldShowTaskForStart } from './task-utils';
+import { mockAppData } from './sync-test-utils';
+import { shouldShowTaskForStart, sortTasksByBoardOrder } from './task-utils';
+import { generateUUID } from './uuid';
 import type { StorageAdapter } from './storage';
 import type { AppData, Area, Project, Task } from './types';
-import { runDataTransferTransaction } from './data-transfer-transaction';
+import { runDataTransferTransaction, runSerializedSyncDocumentWriteOperation } from './data-transfer-transaction';
 import { collectProjectTaskLinks, undoProjectDelete } from './undo-project-delete';
 
 const waitForExpectation = async (assertion: () => void, maxAttempts = 200): Promise<void> => {
@@ -769,6 +771,72 @@ describe('TaskStore', () => {
         expect(useTaskStore.getState()._tasksById.get(duplicateResult.id!)?.title).toBe('Context Bank');
     });
 
+    it('places a Board copy immediately after its source with its own board order', async () => {
+        const { addTask, duplicateTask, updateTask } = useTaskStore.getState();
+        const a = (await addTask('A', { status: 'next' })).id!;
+        const b = (await addTask('B', { status: 'next' })).id!;
+        const c = (await addTask('C', { status: 'next' })).id!;
+        await updateTask(a, { boardOrder: 0 });
+        await updateTask(b, { boardOrder: 1024 });
+        await updateTask(c, { boardOrder: 2048 });
+        const copy = await duplicateTask(b, false);
+        const tasks = useTaskStore.getState().tasks.filter((task) => [a, b, c, copy.id].includes(task.id));
+        expect(sortTasksByBoardOrder(tasks).map((task) => task.id)).toEqual([a, b, copy.id, c]);
+        expect(tasks.find((task) => task.id === copy.id)?.boardOrder).not.toBe(1024);
+    });
+
+    it('duplicates an unordered task without changing other rows or losing a concurrent completion', async () => {
+        const { addTask, duplicateTask } = useTaskStore.getState();
+        vi.setSystemTime(new Date('2026-09-24T12:00:00.000Z'));
+        const ids = await Promise.all(Array.from({ length: 31 }, (_, index) => addTask(`Task ${index}`, { status: 'next' })));
+        const before = useTaskStore.getState()._allTasks.map((task) => ({ ...task }));
+        const completed = { ...before[5], status: 'done' as const, completedAt: '2026-09-24T12:00:30.000Z', updatedAt: '2026-09-24T12:00:30.000Z', rev: before[5].rev + 1, revBy: 'device-b' };
+        vi.setSystemTime(new Date('2026-09-24T12:01:00.000Z'));
+        const copy = await duplicateTask(ids[0].id!, false);
+        const after = useTaskStore.getState()._allTasks;
+        expect(after).toHaveLength(32);
+        expect(after.filter((task) => !before.some((old) => old.id === task.id))).toHaveLength(1);
+        expect(after.find((task) => task.id === copy.id)).toMatchObject({ boardOrder: undefined, rev: 1 });
+        expect(after.filter((task) => before.some((old) => old.id === task.id))).toEqual(before);
+        const merged = mergeAppData(mockAppData(after), mockAppData(before.map((task, index) => index === 5 ? completed : task)), { nowIso: '2026-09-24T12:01:00.000Z' });
+        expect(merged.tasks.find((task) => task.id === completed.id)?.status).toBe('done');
+    });
+
+    it('leaves a copy unordered when no whole-number Board slot is free', async () => {
+        const { addTask, duplicateTask, updateTask } = useTaskStore.getState();
+        const source = (await addTask('Source', { status: 'next' })).id!;
+        const next = (await addTask('Next', { status: 'next' })).id!;
+        await updateTask(source, { boardOrder: 1024 });
+        await updateTask(next, { boardOrder: 1025 });
+        const before = useTaskStore.getState()._allTasks.map((task) => ({ ...task }));
+        const copy = await duplicateTask(source, false);
+        expect(useTaskStore.getState()._allTasks.find((task) => task.id === copy.id)?.boardOrder).toBeUndefined();
+        expect(useTaskStore.getState()._allTasks.slice(0, 2)).toEqual(before);
+    });
+
+    it('reuses a Board copy id for the same source and refuses another source', async () => {
+        const { addTask, duplicateTask } = useTaskStore.getState();
+        const a = (await addTask('A', { status: 'next' })).id!;
+        const b = (await addTask('B', { status: 'next' })).id!;
+        const copyId = generateUUID();
+        expect(await duplicateTask(a, false, copyId)).toMatchObject({ success: true, id: copyId });
+        const before = useTaskStore.getState()._allTasks.map((task) => [task.id, task.rev]);
+        expect(await duplicateTask(a, false, copyId)).toMatchObject({ success: true, id: copyId });
+        expect(await duplicateTask(b, false, copyId)).toMatchObject({ success: false });
+        expect(useTaskStore.getState()._allTasks.map((task) => [task.id, task.rev])).toEqual(before);
+    });
+
+    it('reuses the requested copy even when an earlier duplicate has identical fields', async () => {
+        const { addTask, duplicateTask } = useTaskStore.getState();
+        const a = (await addTask('Same', { status: 'next' })).id!;
+        expect((await duplicateTask(a, false)).success).toBe(true);
+        const copyId = generateUUID();
+        expect(await duplicateTask(a, false, copyId)).toMatchObject({ success: true, id: copyId });
+        const before = useTaskStore.getState()._allTasks.map((task) => [task.id, task.rev]);
+        expect(await duplicateTask(a, false, copyId)).toMatchObject({ success: true, id: copyId });
+        expect(useTaskStore.getState()._allTasks.map((task) => [task.id, task.rev])).toEqual(before);
+    });
+
     it('sends a duplicated done task back to the Inbox to be re-clarified', async () => {
         const { addTask, duplicateTask } = useTaskStore.getState();
         const addResult = await addTask('Weekly review', {
@@ -1274,7 +1342,7 @@ describe('TaskStore', () => {
         expect(useTaskStore.getState()._tasksById.get(taskIds[3])?.isFocusedToday).toBe(true);
     });
 
-    it('clears today focus when a focused task is deferred to a future start date', async () => {
+    it('queues focus when a focused Next action is deferred to a future start date', async () => {
         vi.setSystemTime(new Date('2026-05-02T10:00:00.000Z'));
         const { addTask, updateTask } = useTaskStore.getState();
         const result = await addTask('Focused later', { status: 'next', isFocusedToday: true });
@@ -1286,7 +1354,7 @@ describe('TaskStore', () => {
 
         const task = useTaskStore.getState()._tasksById.get(taskId!);
         expect(task?.startTime).toBe('2026-05-03');
-        expect(task?.isFocusedToday).toBe(false);
+        expect(task?.isFocusedToday).toBe(true);
         expect(useTaskStore.getState().getDerivedState().focusedCount).toBe(0);
     });
 
@@ -3792,6 +3860,52 @@ describe('TaskStore', () => {
         expect(after.rev).toBe(purged.rev);
     });
 
+    it('refuses to purge a task that is no longer in Trash', async () => {
+        const { addTask, deleteTask, restoreTask, purgeTask } = useTaskStore.getState();
+        await addTask('Restored by sync', { status: 'next' });
+        const task = useTaskStore.getState()._allTasks.find((item) => item.title === 'Restored by sync');
+        expect(task).toBeTruthy();
+        if (!task) return;
+
+        await deleteTask(task.id);
+        // Sync (or another device) restores it after the Trash confirmation was shown.
+        await restoreTask(task.id);
+        const live = useTaskStore.getState()._allTasks.find((item) => item.id === task.id)!;
+
+        const result = await purgeTask(task.id);
+
+        expect(result).toEqual({ success: false, error: 'Task is not in Trash' });
+        const after = useTaskStore.getState()._allTasks.find((item) => item.id === task.id)!;
+        expect(after.deletedAt).toBeUndefined();
+        expect(after.purgedAt).toBeUndefined();
+        expect(after.rev).toBe(live.rev);
+    });
+
+    it('refuses a purge that waited behind a document restore which made the task live', async () => {
+        const { addTask, deleteTask } = useTaskStore.getState();
+        await addTask('Restored by a document restore', { status: 'next' });
+        const task = useTaskStore.getState()._allTasks.find((item) => item.title === 'Restored by a document restore')!;
+        await deleteTask(task.id);
+        let release: (() => void) | undefined;
+        // A document restore holds the store write lock and makes the task live again.
+        const restore = runSerializedSyncDocumentWriteOperation(async () => {
+            await new Promise<void>((resolve) => { release = resolve; });
+            useTaskStore.setState((state) => ({
+                _allTasks: state._allTasks.map((item) => (item.id === task.id ? { ...item, deletedAt: undefined } : item)),
+            }));
+        });
+        await vi.waitFor(() => expect(release).toBeDefined());
+        // Trash showed the task, so the purge was requested; it waits for the lock.
+        const purging = useTaskStore.getState().purgeTask(task.id);
+        release!();
+        await restore;
+
+        expect(await purging).toEqual({ success: false, error: 'Task is not in Trash' });
+        const after = useTaskStore.getState()._allTasks.find((item) => item.id === task.id)!;
+        expect(after.deletedAt).toBeUndefined();
+        expect(after.purgedAt).toBeUndefined();
+    });
+
     it('purges deleted tasks while deriving the visible task slice from all tasks', async () => {
         const archivedTask = {
             id: 'archived-visible',
@@ -4666,7 +4780,11 @@ describe('TaskStore', () => {
 
         const nextInstance = state._allTasks.find(t => t.id !== original.id)!;
         expect(nextInstance.status).toBe('next');
-        expect(nextInstance.recurrence).toEqual({ rule: 'daily', seriesId: original.id });
+        expect(nextInstance.recurrence).toEqual({
+            rule: 'daily',
+            seriesId: original.id,
+            rrule: `FREQ=DAILY;X-MINDWTR-SERIES-ID=${original.id}`,
+        });
         expect(nextInstance.dueDate).toBe('2023-01-02T09:00');
     });
 
@@ -4856,6 +4974,7 @@ describe('TaskStore', () => {
             rule: 'weekly',
             strategy: 'fluid',
             seriesId: 'weekly-series',
+            rrule: 'FREQ=WEEKLY;X-MINDWTR-SERIES-ID=weekly-series',
         });
     });
 
@@ -4875,6 +4994,7 @@ describe('TaskStore', () => {
             rule: 'weekly',
             strategy: 'strict',
             seriesId: duplicateId,
+            rrule: `FREQ=WEEKLY;X-MINDWTR-SERIES-ID=${duplicateId}`,
         });
 
         await updateTask(originalId, { status: 'done' });

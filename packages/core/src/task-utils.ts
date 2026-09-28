@@ -129,6 +129,8 @@ export type TaskFocusEligibilityOptions = {
     sections?: readonly SequentialSection[];
     /** Precomputed by buildTaskFocusEligibilityContext; derived per call when absent. */
     sequentialFirstTaskIds?: ReadonlySet<string>;
+    /** A future-start Next action may be starred now for Focus on its start day. */
+    allowFutureStart?: boolean;
 };
 
 type SequentialTaskOrderFields = Pick<Task, 'createdAt' | 'order' | 'orderNum'>;
@@ -535,6 +537,14 @@ export function isTaskFutureStart(
     return deferUntil > endOfToday;
 }
 
+export function isTaskFutureFocusCandidate(task: Task, now: Date = new Date()): boolean {
+    return task.status === 'next' && Boolean(task.startTime) && isTaskFutureStart(task, now);
+}
+
+export function isTaskFocusedNow(task: Task, now: Date = new Date()): boolean {
+    return task.isFocusedToday === true && !isTaskFutureStart(task, now);
+}
+
 export type UpcomingDeferredTask = {
     task: Task;
     /** The defer-until date the task will surface on. */
@@ -871,7 +881,7 @@ export function getTaskFocusEligibility(
         && sequentialProjectIds.has(task.projectId)
         && !sequentialFirstTaskIds.has(task.id),
     );
-    const isVisibleForStart = shouldShowTaskForStart(task, { now });
+    const isVisibleForStart = options.allowFutureStart === true || shouldShowTaskForStart(task, { now });
     const isVisibleActiveTask = isTaskInActiveProject(task, projectMap) && isVisibleForStart;
     const isReviewDueEligible = task.status !== 'inbox' && isDueForReview(task.reviewAt, now);
     const eligible = isVisibleActiveTask
@@ -896,7 +906,7 @@ export function getTaskFocusEligibility(
  * parses — not the sort — were the cost (#766). The comparison itself is
  * unchanged, and `sort` stays stable, so the resulting order is identical.
  */
-function sortByPrecomputedKey<T, K>(
+export function sortByPrecomputedKey<T, K>(
     tasks: readonly T[],
     toKey: (task: T) => K,
     compare: (a: K, b: K) => number
@@ -1149,6 +1159,19 @@ export function sortTasksByBoardOrder<T extends Pick<Task, 'boardOrder'>>(tasks:
     });
 }
 
+/** A duplicate takes a free integer slot without changing existing cards. */
+export function boardOrderForDuplicate(sourceOrder: number | undefined, column: readonly Pick<Task, 'boardOrder'>[]): number | undefined {
+    if (!Number.isSafeInteger(sourceOrder)) return undefined;
+    const current = sourceOrder as number;
+    let next = Number.POSITIVE_INFINITY;
+    for (const task of column) {
+        const order = task.boardOrder;
+        if (Number.isFinite(order) && (order as number) > current && (order as number) < next) next = order as number;
+    }
+    const candidate = next === Number.POSITIVE_INFINITY ? current + 1024 : Math.floor((current + next) / 2);
+    return Number.isSafeInteger(candidate) && candidate > current && candidate < next ? candidate : undefined;
+}
+
 /**
  * Stable sort for Today's Focus: tasks with a manual focusOrder come first
  * in ascending order; tasks without one keep their incoming relative order.
@@ -1312,6 +1335,9 @@ export function sortFocusNextActions(tasks: Task[], options: SortFocusNextAction
     // Date parsing belongs to the O(n) preparation, not the O(n log n)
     // comparator. Keep keys local so edits and the moving due-soon window
     // always take effect, and return the original task references.
+    // Every value the comparator reads more than once — the boost lookup and the
+    // priority rank included — is read once per task here. Same reason as the
+    // date parses above (#766): the comparator runs O(n log n) times.
     return sortByPrecomputedKey(tasks, (task) => {
         const due = safeDueTime(task.dueDate, Number.POSITIVE_INFINITY);
         return {
@@ -1320,6 +1346,8 @@ export function sortFocusNextActions(tasks: Task[], options: SortFocusNextAction
             bucket: getFocusNextActionBucket(due, nowMs, dueSoonWindowMs),
             start: safeTime(task.startTime, Number.POSITIVE_INFINITY),
             created: safeTime(task.createdAt, 0),
+            boost: projectDeadlineBoosts.get(task.id),
+            priority: TASK_PRIORITY_SORT_RANK[task.priority as TaskPriority] || 0,
         };
     }, (keyA, keyB) => {
         const { task: a, bucket: bucketA } = keyA;
@@ -1331,18 +1359,12 @@ export function sortFocusNextActions(tasks: Task[], options: SortFocusNextAction
         }
 
         if (bucketA === 1) {
-            const projectBoostDiff = compareProjectDeadlineBoosts(
-                projectDeadlineBoosts.get(a.id),
-                projectDeadlineBoosts.get(b.id),
-                a,
-                b,
-            );
+            const projectBoostDiff = compareProjectDeadlineBoosts(keyA.boost, keyB.boost, a, b);
             if (projectBoostDiff !== 0) return projectBoostDiff;
         }
 
         if (prioritizeByPriority) {
-            const priorityDiff = (TASK_PRIORITY_SORT_RANK[b.priority as TaskPriority] || 0)
-                - (TASK_PRIORITY_SORT_RANK[a.priority as TaskPriority] || 0);
+            const priorityDiff = keyB.priority - keyA.priority;
             if (priorityDiff !== 0) return priorityDiff;
         }
 
@@ -1418,9 +1440,8 @@ export function getCalendarPlanningCandidates<T extends Task>(
 /**
  * Calculate the age of a task in days
  */
-export function getTaskAgeDays(createdAt: string): number {
+export function getTaskAgeDays(createdAt: string, now: Date = new Date()): number {
     const created = new Date(createdAt);
-    const now = new Date();
     const diffMs = now.getTime() - created.getTime();
     return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 }
@@ -1429,8 +1450,8 @@ export function getTaskAgeDays(createdAt: string): number {
  * Get a human-readable age string for a task
  * Returns null for tasks < 1 day old (to avoid clutter)
  */
-export function getTaskAgeLabel(createdAt: string, lang: Language = 'en'): string | null {
-    const days = getTaskAgeDays(createdAt);
+export function getTaskAgeLabel(createdAt: string, lang: Language = 'en', now: Date = new Date()): string | null {
+    const days = getTaskAgeDays(createdAt, now);
     const isChinese = lang === 'zh' || lang === 'zh-Hant';
 
     if (days < 1) return null;
@@ -1468,11 +1489,10 @@ export function getTaskStaleness(createdAt: string): 'fresh' | 'aging' | 'stale'
  * Get the urgency level of a task based on due date
  * Returns: 'overdue' | 'urgent' (24h) | 'upcoming' (72h) | 'normal' | 'done'
  */
-export function getTaskUrgency(task: Partial<Task>): 'overdue' | 'urgent' | 'upcoming' | 'normal' | 'done' {
+export function getTaskUrgency(task: Partial<Task>, now: Date = new Date()): 'overdue' | 'urgent' | 'upcoming' | 'normal' | 'done' {
     if (!isTaskActionable(task)) return 'done';
     if (!task.dueDate) return 'normal';
 
-    const now = new Date();
     const due = safeParseDueDate(task.dueDate);
     if (!due) return 'normal';
     const diffHours = (due.getTime() - now.getTime()) / (1000 * 60 * 60);

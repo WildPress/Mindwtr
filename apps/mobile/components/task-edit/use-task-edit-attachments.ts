@@ -5,15 +5,17 @@ import {
     buildTaskUpdatesFromSpeechResult,
     findSelectableProjectByTitleAndArea,
     generateUUID,
+    isImageAttachment,
     isSandboxMode,
     normalizeLinkAttachmentInput,
+    parseAttachmentLinkBatch,
     planAttachmentDraftSettlement,
     translateWithFallback,
     type Attachment,
     type AttachmentDraftSettlementInput,
     type Task,
     useTaskStore,
-    validateAttachmentForUpload, tFallback } from '@mindwtr/core';
+    validateAttachmentForUpload, tFallback, formatI18nTemplate } from '@mindwtr/core';
 import {
     toTaskDraftDateTimeLocalValue,
 } from '@mindwtr/core/task-draft';
@@ -295,13 +297,13 @@ export function useTaskEditAttachments({
             setLinkInputTouched(true);
             return;
         }
-        const normalized = normalizeLinkAttachmentInput(linkInput);
-        if (!normalized.uri || !isValidLinkUri(normalized.uri)) {
-            Alert.alert(t('attachments.title'), t('attachments.invalidLink'));
-            return;
-        }
         const now = new Date().toISOString();
         if (editingLinkAttachmentId) {
+            const normalized = normalizeLinkAttachmentInput(linkInput);
+            if (!normalized.uri || !isValidLinkUri(normalized.uri)) {
+                Alert.alert(t('attachments.title'), t('attachments.invalidLink'));
+                return;
+            }
             setAttachments((current) => (
                 (current || []).map((attachment) => (
                     attachment.id === editingLinkAttachmentId
@@ -321,15 +323,21 @@ export function useTaskEditAttachments({
             setLinkModalVisible(false);
             return;
         }
-        const attachment: Attachment = {
+        const batch = parseAttachmentLinkBatch(linkInput);
+        if (batch.invalidLine !== null) {
+            Alert.alert(t('attachments.title'), formatI18nTemplate(t('attachments.invalidLinkLine'), { line: batch.invalidLine }));
+            return;
+        }
+        if (batch.entries.length === 0) return;
+        const added: Attachment[] = batch.entries.map((entry) => ({
             id: generateUUID(),
-            kind: normalized.kind,
-            title: normalized.title,
-            uri: normalized.uri,
+            kind: entry.kind,
+            title: entry.title,
+            uri: entry.uri,
             createdAt: now,
             updatedAt: now,
-        };
-        setAttachments((current) => [...(current || []), attachment]);
+        }));
+        setAttachments((current) => [...(current || []), ...added]);
         setLinkInput('');
         setLinkInputTouched(false);
         setEditingLinkAttachmentId(null);
@@ -679,12 +687,6 @@ export function useTaskEditAttachments({
         showAttachmentResolutionError(resolution);
     }, [resolveAttachment, showAttachmentResolutionError, showSandboxUnavailable]);
 
-    const isImageAttachment = React.useCallback((attachment: Attachment) => {
-        const mime = attachment.mimeType?.toLowerCase();
-        if (mime?.startsWith('image/')) return true;
-        return /\.(png|jpg|jpeg|gif|webp|heic|heif)$/i.test(attachment.uri);
-    }, []);
-
     const openAttachment = React.useCallback(async (attachment: Attachment) => {
         if (isSandboxMode()) {
             showSandboxUnavailable();
@@ -701,7 +703,7 @@ export function useTaskEditAttachments({
             // example D:\\Documents\\x.docx) and is never uploaded; handing it to the
             // OS as a URL failed silently (#1001).
             if (isLikelyFilePath(resolved.uri) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(resolved.uri)) {
-                Alert.alert(t('attachments.title'), tFallback(t, 'attachments.linkedFileElsewhere', 'This link points to a file on another device: {{path}}. Open it there, or attach the file instead of linking it.').replace('{{path}}', resolved.uri));
+                Alert.alert(t('attachments.title'), formatI18nTemplate(tFallback(t, 'attachments.linkedFileElsewhere', 'This link points to a file on another device: {{path}}. Open it there, or attach the file instead of linking it.'), { path: resolved.uri }));
                 return;
             }
             Linking.openURL(resolved.uri).catch((error) => {
@@ -730,7 +732,7 @@ export function useTaskEditAttachments({
         } else {
             Linking.openURL(resolved.uri).catch((error) => logTaskError('Failed to open attachment URL', error));
         }
-    }, [isAudioAttachment, isImageAttachment, openAudioAttachment, resolveAttachment, showAttachmentResolutionError, showSandboxUnavailable, t]);
+    }, [isAudioAttachment, openAudioAttachment, resolveAttachment, showAttachmentResolutionError, showSandboxUnavailable, t]);
 
     const removeAttachment = React.useCallback((id: string) => {
         const now = new Date().toISOString();

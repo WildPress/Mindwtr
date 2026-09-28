@@ -822,9 +822,9 @@ describe('desktop sync attachment backends', () => {
             expect(putCount(fetcher)).toBe(3);
         });
 
-        // The other devices hold the older copy of this attachment. A tombstone would reach
-        // them and their cleanup pass would delete it, leaving the bytes nowhere.
-        it('never tombstones a refused re-upload of edited content', async () => {
+        // The other devices hold the older copy of this attachment. Publishing the candidate
+        // hash without its bytes would make that good remote copy unverifiable.
+        it('keeps a refused replacement pending and bounds retries to its content identity', async () => {
             const fetcher = serverRefusal(400, 'Blocked executable attachment signature: elf');
             const logSyncWarning = vi.fn();
             const deps = refusalDeps(fetcher, logSyncWarning);
@@ -844,16 +844,40 @@ describe('desktop sync attachment backends', () => {
 
             await runCloudUpload(appData, deps, postMergeHelpers());
             await runCloudUpload(appData, deps, postMergeHelpers());
-            const result = expectFoldedData(await runCloudUpload(appData, deps, postMergeHelpers()));
+            const result = await runCloudUpload(appData, deps, postMergeHelpers());
 
-            const attachment = result.tasks[0].attachments?.[0];
+            const attachment = refusedAttachment(result, appData);
             expect(attachment?.deletedAt).toBeUndefined();
             expect(attachment?.cloudKey).toBe('attachments/attachment-1.txt');
             expect(attachment?.localStatus).toBe('available');
-            // Only the "waiting to re-upload" flag goes, which is what unblocks the document.
-            expect(attachment?.pendingContentUpload).toBeUndefined();
-            expect(findPendingAttachmentUploads(result)).toHaveLength(0);
+            expect(attachment?.pendingContentUpload).toBe(true);
+            expect(attachment?.fileHash).toBe('039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81');
+            expect(findPendingAttachmentUploads(result === false ? appData : result)).toHaveLength(1);
             expect(putCount(fetcher)).toBe(3);
+            expect(fsMocks.remove).not.toHaveBeenCalled();
+            expect(logSyncWarning).toHaveBeenCalledWith(
+                expect.stringContaining('keeping the edited content pending'),
+            );
+            expect(logSyncWarning).toHaveBeenCalledWith(
+                'Attachment replacement retained after upload refusal',
+                undefined,
+                { releaseCheck: 'v1.3.2/attachment-replacement-held' },
+            );
+
+            expect(await runCloudUpload(appData, deps, postMergeHelpers())).toBe(false);
+            expect(putCount(fetcher)).toBe(3);
+
+            const nextBytes = new Uint8Array([4, 5, 6]);
+            fsMocks.readFile.mockResolvedValue(nextBytes);
+            Object.assign(appData.tasks[0].attachments![0], {
+                fileHash: await coreMocks.computeSha256Hex(nextBytes),
+                contentRev: 8,
+                contentMtimeMs: 2000,
+                contentSize: nextBytes.length,
+            });
+
+            await runCloudUpload(appData, deps, postMergeHelpers());
+            expect(putCount(fetcher)).toBe(4);
         });
     });
 
@@ -1753,6 +1777,8 @@ describe('desktop sync attachment backends', () => {
                     stage,
                     errorType: 'native-os-error',
                     nativeCode,
+                    // These fixtures fail with an OS error, which carries a path: never a named reason.
+                    reason: 'unlisted',
                 },
             );
             const calls = JSON.stringify(vi.mocked(deps.logSyncWarning).mock.calls);
@@ -1941,9 +1967,21 @@ describe('desktop sync attachment backends', () => {
             expectFileUploadFailureDiagnostic(deps, 'existing-generation-read');
             expect(syncFsMocks.reserveAttachmentGeneration).not.toHaveBeenCalled();
             expect(appData.tasks[0].attachments?.[0]?.cloudKey).toBeUndefined();
+
+            await expect(syncFileAttachments(
+                appData,
+                '/candidate-sync',
+                deps,
+                postMergeHelpers(),
+            )).resolves.toBe(false);
+
+            expect(syncFsMocks.stat).toHaveBeenCalledTimes(2);
+            expect(syncFsMocks.remove).not.toHaveBeenCalled();
+            expect(syncFsMocks.publishAttachmentGeneration).not.toHaveBeenCalled();
+            expect(appData.tasks[0].attachments?.[0]?.deletedAt).toBeUndefined();
         });
 
-        /** The corrupt generation every rewrite test below starts from: the sync folder
+        /** The invalid generation every preservation test below starts from: the sync folder
          *  holds a file under this content-addressed name whose bytes are not this content. */
         const stageCorruptGeneration = () => {
             const otherBytes = new Uint8Array([4, 5, 6]);
@@ -1956,20 +1994,18 @@ describe('desktop sync attachment backends', () => {
             syncFsMocks.stat.mockResolvedValue({ mtimeMs: 1000, size: otherBytes.length });
         };
 
-        it('rewrites an existing generation once after an integrity mismatch at verification', async () => {
+        it('preserves an existing generation after an integrity mismatch at verification', async () => {
             const appData = makePendingData();
             appData.tasks[0].attachments![0].cloudKey = undefined;
             const deps = depsFor();
-            const generationKey = `attachments/attachment-1.${BYTES_HASH}.txt`;
-            const generationPath = `/candidate-sync/${generationKey}`;
             stageCorruptGeneration();
 
-            const result = expectFoldedData(await syncFileAttachments(
+            const result = await syncFileAttachments(
                 appData,
                 '/candidate-sync',
                 deps,
                 postMergeHelpers(),
-            ));
+            );
 
             expect(deps.logSyncWarning).toHaveBeenCalledWith(
                 'File Sync attachment operation failed',
@@ -1980,45 +2016,42 @@ describe('desktop sync attachment backends', () => {
                     nativeCode: 'unknown',
                 }),
             );
-            // Replaced through the ordinary create-new + write + publish protocol, never
-            // written over in place.
-            expect(syncFsMocks.remove).toHaveBeenCalledWith(generationPath);
-            expect(syncFsMocks.reserveAttachmentGeneration).toHaveBeenCalledWith(
-                '',
-                generationPath,
-                bytes.byteLength,
-                BYTES_HASH,
+            expect(deps.logSyncWarning).toHaveBeenCalledWith(
+                'Preserved invalid File Sync attachment generation; refusing replacement',
+                undefined,
+                { releaseCheck: 'v1.3.2/file-generation-preserved' },
             );
-            expect(syncFsMocks.publishAttachmentGeneration).toHaveBeenCalledTimes(1);
-            expect(result.tasks[0].attachments?.[0]?.cloudKey).toBe(generationKey);
-            expect(result.tasks[0].attachments?.[0]?.deletedAt).toBeUndefined();
+            expect(result).toBe(false);
+            expect(syncFsMocks.remove).not.toHaveBeenCalled();
+            expect(syncFsMocks.reserveAttachmentGeneration).not.toHaveBeenCalled();
+            expect(syncFsMocks.publishAttachmentGeneration).not.toHaveBeenCalled();
+            expect(appData.tasks[0].attachments?.[0]?.cloudKey).toBeUndefined();
+            expect(appData.tasks[0].attachments?.[0]?.deletedAt).toBeUndefined();
         });
 
-        it('stops retrying a still-corrupt generation without tombstoning the attachment', async () => {
+        it('does not retry a preserved invalid generation again in the same session', async () => {
             const generationPath = `/candidate-sync/attachments/attachment-1.${BYTES_HASH}.txt`;
             const removals = () => syncFsMocks.remove.mock.calls.filter(([path]) => path === generationPath).length;
             stageCorruptGeneration();
 
             await syncFileAttachments(makePendingData(), '/candidate-sync', depsFor(), postMergeHelpers());
-            expect(removals()).toBe(1);
+            expect(removals()).toBe(0);
 
             const secondData = makePendingData();
             const secondDeps = depsFor();
             const second = await syncFileAttachments(secondData, '/candidate-sync', secondDeps, postMergeHelpers());
 
-            // One rewrite is the whole budget. Giving up must not touch the record: the local
-            // bytes are the good copy, so a tombstone here would lose them on every device.
+            // Preserving the generation must not touch the record: the local bytes are the
+            // good copy, so a tombstone here would lose them on every device.
             expect(second).toBe(false);
             expect(secondData.tasks[0].attachments?.[0]).toMatchObject({
                 cloudKey: 'attachments/attachment-1.txt',
                 localStatus: 'available',
             });
             expect(secondData.tasks[0].attachments?.[0]?.deletedAt).toBeUndefined();
-            expect(removals()).toBe(1);
-            expect(syncFsMocks.reserveAttachmentGeneration).toHaveBeenCalledTimes(1);
-            expect(secondDeps.logSyncWarning).toHaveBeenCalledWith(
-                'File Sync attachment generation stayed corrupt after a rewrite; leaving it alone until the next restart',
-            );
+            expect(removals()).toBe(0);
+            expect(syncFsMocks.reserveAttachmentGeneration).not.toHaveBeenCalled();
+            expect(secondDeps.logSyncWarning).not.toHaveBeenCalled();
 
             const settledReads = syncFsMocks.exists.mock.calls.length + syncFsMocks.stat.mock.calls.length;
             const thirdDeps = depsFor();
@@ -2032,23 +2065,33 @@ describe('desktop sync attachment backends', () => {
             // Nothing is read from or written to the sync folder for that generation again,
             // and the warning is not repeated every cycle.
             expect(syncFsMocks.exists.mock.calls.length + syncFsMocks.stat.mock.calls.length).toBe(settledReads);
-            expect(removals()).toBe(1);
+            expect(removals()).toBe(0);
             expect(thirdDeps.logSyncWarning).not.toHaveBeenCalled();
         });
 
-        it('grants one more rewrite after the attachment sync state is reset', async () => {
+        it('retries verification after the attachment sync state is reset without replacing the generation', async () => {
             const generationPath = `/candidate-sync/attachments/attachment-1.${BYTES_HASH}.txt`;
             const removals = () => syncFsMocks.remove.mock.calls.filter(([path]) => path === generationPath).length;
             stageCorruptGeneration();
 
             await syncFileAttachments(makePendingData(), '/candidate-sync', depsFor(), postMergeHelpers());
             await syncFileAttachments(makePendingData(), '/candidate-sync', depsFor(), postMergeHelpers());
-            expect(removals()).toBe(1);
+            const readsBeforeReset = syncFsMocks.stat.mock.calls.length;
+            expect(removals()).toBe(0);
 
             clearAttachmentSyncState();
-            await syncFileAttachments(makePendingData(), '/candidate-sync', depsFor(), postMergeHelpers());
+            const deps = depsFor();
+            await syncFileAttachments(makePendingData(), '/candidate-sync', deps, postMergeHelpers());
 
-            expect(removals()).toBe(2);
+            expect(syncFsMocks.stat.mock.calls.length).toBeGreaterThan(readsBeforeReset);
+            expect(removals()).toBe(0);
+            expect(syncFsMocks.reserveAttachmentGeneration).not.toHaveBeenCalled();
+            expect(syncFsMocks.publishAttachmentGeneration).not.toHaveBeenCalled();
+            expect(deps.logSyncWarning).toHaveBeenCalledWith(
+                'Preserved invalid File Sync attachment generation; refusing replacement',
+                undefined,
+                { releaseCheck: 'v1.3.2/file-generation-preserved' },
+            );
         });
 
         it('never rewrites a healthy existing generation', async () => {

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     applyNativeTheme,
+    applyStartupSystemThemeBeforeApp,
+    applySystemThemeChange,
     applyThemeMode,
     coerceDesktopThemeMode,
     coerceSystemThemePreference,
@@ -8,7 +10,7 @@ import {
     resolveNativeTheme,
     resolveSystemThemeCommandPreference,
     resolveSystemThemePreference,
-    watchSystemThemeCommandPreference,
+    watchSystemThemePortalPreference,
     watchNativeSystemThemePreference,
     watchSystemThemePreference,
 } from './theme';
@@ -149,11 +151,25 @@ describe('coerceDesktopThemeMode', () => {
 });
 
 describe('resolveNativeTheme', () => {
+    afterEach(() => vi.restoreAllMocks());
+
     it('reports the preset themes to the native window as dark', () => {
         expect(resolveNativeTheme('catppuccin-macchiato')).toBe('dark');
         expect(resolveNativeTheme('dracula')).toBe('dark');
         expect(resolveNativeTheme('sepia')).toBe('light');
-        expect(resolveNativeTheme('system')).toBeNull();
+    });
+
+    it('uses the resolved system preference for Linux GTK titlebars', () => {
+        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Linux');
+        expect(resolveNativeTheme('system', 'dark')).toBe('dark');
+        expect(resolveNativeTheme('system-oled', 'light')).toBe('light');
+        expect(resolveNativeTheme('system', 'light')).toBe('light');
+    });
+
+    it('leaves system theme native on other platforms', () => {
+        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows');
+        expect(resolveNativeTheme('system', 'dark')).toBeNull();
+        expect(resolveNativeTheme('system-oled', 'dark')).toBeNull();
     });
 });
 
@@ -164,7 +180,7 @@ describe('applyNativeTheme', () => {
         const theme = vi.fn(async () => 'dark' as const);
         const onThemeChanged = vi.fn(async () => vi.fn());
 
-        await applyNativeTheme(
+        const applied = await applyNativeTheme(
             'dark',
             async () => ({ setTheme: setAppTheme }),
             async () => ({ getCurrentWindow: () => ({ theme, onThemeChanged, setTheme: setWindowTheme }) }),
@@ -172,6 +188,7 @@ describe('applyNativeTheme', () => {
 
         expect(setAppTheme).toHaveBeenCalledWith('dark');
         expect(setWindowTheme).toHaveBeenCalledWith('dark');
+        expect(applied).toBe(true);
     });
 
     it('reports app and window theme errors independently', async () => {
@@ -179,7 +196,7 @@ describe('applyNativeTheme', () => {
         const windowError = new Error('window theme failed');
         const onError = vi.fn();
 
-        await applyNativeTheme(
+        const applied = await applyNativeTheme(
             'light',
             async () => ({ setTheme: vi.fn(async () => { throw appError; }) }),
             async () => ({
@@ -194,6 +211,7 @@ describe('applyNativeTheme', () => {
 
         expect(onError).toHaveBeenCalledWith('app', appError);
         expect(onError).toHaveBeenCalledWith('window', windowError);
+        expect(applied).toBe(false);
     });
 });
 
@@ -243,6 +261,59 @@ describe('watchSystemThemePreference', () => {
         expect(removeEventListener).toHaveBeenCalledWith('change', expect.any(Function));
         expect(listeners.size).toBe(0);
     });
+
+    it('updates both webview and Linux titlebar on a media fallback transition without repeating setter events', async () => {
+        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Linux');
+        let listener: ((event: { matches: boolean }) => void) | undefined;
+        window.matchMedia = vi.fn().mockImplementation(() => ({
+            matches: false,
+            addEventListener: (_event: string, callback: (event: { matches: boolean }) => void) => { listener = callback; },
+            removeEventListener: vi.fn(),
+        })) as typeof window.matchMedia;
+        const setAppTheme = vi.fn(async () => undefined);
+        const setWindowTheme = vi.fn(async () => undefined);
+        const stop = watchSystemThemePreference((theme) => applySystemThemeChange('system', theme, (resolved) => {
+            void applyNativeTheme(
+                resolveNativeTheme('system', resolved),
+                async () => ({ setTheme: setAppTheme }),
+                async () => ({ getCurrentWindow: () => ({
+                    theme: async () => resolved,
+                    onThemeChanged: async () => () => { },
+                    setTheme: setWindowTheme,
+                }) }),
+            );
+        }));
+
+        listener?.({ matches: true });
+        listener?.({ matches: true }); // GTK setting the same color must not recurse.
+        await flushMicrotasks();
+        expect(document.documentElement.classList.contains('dark')).toBe(true);
+        expect(setWindowTheme).toHaveBeenCalledTimes(1);
+        expect(setWindowTheme).toHaveBeenCalledWith('dark');
+
+        listener?.({ matches: false });
+        await flushMicrotasks();
+        expect(document.documentElement.classList.contains('dark')).toBe(false);
+        expect(setAppTheme).toHaveBeenNthCalledWith(2, 'light');
+        expect(setWindowTheme).toHaveBeenNthCalledWith(2, 'light');
+        stop();
+    });
+});
+
+describe('applyStartupSystemThemeBeforeApp', () => {
+    it('discards a delayed System result after App takes ownership of theme', async () => {
+        const deferred = createDeferred<'light' | 'dark' | null>();
+        let appOwnsTheme = false;
+        const apply = vi.fn();
+        const pending = applyStartupSystemThemeBeforeApp(deferred.promise, () => appOwnsTheme, apply);
+        appOwnsTheme = true;
+        deferred.resolve('light');
+        await pending;
+        expect(apply).not.toHaveBeenCalled();
+
+        await applyStartupSystemThemeBeforeApp(Promise.resolve('dark'), () => false, apply);
+        expect(apply).toHaveBeenCalledExactlyOnceWith('dark');
+    });
 });
 
 describe('coerceSystemThemePreference', () => {
@@ -284,60 +355,63 @@ describe('resolveSystemThemeCommandPreference', () => {
     });
 });
 
-describe('watchSystemThemeCommandPreference', () => {
-    beforeEach(() => {
-        vi.useFakeTimers();
-    });
-
+describe('watchSystemThemePortalPreference', () => {
     afterEach(() => {
-        disableNativeInvoke();
-        vi.useRealTimers();
         vi.restoreAllMocks();
     });
 
-    it('polls the native command fallback and forwards changed theme values', async () => {
-        const themes = ['dark', 'dark', 'light'];
-        const invoke = vi.fn(async () => themes.shift() ?? 'light');
+    it('forwards portal changes without polling and stops listening on cleanup', async () => {
+        let listener: ((event: { payload: unknown }) => void) | undefined;
+        const unlisten = vi.fn();
+        const listen = vi.fn(async (_event: string, callback: (event: { payload: unknown }) => void) => {
+            listener = callback;
+            return unlisten;
+        });
         const onChange = vi.fn();
-        enableNativeInvoke(invoke);
-
-        const stopWatching = watchSystemThemeCommandPreference(onChange, undefined, 1000);
+        const stopWatching = watchSystemThemePortalPreference(async () => ({ listen }), onChange);
+        await flushMicrotasks();
         await flushMicrotasks();
 
-        expect(invoke).toHaveBeenCalledWith('get_system_theme_preference', undefined);
+        expect(listen).toHaveBeenCalledWith('system-theme-portal-changed', expect.any(Function));
+        listener?.({ payload: 'dark' });
         expect(onChange).toHaveBeenCalledWith('dark');
-
-        await vi.advanceTimersByTimeAsync(1000);
+        listener?.({ payload: 'invalid' });
         expect(onChange).toHaveBeenCalledTimes(1);
-
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(onChange).toHaveBeenNthCalledWith(2, 'light');
-
         stopWatching();
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(invoke).toHaveBeenCalledTimes(3);
+        expect(unlisten).toHaveBeenCalledOnce();
+        listener?.({ payload: 'light' });
+        expect(onChange).toHaveBeenCalledTimes(1);
     });
 
-    it('reports poll failures without tearing the poll down', async () => {
-        const error = new Error('command failed');
+    it('reports subscription failures', async () => {
+        const error = new Error('subscription failed');
         const onError = vi.fn();
-        const invoke = vi.fn(async () => {
-            throw error;
-        });
-        enableNativeInvoke(invoke);
-
-        const stopWatching = watchSystemThemeCommandPreference(vi.fn(), onError, 1000);
+        const stopWatching = watchSystemThemePortalPreference(
+            async () => ({ listen: async () => { throw error; } }),
+            vi.fn(),
+            onError,
+        );
         await flushMicrotasks();
-
-        expect(onError).toHaveBeenCalledWith('resolveSystem', error);
-
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(invoke).toHaveBeenCalledTimes(2);
+        await flushMicrotasks();
+        expect(onError).toHaveBeenCalledWith('watch', error);
         stopWatching();
     });
 });
 
 describe('watchNativeSystemThemePreference', () => {
+    beforeEach(() => vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Windows'));
+    afterEach(() => vi.restoreAllMocks());
+
+    it('does not use GTK theme events as system preference on Linux', async () => {
+        vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Linux');
+        const loadWindowModule = vi.fn();
+        const onChange = vi.fn();
+        watchNativeSystemThemePreference(loadWindowModule, onChange)();
+        await flushMicrotasks();
+        expect(loadWindowModule).not.toHaveBeenCalled();
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
     it('does not touch the native window api after cleanup when the module resolves late', async () => {
         const windowModuleDeferred = createDeferred<NativeThemeWindowModule>();
         const theme = vi.fn<NativeThemeWindow['theme']>(async () => 'dark');

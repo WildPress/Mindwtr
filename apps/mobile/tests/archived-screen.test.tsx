@@ -200,12 +200,15 @@ vi.mock('react-native-gesture-handler', () => ({
 
 vi.mock('lucide-react-native', () => ({
   Archive: (props: any) => React.createElement('Archive', props),
+  Check: (props: any) => React.createElement('Check', props),
+  Trash2: (props: any) => React.createElement('Trash2', props),
   ArrowUpDown: (props: any) => React.createElement('ArrowUpDown', props),
   ChevronLeft: (props: any) => React.createElement('ChevronLeft', props),
   ChevronDown: (props: any) => React.createElement('ChevronDown', props),
   ChevronRight: (props: any) => React.createElement('ChevronRight', props),
   Folder: (props: any) => React.createElement('Folder', props),
   MoreHorizontal: (props: any) => React.createElement('MoreHorizontal', props),
+  RotateCcw: (props: any) => React.createElement('RotateCcw', props),
   Settings2: (props: any) => React.createElement('Settings2', props),
   SlidersHorizontal: (props: any) => React.createElement('SlidersHorizontal', props),
   X: (props: any) => React.createElement('X', props),
@@ -633,7 +636,7 @@ describe('ArchivedScreen', () => {
 
     expect(hasText(tree, '2 tasks')).toBe(true);
     typeSearch(tree, 'printer');
-    expect(hasText(tree, '1 tasks')).toBe(true);
+    expect(hasText(tree, '1 task')).toBe(true);
   });
 
   it('offers the search box while a filter is active even though nothing matches', () => {

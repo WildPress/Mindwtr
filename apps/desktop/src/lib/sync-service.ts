@@ -38,7 +38,9 @@ import {
     normalizeWebdavUrl,
     probeWebdavSyncCompatibility,
     normalizeCloudUrl,
-    runDataTransferTransactionWithoutSnapshot,
+    runDataTransferTransaction,
+    prepareRestoredBackupDataForSync,
+    validateBackupJson,
     runSerializedSyncDocumentOperation,
     runSerializedSyncDocumentWriteOperation,
     createSyncDocumentWriteAdmission,
@@ -99,6 +101,7 @@ import { isTauriRuntime } from './runtime';
 import { getTauriHttpFetch } from './tauri-http';
 import { invokeNative } from './tauri-invoke';
 import { reportError } from './report-error';
+import { showSyncErrorToast } from './sync-error-toast';
 import { logInfo, logSyncError, logWarn, sanitizeLogMessage } from './app-log';
 import { useUiStore } from '../store/ui-store';
 import { markLocalSqliteWrite, markLocalWrite } from './local-data-watcher';
@@ -141,6 +144,7 @@ import {
     isSyncEncryptionFailure,
     markRemoteSyncEncryptionDiscovered,
     markRemoteSyncEncryptionPlaintext,
+    restoreVerifiedRemoteSyncEncryption,
     runChangePassphraseOverRemote,
     runDisableLocalOnly,
     runDisableOverRemote,
@@ -622,10 +626,11 @@ const releaseFileSyncLease = async (token: string): Promise<void> => {
     }
 };
 
-type LocalDataSaveOptions = {
-    baseline?: AppData;
-    mode?: 'exact';
-};
+// An exact save replaces every local row, so it must name the data it
+// replaces; native refuses it otherwise.
+type LocalDataSaveOptions =
+    | { baseline?: AppData; mode?: undefined; expectedData?: undefined }
+    | { baseline?: undefined; mode: 'exact'; expectedData: AppData };
 
 async function persistLocalDataForSync(
     data: AppData,
@@ -642,6 +647,7 @@ async function persistLocalDataForSync(
     const args: Record<string, unknown> = { data };
     if (baselineEntities) args.baselineEntities = baselineEntities;
     if (options.mode) args.mode = options.mode;
+    if (options.expectedData) args.expectedData = options.expectedData;
     const canonical = await invokeSyncNative<AppData>('save_data', args);
     // The sync store receives this target. Do not make canonical-only,
     // concurrently added rows eligible for omission before a persisted read.
@@ -1150,7 +1156,7 @@ export class SyncService {
                 logSyncWarning('Queued sync failed', queuedResult.error);
                 try {
                     const message = resolveSyncFailureMessage(queuedResult.error);
-                    useUiStore.getState().showToast(message, 'error', 6000);
+                    showSyncErrorToast(message, 6000);
                 } catch {
                     // UI store may be unavailable during shutdown/tests.
                 }
@@ -2657,6 +2663,13 @@ export class SyncService {
         const encryptionPosture: SyncEncryptionPosture = {
             material: encryptionMaterial,
             logRemoteRead: logSyncEncryptionRemoteRead,
+            onRemoteEncryptionVerified: async (material) => {
+                if (await restoreVerifiedRemoteSyncEncryption(material, desktopSyncLocationScope(context))) {
+                    logSyncInfo('Verified encrypted remote cleared stale plaintext state', {
+                        releaseCheck: 'v1.3.3/encrypted-remote-recovery',
+                    });
+                }
+            },
             onRemotePlaintextDiscovered: () => markRemoteSyncEncryptionPlaintext(
                 desktopSyncLocationScope(context),
             ),
@@ -3135,11 +3148,15 @@ export class SyncService {
                 await syncServiceDependencies.flushPendingSave();
                 const leaseToken = await acquireFileSyncLease();
                 try {
+                    // Read local data first: native replaces it only if it is
+                    // unchanged, so a capture (MCP, Local API) that lands
+                    // while the external file is read survives.
+                    const expectedData = await invokeSyncNative<AppData>('get_data');
                     const externalData = normalizeAppData(await invokeSyncNative<AppData>(
                         'read_sync_file',
                         { leaseToken },
                     ));
-                    await persistLocalDataForSync(externalData, { mode: 'exact' });
+                    await persistLocalDataForSync(externalData, { mode: 'exact', expectedData });
                     await getStoreState().fetchData({ silent: true });
                     const now = new Date().toISOString();
                     const nextHistory = appendSyncHistory(getStoreState().settings, {
@@ -3380,18 +3397,36 @@ export class SyncService {
         if (!isTauriRuntimeEnv()) return { success: false, error: 'Desktop runtime is required.' };
         try {
             const writeAdmission = createSyncDocumentWriteAdmission();
-            await runSyncRestoreExclusive(() => runDataTransferTransactionWithoutSnapshot({
+            let expectedData: AppData | undefined;
+            await runSyncRestoreExclusive(() => runDataTransferTransaction({
                 operation: 'restoreDataSnapshot',
                 writeAdmission,
                 flushPendingSave: syncServiceDependencies.flushPendingSave,
                 getCurrentChangeAt: () => getStoreState().lastDataChangeAt,
                 readCurrentData: () => invokeSyncNative<AppData>('get_data'),
-                apply: (data) => ({ data, result: null }),
-                persistData: async () => {
-                    await invokeSyncNative<boolean>('restore_data_snapshot', { snapshotFileName });
+                apply: async (currentData) => {
+                    expectedData = currentData;
+                    const snapshot = await invokeSyncNative<AppData>('read_data_snapshot', { snapshotFileName });
+                    const validation = validateBackupJson(JSON.stringify(snapshot), { fileName: snapshotFileName });
+                    if (!validation.valid || !validation.data) {
+                        throw new Error(validation.errors[0] || 'Snapshot is not a valid backup.');
+                    }
+                    return {
+                        data: prepareRestoredBackupDataForSync(validation.data, { previousData: currentData }),
+                        result: null,
+                    };
                 },
-                refreshData: () => getStoreState().fetchData({ silent: true }),
+                createRecoverySnapshot: () => invokeSyncNative<string>('create_data_snapshot'),
+                persistData: async (data) => {
+                    if (!expectedData) throw new Error('Snapshot restore did not read local data first.');
+                    await persistLocalDataForSync(data, { mode: 'exact', expectedData });
+                },
+                refreshData: () => getStoreState().fetchData({ silent: true, throwOnError: true }),
             }));
+            void syncServiceDependencies.logInfo('Recovery snapshot restore committed', {
+                scope: 'sync',
+                extra: { releaseCheck: 'v1.3.3/restore-snapshot-sync' },
+            }).catch(() => undefined);
             return { success: true };
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);

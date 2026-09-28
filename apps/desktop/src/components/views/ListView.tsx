@@ -1,6 +1,6 @@
 import React, { memo, useState, useMemo, useDeferredValue, useEffect, useRef, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { AlertTriangle, ChevronDown, ChevronRight, Folder, HelpCircle } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Folder, HelpCircle, Sparkles } from 'lucide-react';
 import { buildProjectOrderMap,
     buildQuickAddParseOptions,
     buildQuickAddPreviewEntries,
@@ -11,6 +11,7 @@ import { buildProjectOrderMap,
     DEFAULT_AREA_COLOR,
     executeCaptureTransaction,
     formatTimeEstimateLabel,
+    getListSearchChipLabel,
     getQuickAddProjectInitialProps,
     getTaskMetadataFilterVisibility,
     getWaitingPerson,
@@ -20,6 +21,8 @@ import { buildProjectOrderMap,
     parseQuickAdd,
     getDefaultTaskAreaMode,
     getPersonOptionNames,
+    getRetainedTaskContexts,
+    getUsedTaskTokens,
     resolveDefaultNewTaskAreaId,
     formatQuickAddHelp,
     resolveFeatureFlags,
@@ -34,6 +37,7 @@ import { buildProjectOrderMap,
     resolveI18nText,
     useTaskStore, tFallback,
     baseTextCollator,
+    formatI18nTemplate,
 } from '@mindwtr/core';
 import type { FilterCriteria, Task, TaskStatus } from '@mindwtr/core';
 import type { BulkOrganizeTaskUpdateInput } from '@mindwtr/core';
@@ -165,6 +169,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
         highlightTaskId: state.highlightTaskId,
     }), shallow);
     const settings = useTaskStore((state) => state.settings);
+    const retainedQuickAddTasks = useTaskStore((state) => statusFilter === 'inbox' ? state._allTasks : null);
     const {
         updateSettings,
         addTask,
@@ -194,7 +199,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
         getDerivedState: state.getDerivedState,
         setHighlightTask: state.setHighlightTask,
     }), shallow);
-    const { t } = useLanguage();
+    const { t, language } = useLanguage();
     const { registerTaskListScope } = useKeybindings();
     const globalSortBy = (settings?.taskSortBy ?? 'default') as TaskSortBy;
     const density = settings?.appearance?.density ?? 'comfortable';
@@ -363,13 +368,24 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
         // not occur in this view visible so they can still be removed here.
         return Array.from(new Set([...offered, ...selectedTokens, ...excludedTokens])).sort();
     }, [allContexts, allTags, excludedTokens, isReferenceView, listFilterableTasks, selectedTokens]);
+    const filterTokens = useMemo(() => Array.from(new Set([
+        ...getUsedTaskTokens(listFilterableTasks, (task) => isReferenceView
+            ? task.tags
+            : [...(task.contexts ?? []), ...(task.tags ?? [])], { includeAncestors: true }),
+        ...selectedTokens,
+        ...excludedTokens,
+    ])).sort(), [excludedTokens, isReferenceView, listFilterableTasks, selectedTokens]);
     const personOptionNames = useMemo(
         () => getPersonOptionNames(people, tasks),
         [people, tasks],
     );
+    const quickAddContextHistory = useMemo(
+        () => retainedQuickAddTasks ? getRetainedTaskContexts(retainedQuickAddTasks) : [],
+        [retainedQuickAddTasks],
+    );
     const quickAddParseOptions = useMemo(
-        () => buildQuickAddParseOptions(settings, { tasks, people }),
-        [people, tasks, settings],
+        () => buildQuickAddParseOptions(settings, { tasks, _allTasks: retainedQuickAddTasks ?? undefined, people }),
+        [people, retainedQuickAddTasks, tasks, settings],
     );
 
     const {
@@ -381,6 +397,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
         applyCopilotSuggestion,
         resetCopilot,
     } = useListCopilot({
+        language,
         settings,
         newTaskTitle,
         allContexts,
@@ -903,9 +920,10 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                 }
             };
             const undo = registerUndoableAction(() => { void runUndo(); });
-            const message = tFallback(t, 'viewSections.moved', 'Moved to {section} ({count})')
-                .replace('{count}', String(move.changedCount))
-                .replace('{section}', move.destinationTitle);
+            const message = formatI18nTemplate(tFallback(t, 'viewSections.moved', 'Moved to {section} ({count})'), {
+                count: move.changedCount,
+                section: move.destinationTitle,
+            });
             showToast(message, 'success', 5000, {
                 label: tFallback(t, 'common.undo', 'Undo'),
                 onClick: undo,
@@ -928,8 +946,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
     const getSomedayAddTaskLabel = useCallback((group: TaskGroup) => (
         group.id === 'view-section:someday:none'
             ? undefined
-            : tFallback(t, 'viewSections.addTask', 'Add task to {section}')
-                .replace('{section}', group.title)
+            : formatI18nTemplate(tFallback(t, 'viewSections.addTask', 'Add task to {section}'), { section: group.title })
     ), [t]);
     const bulkAreaOptions = [...areas]
         .sort(compareAreasByOrder)
@@ -1051,9 +1068,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
     if (normalizedSearchQuery) {
         activeFilterChips.push({
             id: 'search',
-            // Reference searches more than titles, so its existing generic label
-            // is intentionally preserved.
-            label: `${t('common.search')}: ${searchQuery.trim()}`,
+            label: getListSearchChipLabel(searchQuery.trim(), t),
             onRemove: () => setSearchQuery(''),
         });
     }
@@ -1158,6 +1173,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                 showQuickDone={showQuickDone}
                 readOnly={readOnly}
                 compactMetaEnabled={showListDetails}
+                enableDoubleClickEdit
                 showProjectBadgeInActions={false}
                 interactionDisabled={isHistoricalReference}
                 onMoveToSomedaySection={statusFilter === 'someday' ? openSomedayMove : undefined}
@@ -1420,7 +1436,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                                 setSelectedWaitingPerson('');
                                 setIncludeArchivedReferenceProjects(false);
                             }}
-                            allTokens={allTokens}
+                            allTokens={filterTokens}
                             selectedTokens={selectedTokens}
                             excludedTokens={excludedTokens}
                             tokenCounts={tokenCounts}
@@ -1454,6 +1470,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                                 projects={projects}
                                 areas={areas}
                                 contexts={allTokens}
+                                contextHistory={quickAddContextHistory}
                                 people={personOptionNames}
                                 t={t}
                                 dense={densityMode !== 'comfortable'}
@@ -1472,7 +1489,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                             />
                             {aiEnabled && pendingCopilotParts.length > 0 && (
                                 <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground">
-                                    <span>✨ {t('copilot.suggested')}</span>
+                                    <span className="inline-flex items-center gap-1"><Sparkles className="h-3 w-3 shrink-0" aria-hidden="true" />{t('copilot.suggested')}</span>
                                     {pendingCopilotParts.map((part) => (
                                         <button
                                             key={`${part.kind}:${part.value}`}
@@ -1497,7 +1514,7 @@ export const ListView = memo(function ListView({ title, statusFilter }: ListView
                             )}
                             {aiEnabled && (copilotContext || copilotTags.length > 0) && (
                                 <div className="mt-2 rounded border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground">
-                                    ✅ {t('copilot.applied')}{' '}
+                                    <Check className="mr-1 inline h-3 w-3 align-[-0.125em]" aria-hidden="true" />{t('copilot.applied')}{' '}
                                     {copilotContext ? `${copilotContext} ` : ''}
                                     {copilotTags.length ? copilotTags.join(' ') : ''}
                                 </div>

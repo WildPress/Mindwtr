@@ -133,6 +133,11 @@ const makeTask = (attachment: Attachment): Task => ({
 
 type HarnessApi = {
   attachments: Attachment[];
+  linkInput: string;
+  openAddLinkAttachment: ReturnType<typeof useTaskEditAttachments>['openAddLinkAttachment'];
+  editLinkAttachment: ReturnType<typeof useTaskEditAttachments>['editLinkAttachment'];
+  setLinkInput: ReturnType<typeof useTaskEditAttachments>['setLinkInput'];
+  confirmAddLink: ReturnType<typeof useTaskEditAttachments>['confirmAddLink'];
   audioAttachment: Attachment | null;
   audioModalVisible: boolean;
   downloadAttachment: ReturnType<typeof useTaskEditAttachments>['downloadAttachment'];
@@ -166,6 +171,11 @@ function Harness({ expose, initial, taskId = 'task-1', canMutate = () => true }:
   });
   expose.current = {
     attachments,
+    linkInput: hook.linkInput,
+    openAddLinkAttachment: hook.openAddLinkAttachment,
+    editLinkAttachment: hook.editLinkAttachment,
+    setLinkInput: hook.setLinkInput,
+    confirmAddLink: hook.confirmAddLink,
     audioAttachment: hook.audioAttachment,
     audioModalVisible: hook.audioModalVisible,
     downloadAttachment: hook.downloadAttachment,
@@ -186,6 +196,33 @@ describe('useTaskEditAttachments download settlement', () => {
     useTaskStore.setState({ _allTasks: [] });
   });
 
+  it('adds an entire link paste to the draft, rejects an invalid later line, and edits one id', () => {
+    const initial = makeAttachment(1, { kind: 'link', uri: 'https://old.example', title: 'Old' });
+    const expose = React.createRef<HarnessApi | null>();
+    let tree!: ReturnType<typeof create>;
+    act(() => { tree = create(<Harness expose={expose} initial={initial} />); });
+    act(() => { expose.current!.openAddLinkAttachment(); });
+    act(() => { expose.current!.setLinkInput('https://one.example\n\nTwo | https://two.example'); });
+    act(() => { expose.current!.confirmAddLink(); });
+    expect(expose.current!.attachments.map((item) => item.uri)).toEqual([
+      'https://old.example', 'https://one.example', 'https://two.example',
+    ]);
+
+    act(() => { expose.current!.openAddLinkAttachment(); });
+    act(() => { expose.current!.setLinkInput('https://three.example\ninvalid line'); });
+    act(() => { expose.current!.confirmAddLink(); });
+    expect(expose.current!.attachments).toHaveLength(3);
+    expect(expose.current!.linkInput).toBe('https://three.example\ninvalid line');
+    expect(Alert.alert).toHaveBeenCalledWith('attachments.title', expect.any(String));
+
+    act(() => { expose.current!.editLinkAttachment(initial); });
+    act(() => { expose.current!.setLinkInput('https://edited.example'); });
+    act(() => { expose.current!.confirmAddLink(); });
+    expect(expose.current!.attachments).toHaveLength(3);
+    expect(expose.current!.attachments[0]).toMatchObject({ id: initial.id, uri: 'https://edited.example' });
+    act(() => tree.unmount());
+  });
+
   it('explains a desktop file link instead of handing another device\'s path to the OS', async () => {
     // "Link to file…" on the desktop stores that computer's path; Android used
     // to call Linking.openURL('D:\\Documents\\x.docx') and fail silently (#1001).
@@ -201,6 +238,20 @@ describe('useTaskEditAttachments download settlement', () => {
 
     expect(Linking.openURL).not.toHaveBeenCalled();
     expect(Alert.alert).toHaveBeenCalledWith('attachments.title', expect.stringContaining('another device'));
+    act(() => tree.unmount());
+  });
+
+  it('names another device\'s file path literally, even with $ replacement patterns', async () => {
+    const attachment = { ...makeAttachment(1), kind: 'link' as const, uri: 'D:\\Docs\\a$&b$$.docx', mimeType: undefined };
+    useTaskStore.setState({ _allTasks: [makeTask(attachment)] });
+    availabilityMock.ensureAttachmentAvailableDetailed.mockResolvedValue({ status: 'available', attachment });
+    const expose = React.createRef<HarnessApi | null>();
+    let tree!: ReturnType<typeof create>;
+    act(() => { tree = create(<Harness expose={expose} initial={attachment} />); });
+
+    await act(async () => { await expose.current!.openAttachment(attachment); });
+
+    expect(Alert.alert).toHaveBeenCalledWith('attachments.title', expect.stringContaining('another device: D:\\Docs\\a$&b$$.docx.'));
     act(() => tree.unmount());
   });
 

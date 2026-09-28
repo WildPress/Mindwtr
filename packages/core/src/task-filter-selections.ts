@@ -6,6 +6,7 @@ import {
   selectionsFromCriteria,
 } from './filter-criteria';
 import { tFallback } from './i18n';
+import { getListSearchChipLabel } from './list-filter-state';
 import { hasActiveFilterCriteria, taskMatchesFilterCriteria } from './saved-filters';
 import { matchesTask as taskMatchesSearchTerm, parseSearchQuery } from './search';
 import type { TaskMetadataFilterVisibility } from './task-metadata-filter-visibility';
@@ -22,7 +23,7 @@ import type {
 /**
  * Filter selections shared by desktop and mobile picker surfaces. Criteria
  * live in filter-criteria; this hook owns the picker state around them — the
- * tri-state token cycle, visibility pruning, chips, and saved-filter binding.
+ * tri-state token cycle, metadata visibility, chips, and saved-filter binding.
  */
 
 export type TaskFilterView = 'focus' | 'list';
@@ -44,7 +45,7 @@ export type TaskFilterSelectionsOptions = {
   visibility: TaskMetadataFilterVisibility;
   /** Saved filters for this view, already filtered to non-deleted ones. */
   savedFilters?: SavedFilter[];
-  /** Token chips currently offered; selections outside the list are dropped. */
+  /** Offered tokens from older callers; explicit selections remain clearable when absent. */
   retainTokens?: string[];
   /** Project ids currently offered; selections outside the list are dropped. */
   retainProjects?: string[];
@@ -115,7 +116,6 @@ export function useTaskFilterSelections({
   t,
   visibility,
   savedFilters,
-  retainTokens,
   retainProjects,
   getProjectLabel,
   onClear,
@@ -146,33 +146,24 @@ export function useTaskFilterSelections({
 
   // Selections whose section is no longer offered stop filtering silently:
   // drop them so a later re-appearance does not resurrect a hidden filter.
+  // The selections are dependencies too: an applied saved filter can select
+  // what the view already hides or does not offer.
   useEffect(() => {
     if (!visibility.priority) setPriorities((current) => (current.length > 0 ? [] : current));
-  }, [visibility.priority]);
+  }, [priorities, visibility.priority]);
   useEffect(() => {
     if (!visibility.energyLevel) setEnergyLevels((current) => (current.length > 0 ? [] : current));
-  }, [visibility.energyLevel]);
+  }, [energyLevels, visibility.energyLevel]);
   useEffect(() => {
     if (!visibility.timeEstimate) setTimeEstimates((current) => (current.length > 0 ? [] : current));
-  }, [visibility.timeEstimate]);
+  }, [timeEstimates, visibility.timeEstimate]);
   useEffect(() => {
     if (!visibility.location) setLocationQuery((current) => (current.trim() ? '' : current));
-  }, [visibility.location]);
-  useEffect(() => {
-    if (!retainTokens) return;
-    setTokenSelection((current) => {
-      const offered = (token: string) => retainTokens.includes(token);
-      const included = stableFilter(current.included, offered);
-      const excluded = stableFilter(current.excluded, offered);
-      return included === current.included && excluded === current.excluded
-        ? current
-        : { included, excluded };
-    });
-  }, [retainTokens]);
+  }, [locationQuery, visibility.location]);
   useEffect(() => {
     if (!retainProjects) return;
     setProjects((current) => stableFilter(current, (projectId) => retainProjects.includes(projectId)));
-  }, [retainProjects]);
+  }, [projects, retainProjects]);
 
   const toggleToken = useCallback((token: string) => {
     setActiveSavedFilterId(null);
@@ -190,6 +181,14 @@ export function useTaskFilterSelections({
       }
       return { included: [...current.included, token], excluded: current.excluded };
     });
+  }, []);
+
+  const removeToken = useCallback((token: string) => {
+    setActiveSavedFilterId(null);
+    setTokenSelection((current) => ({
+      included: current.included.filter((item) => item !== token),
+      excluded: current.excluded.filter((item) => item !== token),
+    }));
   }, []);
 
   const toggleProject = useCallback((projectId: string) => {
@@ -317,19 +316,19 @@ export function useTaskFilterSelections({
     if (normalizedSearch) {
       result.push({
         id: 'search',
-        label: `${t('common.search')}: ${normalizedSearch}`,
+        label: getListSearchChipLabel(normalizedSearch, t),
         onPress: () => setSearchQuery(''),
       });
     }
     tokens.forEach((token) => {
-      result.push({ id: `token:${token}`, label: token, onPress: () => toggleToken(token) });
+      result.push({ id: `token:${token}`, label: token, onPress: () => removeToken(token) });
     });
     excludedTokens.forEach((token) => {
       result.push({
         id: `excluded-token:${token}`,
         label: token,
         excluded: true,
-        onPress: () => toggleToken(token),
+        onPress: () => removeToken(token),
       });
     });
     projects.forEach((projectId) => {
@@ -381,6 +380,7 @@ export function useTaskFilterSelections({
     excludedTokens,
     getProjectLabel,
     locationQuery,
+    removeToken,
     priorities,
     projects,
     searchQuery,
@@ -391,7 +391,6 @@ export function useTaskFilterSelections({
     togglePriority,
     toggleProject,
     toggleTimeEstimate,
-    toggleToken,
     tokens,
     visibility.energyLevel,
     visibility.location,
@@ -430,6 +429,7 @@ export function useTaskFilterSelections({
     setLocation,
     setMatchMode,
     toggleToken,
+    removeToken,
     toggleProject,
     togglePriority,
     toggleEnergyLevel,

@@ -925,6 +925,15 @@ fn write_initial_data_json_file(data_path: &Path, data: &Value) -> Result<bool, 
 
 const ENTITY_TABLES: [&str; 5] = ["tasks", "projects", "sections", "areas", "people"];
 
+// Every foreign key in SQLITE_SCHEMA, keyed by the table it points at, as
+// (child table, child column). Twin of core ENTITY_FOREIGN_KEY_CHILDREN; a test
+// compares it with PRAGMA foreign_key_list and with the core list.
+const ENTITY_FOREIGN_KEY_CHILDREN: [(&str, &[(&str, &str)]); 3] = [
+    ("sections", &[("tasks", "sectionId")]),
+    ("projects", &[("tasks", "projectId"), ("sections", "projectId")]),
+    ("areas", &[("tasks", "areaId"), ("projects", "areaId")]),
+];
+
 fn count_incoming_entities(data: &Value) -> usize {
     ENTITY_TABLES
         .iter()
@@ -988,8 +997,16 @@ fn persist_data_snapshot(
     ensure_data_file(app)?;
     let mut conn = open_sqlite(app)?;
     refuse_empty_snapshot_overwrite(&conn, data, baseline_entities)?;
-    let (canonical, retained) =
+    let (canonical, retained, kept_live) =
         merge_json_to_sqlite_with_retained_tasks(&mut conn, data, baseline_entities)?;
+    for (table, count) in kept_live {
+        // Proof the omission guard ran: counts only, never row content or ids.
+        let line = format!(
+            "SQLite save kept live rows the snapshot omitted extra.releaseCheck=v1.3.3/desktop-kept-omitted-live-rows table={table} count={count}"
+        );
+        log::info!("{line}");
+        crate::logging::append_native_log_line(app, &line);
+    }
     static REPORTED_APPEND_SNAPSHOT: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     if retained > 0 && !REPORTED_APPEND_SNAPSHOT.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1024,10 +1041,14 @@ fn persist_data_snapshot(
     Ok(refresh_data_json_from_sqlite(&conn, &get_data_path(app)).unwrap_or(canonical))
 }
 
-fn persist_data_snapshot_exact(app: &tauri::AppHandle, data: &Value) -> Result<Value, String> {
+fn persist_data_snapshot_exact(
+    app: &tauri::AppHandle,
+    data: &Value,
+    expected_data: Option<&Value>,
+) -> Result<Value, String> {
     ensure_data_file(app)?;
     let mut conn = open_sqlite(app)?;
-    let canonical = replace_json_in_sqlite(&mut conn, data)?;
+    let canonical = replace_json_in_sqlite_if_unchanged(&mut conn, data, expected_data)?;
     Ok(refresh_data_json_from_sqlite(&conn, &get_data_path(app)).unwrap_or(canonical))
 }
 
@@ -1117,9 +1138,10 @@ pub(crate) fn persist_data_snapshot_with_retries(
 fn persist_data_snapshot_exact_with_retries(
     app: &tauri::AppHandle,
     data: &Value,
+    expected_data: Option<&Value>,
 ) -> Result<Value, String> {
     for attempt in 0..STORAGE_RETRY_ATTEMPTS {
-        match persist_data_snapshot_exact(app, data) {
+        match persist_data_snapshot_exact(app, data, expected_data) {
             Ok(canonical) => return Ok(canonical),
             Err(error) => {
                 let can_retry =
@@ -1855,7 +1877,8 @@ fn build_fts_query(input: &str) -> Option<String> {
     let tokens: Vec<String> = cleaned
         .split_whitespace()
         .filter(|t| !t.is_empty())
-        .map(|t| format!("{}*", t))
+        // Cleaning excludes quotes; quote tokens so @/# remain literal FTS5 text (#1264).
+        .map(|t| format!("\"{}\"*", t))
         .collect();
     if tokens.is_empty() {
         None
@@ -3003,13 +3026,15 @@ fn entities_by_id(entities: &[Value]) -> HashMap<&str, &Value> {
         .collect()
 }
 
+/// Returns the merged rows and how many omitted live rows it kept.
 fn merge_entity_snapshots(
     current: &[Value],
     incoming: &[Value],
     changed_baseline: &[Value],
     observed_ids: &HashSet<&str>,
+    referenced_ids: &HashSet<String>,
     merge_now: i128,
-) -> Vec<Value> {
+) -> (Vec<Value>, usize) {
     let incoming_by_id = entities_by_id(incoming);
     let baseline_by_id = entities_by_id(changed_baseline);
     let current_ids: HashMap<&str, ()> = current
@@ -3017,6 +3042,7 @@ fn merge_entity_snapshots(
         .filter_map(|entity| entity.get("id").and_then(Value::as_str).map(|id| (id, ())))
         .collect();
     let mut merged = Vec::with_capacity(current.len().max(incoming.len()));
+    let mut kept_live = 0;
 
     for canonical in current {
         let Some(id) = canonical.get("id").and_then(Value::as_str) else {
@@ -3044,10 +3070,21 @@ fn merge_entity_snapshots(
             }
             Some(_) => merged.push(canonical.clone()),
             // Omission is a physical removal only when it is a CAS against
-            // the exact row the caller observed. Unseen/concurrently changed
+            // the exact row the caller observed, that row is a tombstone, and
+            // no remaining row references it (removing a referenced parent
+            // would make storage repair the child without its owner's edit).
+            // Mindwtr deletes by tombstone, so an omitted LIVE row means a
+            // stale snapshot, never a delete. Unseen/concurrently changed
             // rows remain intact.
-            None if baseline_matches => {}
-            None => merged.push(canonical.clone()),
+            None if baseline_matches
+                && entity_is_deleted(canonical)
+                && !referenced_ids.contains(id) => {}
+            None => {
+                if baseline_matches && !entity_is_deleted(canonical) {
+                    kept_live += 1;
+                }
+                merged.push(canonical.clone())
+            }
         }
     }
 
@@ -3067,9 +3104,10 @@ fn merge_entity_snapshots(
             merged.push(entity.clone());
         }
     }
-    merged
+    (merged, kept_live)
 }
 
+#[cfg(test)]
 fn merge_data_snapshots(
     current: &Value,
     incoming: &Value,
@@ -3079,14 +3117,29 @@ fn merge_data_snapshots(
     merge_data_snapshots_at(current, incoming, baseline_entities, merge_now)
 }
 
+#[cfg(test)]
 fn merge_data_snapshots_at(
     current: &Value,
     incoming: &Value,
     baseline_entities: Option<&Value>,
     merge_now: i128,
 ) -> Value {
+    merge_data_snapshots_reporting_kept_at(current, incoming, baseline_entities, merge_now).0
+}
+
+/// Also returns, per table, how many live rows the incoming snapshot omitted
+/// and the merge kept.
+fn merge_data_snapshots_reporting_kept_at(
+    current: &Value,
+    incoming: &Value,
+    baseline_entities: Option<&Value>,
+    merge_now: i128,
+) -> (Value, Vec<(&'static str, usize)>) {
     let mut merged = incoming.as_object().cloned().unwrap_or_default();
-    for key in ENTITY_TABLES {
+    let mut kept_live = Vec::new();
+    // Children before parents, so a parent's references come from the
+    // children that survive this merge.
+    for key in ["tasks", "sections", "projects", "areas", "people"] {
         let current_entities = current
             .get(key)
             .and_then(Value::as_array)
@@ -3110,16 +3163,31 @@ fn merge_data_snapshots_at(
             .flatten()
             .filter_map(Value::as_str)
             .collect::<HashSet<_>>();
-        merged.insert(
-            key.to_string(),
-            Value::Array(merge_entity_snapshots(
-                current_entities,
-                incoming_entities,
-                changed_baseline,
-                &observed_ids,
-                merge_now,
-            )),
+        let referenced_ids = ENTITY_FOREIGN_KEY_CHILDREN
+            .iter()
+            .filter(|(parent, _)| *parent == key)
+            .flat_map(|(_, children)| children.iter())
+            .flat_map(|(child, column)| {
+                merged
+                    .get(*child)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entity| optional_id(entity.get(*column)))
+            })
+            .collect::<HashSet<_>>();
+        let (entities, kept) = merge_entity_snapshots(
+            current_entities,
+            incoming_entities,
+            changed_baseline,
+            &observed_ids,
+            &referenced_ids,
+            merge_now,
         );
+        if kept > 0 {
+            kept_live.push((key, kept));
+        }
+        merged.insert(key.to_string(), Value::Array(entities));
     }
     // Settings are one explicit, unsynced document rather than revisioned
     // entities. Legacy/migration callers without a baseline retain replacement
@@ -3142,8 +3210,59 @@ fn merge_data_snapshots_at(
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new())),
         );
+    } else if let Some(settings) = merged.get_mut("settings") {
+        let kept = keep_omitted_live_saved_filters(current.get("settings"), settings);
+        if kept > 0 {
+            kept_live.push(("saved_filters", kept));
+        }
     }
-    Value::Object(merged)
+    (Value::Object(merged), kept_live)
+}
+
+/// Core parity (sqlite-adapter saved_filters): saved filters delete by
+/// tombstone, so a settings write that omits a live saved filter came from a
+/// stale snapshot. Append each such filter after the incoming list, verbatim
+/// and in stored order; an omitted tombstone filter is dropped. Returns how
+/// many filters it kept.
+fn keep_omitted_live_saved_filters(current_settings: Option<&Value>, settings: &mut Value) -> usize {
+    let Some(stored) = current_settings
+        .and_then(|settings| settings.get("savedFilters"))
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+    let Some(settings) = settings.as_object_mut() else {
+        return 0;
+    };
+    let incoming_ids = settings
+        .get("savedFilters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|filter| filter.get("id").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let kept = stored
+        .iter()
+        .filter(|filter| {
+            !entity_is_deleted(filter)
+                && filter
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty() && !incoming_ids.contains(id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let count = kept.len();
+    if count == 0 {
+        return 0;
+    }
+    match settings.get_mut("savedFilters") {
+        Some(Value::Array(filters)) => filters.extend(kept),
+        _ => {
+            settings.insert("savedFilters".to_string(), Value::Array(kept));
+        }
+    }
+    count
 }
 
 fn normalize_revision_metadata_in_data(data: &mut Value) {
@@ -3467,7 +3586,7 @@ fn merge_json_to_sqlite(
     data: &Value,
     baseline_entities: Option<&Value>,
 ) -> Result<Value, String> {
-    merge_json_to_sqlite_with_retained_tasks(conn, data, baseline_entities).map(|(data, _)| data)
+    merge_json_to_sqlite_with_retained_tasks(conn, data, baseline_entities).map(|(data, _, _)| data)
 }
 
 // A deliberately narrow optimization after normal merge/revision/CAS arbitration
@@ -3530,22 +3649,29 @@ fn write_merged_snapshot_in_transaction(
     replace_prepared_data_in_transaction(conn, merged).map(|data| (data, 0))
 }
 
+/// Returns the canonical data, the retained task count of an append-only
+/// save, and per table the omitted live rows the merge kept.
 fn merge_json_to_sqlite_with_retained_tasks(
     conn: &mut Connection,
     data: &Value,
     baseline_entities: Option<&Value>,
-) -> Result<(Value, usize), String> {
+) -> Result<(Value, usize, Vec<(&'static str, usize)>), String> {
     // Acquire the cross-process writer lock before reloading. A stale whole
     // snapshot can then merge with canonical rows without erasing an MCP,
     // CLI, or Local API write committed after the snapshot was captured.
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| e.to_string())?;
-    let result: Result<(Value, usize), String> = (|| {
+    let result: Result<(Value, usize, Vec<(&'static str, usize)>), String> = (|| {
         let current = read_sqlite_data(conn)?;
-        let merged = merge_data_snapshots(&current, data, baseline_entities);
-        let result = write_merged_snapshot_in_transaction(conn, &current, merged)?;
+        let (merged, kept_live) = merge_data_snapshots_reporting_kept_at(
+            &current,
+            data,
+            baseline_entities,
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        );
+        let (canonical, retained) = write_merged_snapshot_in_transaction(conn, &current, merged)?;
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
-        Ok(result)
+        Ok((canonical, retained, kept_live))
     })();
     if result.is_err() {
         let _ = conn.execute_batch("ROLLBACK");
@@ -3557,10 +3683,33 @@ fn migrate_json_to_sqlite(conn: &mut Connection, data: &Value) -> Result<(), Str
     merge_json_to_sqlite(conn, data, None).map(|_| ())
 }
 
+#[cfg(test)]
 fn replace_json_in_sqlite(conn: &mut Connection, data: &Value) -> Result<Value, String> {
+    let current = read_sqlite_data(conn)?;
+    replace_json_in_sqlite_if_unchanged(conn, data, Some(&current))
+}
+
+fn replace_json_in_sqlite_if_unchanged(
+    conn: &mut Connection,
+    data: &Value,
+    expected_data: Option<&Value>,
+) -> Result<Value, String> {
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| e.to_string())?;
     let result = (|| {
+        // Native/API writers bypass the renderer's write barrier. Check under
+        // the SQLite writer lock so a restore cannot erase a later commit. An
+        // exact replacement erases every row it does not carry, so a caller
+        // that did not name the data it replaces is refused.
+        let Some(expected) = expected_data else {
+            return Err(
+                "Refusing an exact replacement without the data it replaces; local data left untouched"
+                    .to_string(),
+            );
+        };
+        if &read_sqlite_data(conn)? != expected {
+            return Err("Local data changed during restore. Please try again.".to_string());
+        }
         let canonical = replace_data_in_transaction(conn, data.clone())?;
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(canonical)
@@ -4002,12 +4151,13 @@ pub(crate) async fn save_data(
     data: Value,
     baseline_entities: Option<Value>,
     mode: Option<String>,
+    expected_data: Option<Value>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || match mode.as_deref() {
         None | Some("merge") => {
             persist_data_snapshot_with_retries(&app, &data, baseline_entities.as_ref())
         }
-        Some("exact") => persist_data_snapshot_exact_with_retries(&app, &data),
+        Some("exact") => persist_data_snapshot_exact_with_retries(&app, &data, expected_data.as_ref()),
         Some(unsupported) => Err(format!("Unsupported save_data mode: {unsupported}")),
     })
     .await
@@ -5355,13 +5505,7 @@ pub(crate) fn list_data_snapshots(app: tauri::AppHandle) -> Result<Vec<String>, 
     Ok(names)
 }
 
-#[tauri::command(async)]
-pub(crate) fn restore_data_snapshot(
-    app: tauri::AppHandle,
-    snapshot_file_name: String,
-) -> Result<bool, String> {
-    let _snapshot_guard = lock_snapshot_operation()?;
-    ensure_data_file(&app)?;
+fn snapshot_file_path(snapshot_dir: &Path, snapshot_file_name: &str) -> Result<PathBuf, String> {
     let trimmed = snapshot_file_name.trim();
     if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('\\') {
         return Err("Invalid snapshot file name".to_string());
@@ -5369,15 +5513,26 @@ pub(crate) fn restore_data_snapshot(
     if !is_snapshot_file_name(trimmed) {
         return Err("Invalid snapshot file format".to_string());
     }
-    let snapshot_dir = get_snapshot_dir(&app)?;
     let snapshot_path = snapshot_dir.join(trimmed);
-    if !snapshot_path.exists() {
-        return Err("Snapshot file not found".to_string());
+    match fs::symlink_metadata(&snapshot_path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(snapshot_path),
+        Ok(_) => Err("Invalid snapshot file".to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err("Snapshot file not found".to_string())
+        }
+        Err(error) => Err(error.to_string()),
     }
+}
 
-    let data = read_json_with_retries(&snapshot_path, 2)?;
-    persist_data_snapshot_exact_with_retries(&app, &data)?;
-    Ok(true)
+#[tauri::command(async)]
+pub(crate) fn read_data_snapshot(
+    app: tauri::AppHandle,
+    snapshot_file_name: String,
+) -> Result<Value, String> {
+    let _snapshot_guard = lock_snapshot_operation()?;
+    let snapshot_dir = get_snapshot_dir(&app)?;
+    let snapshot_path = snapshot_file_path(&snapshot_dir, &snapshot_file_name)?;
+    read_json_with_retries(&snapshot_path, 2)
 }
 
 #[tauri::command(async)]
@@ -5745,7 +5900,7 @@ mod tests {
         }));
         let merged = merge_data_snapshots(&initial, &input, None);
         let expected = replace_json_in_sqlite(&mut reference, &merged).unwrap();
-        let (saved, retained) =
+        let (saved, retained, _) =
             merge_json_to_sqlite_with_retained_tasks(&mut actual, &input, None).unwrap();
         assert_eq!(retained, 2);
         assert_eq!(
@@ -5814,8 +5969,12 @@ mod tests {
             let mut conn = open_sqlite_path(&temp.path().join(format!("{scenario}.db"))).unwrap();
             let mut reference =
                 open_sqlite_path(&temp.path().join(format!("{scenario}-ref.db"))).unwrap();
-            let seed = serde_json::json!({"tasks":[{"id":"old","title":"Existing","status":"inbox","rev":8}],
+            let mut seed = serde_json::json!({"tasks":[{"id":"old","title":"Existing","status":"inbox","rev":8}],
                 "projects":[],"sections":[],"areas":[],"people":[],"settings":{}});
+            if scenario == "prune" {
+                // Omission prunes only a tombstone; a live row it omits is kept.
+                seed["tasks"][0]["deletedAt"] = serde_json::json!("2026-01-01T00:00:00Z");
+            }
             let current = replace_json_in_sqlite(&mut conn, &seed).unwrap();
             replace_json_in_sqlite(&mut reference, &current).unwrap();
             let mut input = current.clone();
@@ -5856,7 +6015,7 @@ mod tests {
             }
             let merged = merge_data_snapshots(&current, &input, Some(&baseline));
             let expected = replace_json_in_sqlite(&mut reference, &merged).unwrap();
-            let (actual, retained) =
+            let (actual, retained, _) =
                 merge_json_to_sqlite_with_retained_tasks(&mut conn, &input, Some(&baseline))
                     .unwrap();
             assert_eq!(actual, expected, "scenario {scenario}");
@@ -5868,6 +6027,52 @@ mod tests {
             let again = merge_json_to_sqlite(&mut conn, &actual, None).unwrap();
             assert_eq!(again, actual, "second save must converge: {scenario}");
         }
+    }
+
+    // An exact replacement erases every row it does not carry, so it must
+    // name the data it replaces; no caller can skip the check.
+    #[test]
+    fn exact_replacement_without_the_data_it_replaces_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut conn = open_sqlite_path(&temp.path().join("exact-unguarded.db")).unwrap();
+        let seed = serde_json::json!({"tasks":[{"id":"capture","title":"MCP capture","rev":1}],
+            "projects":[],"sections":[],"areas":[],"people":[],"settings":{}});
+        let current = replace_json_in_sqlite(&mut conn, &seed).unwrap();
+        let external = serde_json::json!({"tasks":[],"projects":[],"sections":[],"areas":[],
+            "people":[],"settings":{}});
+        replace_json_in_sqlite_if_unchanged(&mut conn, &external, None)
+            .expect_err("an exact replacement needs the data it replaces");
+        assert_eq!(read_sqlite_data(&conn).unwrap(), current);
+    }
+
+    #[test]
+    fn exact_restore_rejects_a_native_write_after_its_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("restore-writers.db");
+        let mut conn = open_sqlite_path(&path).unwrap();
+        let seed = serde_json::json!({"tasks":[{"id":"old","title":"Old","rev":8}],
+            "projects":[],"sections":[],"areas":[],"people":[],"settings":{}});
+        let observed = replace_json_in_sqlite(&mut conn, &seed).unwrap();
+        let mut restored = observed.clone();
+        restored["tasks"][0]["title"] = serde_json::json!("Restored");
+        restored["tasks"][0]["rev"] = serde_json::json!(9);
+        let other = open_sqlite_path(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        replace_task_row(
+            &other,
+            &serde_json::json!({"id":"external","title":"New capture","rev":1}),
+        ).unwrap();
+        other.execute_batch("COMMIT").unwrap();
+        let current = read_sqlite_data(&other).unwrap();
+        let error = replace_json_in_sqlite_if_unchanged(&mut conn, &restored, Some(&observed))
+            .expect_err("a late native write must abort the replacement");
+        assert!(error.contains("Local data changed"));
+        assert_eq!(read_sqlite_data(&other).unwrap(), current);
+
+        // A fresh preparation can proceed; this models carrying the newly read
+        // data through the core restore rules before retrying the exact write.
+        let saved = replace_json_in_sqlite_if_unchanged(&mut conn, &current, Some(&current)).unwrap();
+        assert_eq!(saved, current);
     }
 
     #[test]
@@ -5891,7 +6096,7 @@ mod tests {
         )
         .unwrap();
         other.execute_batch("COMMIT").unwrap();
-        let (saved, retained) =
+        let (saved, retained, _) =
             merge_json_to_sqlite_with_retained_tasks(&mut conn, &input, Some(&observed)).unwrap();
         assert_eq!(
             retained, 2,
@@ -5929,7 +6134,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"id":"capture","title":"Capture"}));
-        let (saved, retained) =
+        let (saved, retained, _) =
             merge_json_to_sqlite_with_retained_tasks(&mut conn, &input, None).unwrap();
         assert_eq!(retained, 0);
         assert!(saved["sections"][0]
@@ -8703,6 +8908,230 @@ mod tests {
         assert_eq!(merged["tasks"][0]["rev"], 5);
     }
 
+    // A stale snapshot (built before the caller saw every row) omits rows it
+    // never meant to delete. Mindwtr deletes by tombstone, so omission may drop
+    // only an unchanged, unreferenced tombstone (core sqlite-adapter parity).
+    #[test]
+    fn omission_removes_only_unchanged_unreferenced_tombstones() {
+        let gone = "2026-06-01T00:00:00Z";
+        let current = serde_json::json!({
+            "tasks": [
+                {"id": "task-live", "title": "Live", "status": "next", "rev": 2,
+                 "projectId": "project-held", "sectionId": "section-held"},
+                {"id": "task-gone", "title": "Gone", "status": "next", "rev": 3, "deletedAt": gone},
+                {"id": "task-changed", "title": "Changed", "status": "next", "rev": 4, "deletedAt": gone},
+                {"id": "task-deleted-child", "title": "Deleted child", "status": "next", "rev": 2,
+                 "deletedAt": gone, "areaId": "area-held-by-deleted"}
+            ],
+            "projects": [
+                {"id": "project-live", "title": "Live", "rev": 1, "areaId": "area-held"},
+                {"id": "project-held", "title": "Held", "rev": 2, "deletedAt": gone},
+                {"id": "project-gone", "title": "Gone", "rev": 2, "deletedAt": gone}
+            ],
+            "sections": [
+                {"id": "section-live", "projectId": "project-live", "title": "Live", "rev": 1},
+                {"id": "section-held", "projectId": "project-live", "title": "Held", "rev": 2, "deletedAt": gone},
+                {"id": "section-gone", "projectId": "project-live", "title": "Gone", "rev": 2, "deletedAt": gone}
+            ],
+            "areas": [
+                {"id": "area-live", "name": "Live", "rev": 1},
+                {"id": "area-held", "name": "Held", "rev": 2, "deletedAt": gone},
+                {"id": "area-held-by-deleted", "name": "Held by a tombstone", "rev": 2, "deletedAt": gone},
+                {"id": "area-gone", "name": "Gone", "rev": 2, "deletedAt": gone}
+            ],
+            "people": [
+                {"id": "person-live", "name": "Live", "rev": 1},
+                {"id": "person-gone", "name": "Gone", "rev": 2, "deletedAt": gone}
+            ],
+            "settings": {}
+        });
+        // The caller observed every row exactly (the CAS matches) except
+        // task-changed, which advanced after it was read.
+        let mut baseline = serde_json::json!({});
+        for key in ENTITY_TABLES {
+            baseline[key] = current[key].clone();
+        }
+        baseline["tasks"][2]["rev"] = serde_json::json!(3);
+        // The target keeps only the deleted child, so its tombstone area has a
+        // remaining reference; every other row is omitted.
+        let target = serde_json::json!({
+            "tasks": [current["tasks"][3].clone()],
+            "projects": [], "sections": [], "areas": [], "people": [],
+            "settings": {}
+        });
+
+        let merged = merge_data_snapshots(&current, &target, Some(&baseline));
+        let ids = |key: &str| -> Vec<String> {
+            merged[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entity| entity["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids("tasks"), ["task-live", "task-changed", "task-deleted-child"]);
+        assert_eq!(ids("projects"), ["project-live", "project-held"]);
+        assert_eq!(ids("sections"), ["section-live", "section-held"]);
+        assert_eq!(ids("areas"), ["area-live", "area-held", "area-held-by-deleted"]);
+        assert_eq!(ids("people"), ["person-live"]);
+        assert_eq!(merged["tasks"][0], current["tasks"][0], "a kept live row is unchanged");
+    }
+
+    #[test]
+    fn omission_removes_a_tombstone_chain_in_one_save() {
+        let gone = "2026-06-01T00:00:00Z";
+        let current = serde_json::json!({
+            "tasks": [{"id": "task-gone", "title": "Gone", "rev": 2, "deletedAt": gone,
+                       "projectId": "project-gone", "sectionId": "section-gone", "areaId": "area-gone"}],
+            "projects": [{"id": "project-gone", "title": "Gone", "rev": 2, "deletedAt": gone,
+                          "areaId": "area-gone"}],
+            "sections": [{"id": "section-gone", "projectId": "project-gone", "title": "Gone",
+                          "rev": 2, "deletedAt": gone}],
+            "areas": [{"id": "area-gone", "name": "Gone", "rev": 2, "deletedAt": gone}],
+            "people": [],
+            "settings": {}
+        });
+        let mut baseline = serde_json::json!({});
+        for key in ENTITY_TABLES {
+            baseline[key] = current[key].clone();
+        }
+        let target = serde_json::json!({
+            "tasks": [], "projects": [], "sections": [], "areas": [], "people": [],
+            "settings": {}
+        });
+
+        let merged = merge_data_snapshots(&current, &target, Some(&baseline));
+
+        for key in ENTITY_TABLES {
+            assert_eq!(merged[key], serde_json::json!([]), "{key} tombstone must go with its child");
+        }
+    }
+
+    // Core parity (sqlite-adapter saved_filters): a settings write that omits a
+    // live saved filter keeps it; an omitted tombstone filter is removed.
+    #[test]
+    fn settings_write_keeps_omitted_live_saved_filters() {
+        let live = serde_json::json!({"id": "filter-live", "name": "Live",
+            "criteria": {"futureField": [3, 1]}, "unknownField": "kept"});
+        let current = serde_json::json!({
+            "tasks": [], "projects": [], "areas": [], "sections": [], "people": [],
+            "settings": {
+                "theme": "dark",
+                "savedFilters": [
+                    {"id": "filter-edited", "name": "Before"},
+                    live.clone(),
+                    {"id": "filter-deleted", "name": "Gone", "deletedAt": "2026-06-01T00:00:00Z"}
+                ]
+            }
+        });
+        let baseline = serde_json::json!({ "settings": current["settings"].clone() });
+        let edited = serde_json::json!({"id": "filter-edited", "name": "After"});
+        let target = serde_json::json!({
+            "tasks": [], "projects": [], "areas": [], "sections": [], "people": [],
+            "settings": { "theme": "light", "savedFilters": [edited.clone()] }
+        });
+
+        let merged = merge_data_snapshots(&current, &target, Some(&baseline));
+        assert_eq!(merged["settings"]["theme"], "light");
+        assert_eq!(merged["settings"]["savedFilters"], serde_json::json!([edited, live]));
+
+        let without_list = serde_json::json!({
+            "tasks": [], "projects": [], "areas": [], "sections": [], "people": [],
+            "settings": { "theme": "light" }
+        });
+        let merged = merge_data_snapshots(&current, &without_list, Some(&baseline));
+        assert_eq!(
+            merged["settings"]["savedFilters"],
+            serde_json::json!([current["settings"]["savedFilters"][0].clone(), live])
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_save_keeps_live_rows_in_sqlite() {
+        let mut conn = Connection::open_in_memory().expect("should open in-memory db");
+        conn.execute_batch(SQLITE_SCHEMA)
+            .expect("should create schema");
+        let observed = serde_json::json!({
+            "tasks": [{"id": "task-1", "title": "Live task", "status": "next", "rev": 1,
+                       "projectId": "project-1", "sectionId": "section-1", "areaId": "area-1"}],
+            "projects": [{"id": "project-1", "title": "Live project", "rev": 1, "areaId": "area-1"}],
+            "sections": [{"id": "section-1", "projectId": "project-1", "title": "Live section", "rev": 1}],
+            "areas": [{"id": "area-1", "name": "Live area", "rev": 1}],
+            "people": [{"id": "person-1", "name": "Live person", "rev": 1}],
+            "settings": {}
+        });
+        let canonical = merge_json_to_sqlite(&mut conn, &observed, None).expect("seed");
+        let mut baseline = serde_json::json!({ "settings": canonical["settings"].clone() });
+        for key in ENTITY_TABLES {
+            baseline[key] = canonical[key].clone();
+        }
+        let stale = serde_json::json!({
+            "tasks": [{"id": "task-2", "title": "Quick capture", "status": "inbox", "rev": 1}],
+            "projects": [], "sections": [], "areas": [], "people": [],
+            "settings": canonical["settings"].clone()
+        });
+
+        let saved = merge_json_to_sqlite(&mut conn, &stale, Some(&baseline)).expect("stale save");
+
+        assert_eq!(saved, read_sqlite_data(&conn).unwrap());
+        for key in ENTITY_TABLES {
+            assert!(
+                saved[key].as_array().unwrap().contains(&canonical[key][0]),
+                "live {key} row must survive a snapshot that omits it"
+            );
+        }
+        assert_eq!(saved["tasks"].as_array().unwrap().len(), 2);
+    }
+
+    // Rust twin of core ENTITY_FOREIGN_KEY_CHILDREN: the omission guard must
+    // know every foreign key, or pruning a parent fires ON DELETE actions.
+    #[test]
+    fn entity_foreign_key_children_match_the_sqlite_schema() {
+        let conn = Connection::open_in_memory().expect("should open in-memory db");
+        conn.execute_batch(SQLITE_SCHEMA)
+            .expect("should create schema");
+        let mut schema: Vec<(String, String, String)> = Vec::new();
+        for child in ENTITY_TABLES {
+            let mut stmt = conn
+                .prepare(&format!("SELECT \"table\", \"from\" FROM pragma_foreign_key_list('{child}')"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                .unwrap();
+            for row in rows {
+                let (parent, column) = row.unwrap();
+                schema.push((parent, child.to_string(), column));
+            }
+        }
+        let mut listed: Vec<(String, String, String)> = ENTITY_FOREIGN_KEY_CHILDREN
+            .iter()
+            .flat_map(|(parent, children)| {
+                children.iter().map(move |(child, column)| {
+                    (parent.to_string(), child.to_string(), column.to_string())
+                })
+            })
+            .collect();
+        schema.sort();
+        listed.sort();
+        assert_eq!(listed, schema);
+
+        let core =
+            include_str!("../../../../packages/core/src/sync-tombstones.ts").replace("\r\n", "\n");
+        let entries = ENTITY_FOREIGN_KEY_CHILDREN
+            .iter()
+            .map(|(parent, children)| {
+                let pairs = children
+                    .iter()
+                    .map(|(child, column)| format!("['{child}', '{column}']"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("    {parent}: [{pairs}],\n")
+            })
+            .collect::<String>();
+        let expected = format!("export const ENTITY_FOREIGN_KEY_CHILDREN = {{\n{entries}}}");
+        assert!(core.contains(&expected), "core list differs from:\n{expected}");
+    }
+
     #[test]
     fn snapshot_materializes_and_semantically_deduplicates_canonical_sqlite() {
         let mut conn = Connection::open_in_memory().expect("should open in-memory db");
@@ -10887,7 +11316,34 @@ mod tests {
         assert_eq!(task.get("projectId"), None);
     }
 
-    // create_data_snapshot/restore_data_snapshot need a real tauri::AppHandle,
+    #[test]
+    fn snapshot_reader_rejects_invalid_paths_and_accepts_regular_snapshot() {
+        let dir = tempfile::tempdir().expect("temporary snapshot directory");
+        let name = "data.2026-07-31.snapshot.json";
+        let path = dir.path().join(name);
+        fs::write(&path, "{}").expect("write snapshot");
+        assert_eq!(snapshot_file_path(dir.path(), name).unwrap(), path);
+
+        for invalid in [
+            "",
+            "../data.2026-07-31.snapshot.json",
+            "data.2026-07-31.snapshot.json/other",
+            "data.2026-07-31.snapshot.json\\other",
+            "/data.2026-07-31.snapshot.json",
+            "other.json",
+        ] {
+            assert!(snapshot_file_path(dir.path(), invalid).is_err(), "accepted {invalid}");
+        }
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("data.link.snapshot.json");
+            std::os::unix::fs::symlink(&path, &link).expect("create snapshot symlink");
+            assert!(snapshot_file_path(dir.path(), "data.link.snapshot.json").is_err());
+        }
+    }
+
+    // create_data_snapshot/read_data_snapshot need a real tauri::AppHandle,
     // which this crate has no test harness to construct — this proves the
     // lock those commands share (lock_snapshot_operation) actually serializes
     // two concurrent holders, the mechanism they rely on now that both run

@@ -14,8 +14,8 @@ import {
 } from '@dnd-kit/core';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { ErrorBoundary } from '../ErrorBoundary';
-import { shallow, useTaskStore, TaskPriority, TimeEstimate, TIME_ESTIMATE_OPTIONS, buildFocusPools, compareProjectsByOrder, removeAdvancedFilterCriteriaChip, formatFocusTaskLimitText,
-    getFocusStarBlockedText, formatTimeEstimateLabel, generateUUID, getUsedTaskTokens, deriveFocusTaskLists, getProjectDeadlineBoostLabel, getTaskMetadataFilterVisibility, markSavedFilterDeleted, normalizeFocusTaskLimit, resolveFeatureFlags, resolveTaskPerspectiveForFeatures, safeFormatDate, safeParseDate, isDueForReview, shouldShowTaskForStart, splitTodayTasksByStartTime, translateWithFallback, tFallback } from '@mindwtr/core';
+import { shallow, useTaskStore, TaskPriority, TimeEstimate, TIME_ESTIMATE_OPTIONS, buildFocusPools, compareProjectsByOrder, planFocusFilterCriterionRemoval, formatFocusTaskLimitText,
+    getFocusStarBlockedText, formatTimeEstimateLabel, generateUUID, getUsedTaskTokens, deriveFocusTaskLists, getProjectDeadlineBoostLabel, getTaskMetadataFilterVisibility, isTaskFutureFocusCandidate, markSavedFilterDeleted, normalizeFocusTaskLimit, resolveFeatureFlags, resolveTaskPerspectiveForFeatures, safeFormatDate, safeParseDate, selectFocusSavedFilters, isDueForReview, shouldShowTaskForStart, splitTodayTasksByStartTime, translateWithFallback, tFallback } from '@mindwtr/core';
 import { DEFAULT_FOCUS_SORT_BY } from '@mindwtr/core';
 import type { MultiValueFilterMatchMode, SavedFilter, SortField, Task, TaskEnergyLevel } from '@mindwtr/core';
 import { useTaskFilterSelections } from '@mindwtr/core/task-filter-selections';
@@ -23,7 +23,7 @@ import { buildAdvancedChips, buildSelectionChips, type ActiveFilterChipDeps } fr
 import { useLanguage } from '../../contexts/language-context';
 import { cn } from '../../lib/utils';
 import { useUiStore } from '../../store/ui-store';
-import { AlertCircle, CalendarDays, Clock, ArrowRight, Folder, CheckCircle2, MoreHorizontal, Trash2 } from 'lucide-react';
+import { AlertCircle, CalendarDays, ChevronDown, ChevronRight, Clock, ArrowRight, Folder, CheckCircle2, MoreHorizontal, Trash2 } from 'lucide-react';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { usePerformanceMonitor } from '../../hooks/usePerformanceMonitor';
 import { checkBudget } from '../../config/performanceBudgets';
@@ -58,7 +58,7 @@ const AGENDA_VIRTUALIZATION_THRESHOLD = 25;
 const AGENDA_ACTIVE_STATUSES: Task['status'][] = ['inbox', 'next', 'waiting', 'someday'];
 const FOCUS_VIEW_STATE_STORAGE_KEY = 'mindwtr:view:focus:v1';
 
-type FocusSectionKey = 'schedule' | 'nextActions' | 'upcoming' | 'reviewDue' | 'reviewProjects';
+type FocusSectionKey = 'focus' | 'schedule' | 'nextActions' | 'upcoming' | 'reviewDue' | 'reviewProjects';
 type SetFocusCollapsedGroups = (
     updater: (current: CollapsedGroups<NextGroupBy>) => CollapsedGroups<NextGroupBy>,
 ) => void;
@@ -70,6 +70,7 @@ type FocusPersistedViewState = {
 
 const DEFAULT_FOCUS_VIEW_STATE: FocusPersistedViewState = {
     expandedSections: {
+        focus: true,
         schedule: true,
         nextActions: true,
         upcoming: true,
@@ -88,6 +89,7 @@ function sanitizeFocusViewState(value: unknown, fallback: FocusPersistedViewStat
         : {};
     return {
         expandedSections: {
+            focus: typeof expandedSections.focus === 'boolean' ? expandedSections.focus : fallback.expandedSections.focus,
             schedule: typeof expandedSections.schedule === 'boolean' ? expandedSections.schedule : fallback.expandedSections.schedule,
             nextActions: typeof expandedSections.nextActions === 'boolean' ? expandedSections.nextActions : fallback.expandedSections.nextActions,
             upcoming: typeof expandedSections.upcoming === 'boolean' ? expandedSections.upcoming : fallback.expandedSections.upcoming,
@@ -460,7 +462,7 @@ export function AgendaView() {
         const active = baseActiveTasks.filter((task) => shouldShowTaskForStart(task, { now, granularity: 'time' }));
         return {
             activeTasks: active,
-            allTokens: getUsedTaskTokens(active, (task) => [...(task.contexts || []), ...(task.tags || [])]),
+            allTokens: getUsedTaskTokens(active, (task) => [...(task.contexts || []), ...(task.tags || [])], { includeAncestors: true }),
         };
     }, [baseActiveTasks, localDayKey, futureStartTick]);
     const priorityOptions: TaskPriority[] = ['low', 'medium', 'high', 'urgent'];
@@ -491,7 +493,7 @@ export function AgendaView() {
     }, [activeTasks, areaById, projects]);
     const showNoProjectOption = activeTasks.some((task) => !task.projectId);
     const formatEstimate = (value: TimeEstimate) => formatTimeEstimateLabel(value, { t });
-    const savedFocusFilters = (settings?.savedFilters ?? []).filter((filter) => filter.view === 'focus' && !filter.deletedAt);
+    const savedFocusFilters = useMemo(() => selectFocusSavedFilters(settings?.savedFilters), [settings?.savedFilters]);
     const filterSelections = useTaskFilterSelections({
         view: 'focus',
         t,
@@ -554,17 +556,13 @@ export function AgendaView() {
         return translateWithFallback(t, key, fallback);
     }, [t]);
     const removeAdvancedSavedFilterCriterion = useCallback((chipId: string) => {
-        if (!activeSavedFilter) return;
-        const nextCriteria = removeAdvancedFilterCriteriaChip(activeSavedFilter.criteria, chipId);
-        if (nextCriteria === activeSavedFilter.criteria) return;
-
-        const nowIso = new Date().toISOString();
-        const nextFilters = (settings?.savedFilters ?? []).map((filter) => (
-            filter.id === activeSavedFilter.id
-                ? { ...filter, criteria: nextCriteria, updatedAt: nowIso }
-                : filter
-        ));
-        void updateSettings({ savedFilters: nextFilters }).catch(() => undefined);
+        const plan = planFocusFilterCriterionRemoval({
+            activeSavedFilter,
+            criterionId: chipId,
+            savedFilters: settings?.savedFilters,
+            nowIso: new Date().toISOString(),
+        });
+        if (plan) void updateSettings(plan).catch(() => undefined);
     }, [activeSavedFilter, settings?.savedFilters, updateSettings]);
     const chipDeps = useMemo<ActiveFilterChipDeps>(() => ({
         t,
@@ -850,8 +848,8 @@ export function AgendaView() {
     ), [resolveText, sections.projectDeadlineBoosts]);
     const visibleOtherSectionKeys: FocusSectionKey[] = [];
     if (sections.schedule.length > 0) visibleOtherSectionKeys.push('schedule');
-    if (sections.reviewDue.length > 0) visibleOtherSectionKeys.push('reviewDue');
     if (sections.nextActions.length > 0) visibleOtherSectionKeys.push('nextActions');
+    if (sections.reviewDue.length > 0) visibleOtherSectionKeys.push('reviewDue');
     if (sections.upcoming.length > 0) visibleOtherSectionKeys.push('upcoming');
     if (reviewDueProjects.length > 0) visibleOtherSectionKeys.push('reviewProjects');
     const canToggleOtherSections = visibleOtherSectionKeys.length > 0;
@@ -861,10 +859,10 @@ export function AgendaView() {
     // The keyboard scope walks exactly what is on screen, in render order:
     // collapsed sections and collapsed groups contribute no rows.
     const visibleTasks = useMemo(() => {
-        const visible = [...focusedTasks];
+        const visible = expandedSections.focus ? [...focusedTasks] : [];
         if (expandedSections.schedule) visible.push(...orderedTodayTasks);
-        if (expandedSections.reviewDue) visible.push(...sections.reviewDue);
         if (expandedSections.nextActions) visible.push(...visibleNextActions);
+        if (expandedSections.reviewDue) visible.push(...sections.reviewDue);
         if (expandedSections.upcoming) visible.push(...sections.upcoming);
         return visible;
     }, [
@@ -900,13 +898,14 @@ export function AgendaView() {
 
     const buildFocusToggle = useCallback((task: Task) => {
         const isFocused = Boolean(task.isFocusedToday);
+        const queued = isTaskFutureFocusCandidate(task);
         // Cheap cap-only gate at render time (rows are many); full eligibility
         // is enforced on click via the core focus-star module, which toasts
         // the blocked reason.
-        const canToggle = isFocused || focusedCount < focusTaskLimit;
+        const canToggle = isFocused || queued || focusedCount < focusTaskLimit;
         const title = isFocused
             ? t('agenda.removeFromFocus')
-            : focusedCount >= focusTaskLimit
+            : !queued && focusedCount >= focusTaskLimit
                 ? formatFocusTaskLimitText(t('agenda.maxFocusItems'), focusTaskLimit)
                 : t('agenda.addToFocus');
         return {
@@ -919,16 +918,11 @@ export function AgendaView() {
         };
     }, [focusTaskLimit, focusedCount, handleToggleFocus, t]);
 
-    // Every Upcoming row is deferred by construction, so the star can only ever
-    // refuse — the cap-only render gate above would show an enabled "Add to Focus"
-    // whose sole outcome is a toast. Disabled-with-the-reason instead, matching
-    // how the project Order row states an unavailable action rather than hiding it.
     const buildUpcomingFocusToggle = useCallback((task: Task) => {
         const toggle = buildFocusToggle(task);
-        if (toggle.isFocused) return toggle;
-        const deferredText = getFocusStarBlockedText(t, { blockedReason: 'deferred' }, focusTaskLimit)
-            ?? toggle.title;
-        return { ...toggle, canToggle: false, title: deferredText, ariaLabel: deferredText };
+        if (toggle.isFocused || isTaskFutureFocusCandidate(task)) return toggle;
+        const title = getFocusStarBlockedText(t, { blockedReason: 'deferred' }, focusTaskLimit) ?? toggle.title;
+        return { ...toggle, canToggle: false, title, ariaLabel: title };
     }, [buildFocusToggle, focusTaskLimit, t]);
 
     const toggleSection = useCallback((sectionKey: FocusSectionKey) => {
@@ -945,6 +939,7 @@ export function AgendaView() {
         setPersistedViewState((current) => ({
             ...current,
             expandedSections: {
+                ...current.expandedSections,
                 schedule: expanded,
                 reviewDue: expanded,
                 nextActions: expanded,
@@ -964,8 +959,8 @@ export function AgendaView() {
         const ordered = [
             ...focusedTasks,
             ...orderedTodayTasks,
-            ...sections.reviewDue,
             ...sections.nextActions,
+            ...sections.reviewDue,
         ];
         const byId = new Map<string, Task>();
         ordered.forEach((task) => {
@@ -1058,15 +1053,26 @@ export function AgendaView() {
             data-testid="todays-focus-section"
             className="rounded-xl border border-border/70 border-l-4 border-l-amber-400 bg-card/70 p-6 shadow-sm dark:border-border/60 dark:border-l-amber-400/80 dark:bg-card/60"
         >
-            <h3 className="font-bold text-lg flex items-center gap-2 mb-4 text-foreground">
-                <FocusStarIcon className="w-5 h-5" filled />
-                {t('agenda.todaysFocus')}
-                <span className="text-sm font-normal text-muted-foreground">
-                    ({focusedCount}/{focusTaskLimit})
-                </span>
+            <h3 className={cn(expandedSections.focus && 'mb-4')}>
+                <button
+                    type="button"
+                    onClick={() => toggleSection('focus')}
+                    aria-expanded={expandedSections.focus}
+                    aria-controls="agenda-section-focus"
+                    className="flex w-full items-center gap-2 rounded-md text-left text-lg font-bold text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                >
+                    {expandedSections.focus
+                        ? <ChevronDown className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                        : <ChevronRight className="h-4 w-4 text-muted-foreground" aria-hidden="true" />}
+                    <FocusStarIcon className="h-5 w-5" filled />
+                    <span>{t('agenda.todaysFocus')}</span>
+                    <span className="text-sm font-normal text-muted-foreground">
+                        ({focusedCount}/{focusTaskLimit})
+                    </span>
+                </button>
             </h3>
 
-            {focusListBody}
+            {expandedSections.focus && <div id="agenda-section-focus">{focusListBody}</div>}
         </div>
     ) : null;
 
@@ -1232,31 +1238,12 @@ export function AgendaView() {
                     </AgendaCollapsibleSection>
                 )}
 
-                {sections.reviewDue.length > 0 && (
-                    <AgendaCollapsibleSection
-                        title={tFallback(t, 'agenda.reviewDue', 'Review Due')}
-                        icon={Clock}
-                        color="text-status-someday"
-                        count={sections.reviewDue.length}
-                        expanded={expandedSections.reviewDue}
-                        onToggle={() => toggleSection('reviewDue')}
-                        controlsId="agenda-section-reviewDue"
-                    >
-                        <AgendaTaskList
-                            tasks={sections.reviewDue}
-                            buildFocusToggle={buildFocusToggle}
-                            showListDetails={showListDetails}
-                            highlightTaskId={highlightTaskId}
-                        />
-                    </AgendaCollapsibleSection>
-                )}
-
                 {effectiveNextGroupBy === 'none' ? (
                     sections.nextActions.length > 0 && (
                         <AgendaCollapsibleSection
                             title={t('agenda.nextActions')}
                             icon={ArrowRight}
-                            color="text-info"
+                            color="text-muted-foreground"
                             count={sections.nextActions.length}
                             expanded={expandedSections.nextActions}
                             onToggle={() => toggleSection('nextActions')}
@@ -1276,7 +1263,7 @@ export function AgendaView() {
                         <AgendaCollapsibleSection
                             title={t('agenda.nextActions')}
                             icon={ArrowRight}
-                            color="text-info"
+                            color="text-muted-foreground"
                             count={sections.nextActions.length}
                             expanded={expandedSections.nextActions}
                             onToggle={() => toggleSection('nextActions')}
@@ -1311,6 +1298,25 @@ export function AgendaView() {
                             </div>
                         </AgendaCollapsibleSection>
                     )
+                )}
+
+                {sections.reviewDue.length > 0 && (
+                    <AgendaCollapsibleSection
+                        title={tFallback(t, 'agenda.reviewDue', 'Review Due')}
+                        icon={Clock}
+                        color="text-status-someday"
+                        count={sections.reviewDue.length}
+                        expanded={expandedSections.reviewDue}
+                        onToggle={() => toggleSection('reviewDue')}
+                        controlsId="agenda-section-reviewDue"
+                    >
+                        <AgendaTaskList
+                            tasks={sections.reviewDue}
+                            buildFocusToggle={buildFocusToggle}
+                            showListDetails={showListDetails}
+                            highlightTaskId={highlightTaskId}
+                        />
+                    </AgendaCollapsibleSection>
                 )}
 
                 {sections.upcoming.length > 0 && (

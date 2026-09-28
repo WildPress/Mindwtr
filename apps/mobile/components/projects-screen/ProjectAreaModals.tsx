@@ -1,7 +1,7 @@
 import React from 'react';
 import { Modal, Pressable, ScrollView, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { Ban } from 'lucide-react-native';
-import { tFallback, type Area, type Project } from '@mindwtr/core';
+import { isManageAreaNameTaken, tFallback, type Area, type Project } from '@mindwtr/core';
 
 import { projectsScreenStyles as styles } from './projects-screen.styles';
 import { applyLiveProjectUpdate, getLiveMutableProject } from './project-meta-pickers';
@@ -33,6 +33,7 @@ type ProjectAreaModalsProps = {
     onSetSelectedProject: React.Dispatch<React.SetStateAction<Project | null>>;
     onSetShowAreaManager: React.Dispatch<React.SetStateAction<boolean>>;
     onSetShowAreaPicker: React.Dispatch<React.SetStateAction<boolean>>;
+    reorderAreas: (orderedIds: string[]) => void | Promise<void>;
     onShowToast: (options: { title: string; message: string; tone: 'warning' | 'error' | 'success' | 'info' }) => void;
     overlayModalPresentation: 'overFullScreen' | 'fullScreen';
     pickerCardMaxHeight: number;
@@ -65,6 +66,7 @@ export function ProjectAreaModals({
     onSetSelectedProject,
     onSetShowAreaManager,
     onSetShowAreaPicker,
+    reorderAreas,
     onShowToast,
     overlayModalPresentation,
     pickerCardMaxHeight,
@@ -80,6 +82,8 @@ export function ProjectAreaModals({
     updateProject,
 }: ProjectAreaModalsProps) {
     const keyboardInset = useAndroidKeyboardInset(showAreaManager);
+    // A live area has this name: adding it would create nothing, so Save is off and the line says why.
+    const newAreaNameTaken = isManageAreaNameTaken('newArea', newAreaName, sortedAreas);
     const dismissProjectPickers = React.useCallback(() => {
         onSetShowAreaPicker(false);
         onSetShowAreaManager(false);
@@ -196,7 +200,7 @@ export function ProjectAreaModals({
                                 showsVerticalScrollIndicator
                                 nestedScrollEnabled
                             >
-                                {sortedAreas.map((area) => {
+                                {sortedAreas.map((area, index) => {
                                     const inUse = (areaUsage.get(area.id) || 0) > 0;
                                     const isExpanded = expandedAreaColorId === area.id;
                                     return (
@@ -207,6 +211,20 @@ export function ProjectAreaModals({
                                                     <Text style={[styles.areaManagerText, { color: tc.text }]}>{area.name}</Text>
                                                 </View>
                                                 <View style={styles.areaManagerActions}>
+                                                    <TouchableOpacity
+                                                        accessibilityRole="button"
+                                                        accessibilityLabel={`${t('projects.moveUp')}: ${area.name}`}
+                                                        accessibilityState={{ disabled: index === 0 }}
+                                                        disabled={index === 0}
+                                                        onPress={() => {
+                                                            const ids = sortedAreas.map((item) => item.id);
+                                                            [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
+                                                            void reorderAreas(ids);
+                                                        }}
+                                                        style={[styles.areaOrderButton, index === 0 && styles.areaOrderButtonDisabled]}
+                                                    >
+                                                        <Text style={[styles.areaOrderText, { color: tc.text }]}>↑</Text>
+                                                    </TouchableOpacity>
                                                     <TouchableOpacity
                                                         onPress={() => onSetExpandedAreaColorId(isExpanded ? null : area.id)}
                                                         style={[styles.colorToggleButton, { borderColor: tc.border }]}
@@ -283,6 +301,11 @@ export function ProjectAreaModals({
                             placeholderTextColor={tc.secondaryText}
                             style={[styles.linkModalInput, { backgroundColor: tc.inputBg, borderColor: tc.border, color: tc.text }]}
                         />
+                        {newAreaNameTaken ? (
+                            <Text style={[styles.linkModalHint, { color: '#EF4444' }]}>
+                                {tFallback(t, 'areas.nameExists', 'An area with this name already exists.')}
+                            </Text>
+                        ) : null}
                         <View style={styles.colorPicker}>
                             {colors.map((color) => (
                                 <TouchableOpacity
@@ -301,10 +324,12 @@ export function ProjectAreaModals({
                                 <Text style={[styles.linkModalButtonText, { color: tc.secondaryText }]}>{t('common.cancel')}</Text>
                             </TouchableOpacity>
                             <TouchableOpacity
+                                accessibilityRole="button"
+                                accessibilityLabel={t('common.save')}
                                 onPress={() => {
                                     const name = newAreaName.trim();
-                                    if (!name) return;
-                                    if (!selectedProject || !getLiveMutableProject(selectedProject.id)) {
+                                    if (!name || newAreaNameTaken) return;
+                                    if (selectedProject && !getLiveMutableProject(selectedProject.id)) {
                                         dismissProjectPickers();
                                         return;
                                     }
@@ -312,8 +337,8 @@ export function ProjectAreaModals({
                                     onCloseAreaManager();
                                     onSetNewAreaName('');
                                 }}
-                                disabled={!newAreaName.trim()}
-                                style={[styles.linkModalButton, !newAreaName.trim() && styles.linkModalButtonDisabled]}
+                                disabled={!newAreaName.trim() || newAreaNameTaken}
+                                style={[styles.linkModalButton, (!newAreaName.trim() || newAreaNameTaken) && styles.linkModalButtonDisabled]}
                             >
                                 <Text style={[styles.linkModalButtonText, { color: tc.tint }]}>{t('common.save')}</Text>
                             </TouchableOpacity>

@@ -457,7 +457,7 @@ describe('FocusScreen', () => {
     expect(openProjectScreenMock).toHaveBeenCalledWith('review-project');
   });
 
-  it('defers a focused task from the row action and offers undo', async () => {
+  it('queues a focused task from the row action and offers undo', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 2, 10, 0, 0, 0));
     const alertSpy = vi.spyOn(Alert, 'alert');
@@ -493,7 +493,6 @@ describe('FocusScreen', () => {
 
     expect(storeState.updateTask).toHaveBeenCalledWith('focused-next', {
       startTime: '2026-05-03',
-      isFocusedToday: false,
     });
     expect(showToastMock).toHaveBeenCalledWith(expect.objectContaining({
       title: 'Focused next',
@@ -508,7 +507,6 @@ describe('FocusScreen', () => {
 
     expect(storeState.updateTask).toHaveBeenLastCalledWith('focused-next', {
       startTime: undefined,
-      isFocusedToday: true,
     });
     vi.useRealTimers();
   });
@@ -619,7 +617,7 @@ describe('FocusScreen', () => {
     vi.useRealTimers();
   });
 
-  it('does not offer defer on due-dated Focus rows', () => {
+  it('does not offer a start date on a Focus row that is due today or overdue', () => {
     storeState.tasks = [
       makeTask('due-next', {
         title: 'Due next',
@@ -636,6 +634,39 @@ describe('FocusScreen', () => {
     const row = tree.root.findAllByType(SwipeableTaskItem).find((node) => node.props.task.id === 'due-next');
     expect(row?.props.onLongPressAction).toBeUndefined();
     expect(row?.props.onLongPressActionLabel).toBeUndefined();
+  });
+
+  it('offers only start dates on or before the due date (#1252)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 2, 10, 0, 0, 0));
+    const alertSpy = vi.spyOn(Alert, 'alert');
+    storeState.tasks = [
+      makeTask('due-soon', { title: 'Due soon', dueDate: '2026-05-05' }),
+    ];
+
+    let tree!: ReturnType<typeof create>;
+
+    act(() => {
+      tree = create(<FocusScreen />);
+    });
+
+    const row = tree.root.findAllByType(SwipeableTaskItem).find((node) => node.props.task.id === 'due-soon');
+    expect(row?.props.onLongPressAction).toBeTypeOf('function');
+
+    act(() => {
+      row?.props.onLongPressAction(row.props.task);
+    });
+
+    const buttons = alertSpy.mock.calls[0]?.[2] as Array<{ text?: string; onPress?: () => void }>;
+    expect(buttons.map((button) => button.text)).toEqual(['Today', 'Tomorrow', 'Custom...', 'Cancel']);
+
+    await act(async () => {
+      buttons[0]?.onPress?.();
+      await Promise.resolve();
+    });
+
+    expect(storeState.updateTask).toHaveBeenCalledWith('due-soon', { startTime: '2026-05-02' });
+    vi.useRealTimers();
   });
 
   it('bounds SectionList rendering for larger Focus lists', () => {
@@ -1126,11 +1157,12 @@ describe('FocusScreen', () => {
     vi.useRealTimers();
   });
 
-  it('disables the Upcoming star and gives each row its reveal date', () => {
+  it('offers the Upcoming star and gives each row its reveal date', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 3, 5, 12, 0, 0, 0));
     storeState.tasks = [
       makeTask('deferred-soon', { title: 'Deferred soon', startTime: '2026-04-08' }),
+      makeTask('recurring-soon', { title: 'Recurring soon', dueDate: '2026-04-10', recurrence: { rule: 'daily' } }),
       makeTask('plain-next', { title: 'Plain next' }),
     ];
 
@@ -1142,10 +1174,10 @@ describe('FocusScreen', () => {
 
     const rows = tree.root.findAllByType(SwipeableTaskItem);
     const upcomingRow = rows.find((node) => node.props.task.id === 'deferred-soon');
+    const recurringRow = rows.find((node) => node.props.task.id === 'recurring-soon');
     const nextRow = rows.find((node) => node.props.task.id === 'plain-next');
-    // Deferred by construction: the star can only refuse, so it announces why
-    // rather than offering a tap that ends in a toast.
-    expect(upcomingRow?.props.focusToggleDisabledLabel)
+    expect(upcomingRow?.props.focusToggleDisabledLabel).toBeUndefined();
+    expect(recurringRow?.props.focusToggleDisabledLabel)
       .toBe('This task is deferred; change its start date before focusing it.');
     expect(nextRow?.props.focusToggleDisabledLabel).toBeUndefined();
     // The reveal date is the section's purpose, so it rides the row.
@@ -1281,6 +1313,25 @@ describe('FocusScreen', () => {
     ).toEqual(['no-context-next', 'home-next', 'work-next']);
   });
 
+  it('keys a task shown under two context groups once per group', () => {
+    storeState.settings = {
+      appearance: {},
+      features: {},
+      gtd: { focusGroupBy: 'context' },
+    } as any;
+    storeState.tasks = [makeTask('both', { title: 'Both', contexts: ['@home', '@work'] })];
+
+    let tree!: ReturnType<typeof create>;
+    act(() => {
+      tree = create(<FocusScreen />);
+    });
+
+    const list = tree.root.findByType(SectionList);
+    const next = (list.props.sections as { type: string; data: unknown[] }[]).find((section) => section.type === 'next')!;
+    const keys = next.data.map((item) => list.props.keyExtractor(item));
+    expect(keys).toEqual(['context:@home', 'context:@home:both', 'context:@work', 'context:@work:both']);
+  });
+
   it('updates the mobile Focus list identity when grouping changes to a single context group', () => {
     storeState.tasks = [
       makeTask('work-first', { title: 'Work first', contexts: ['@work'] }),
@@ -1397,7 +1448,7 @@ describe('FocusScreen', () => {
     expect(() => tree.root.findByProps({ children: 'All clear' })).toThrow();
   });
 
-  it('orders mobile Focus sections as Schedule, Review Due, Next Actions, Upcoming, then Projects to review', () => {
+  it('orders mobile Focus sections as Schedule, Next Actions, Review Due, Upcoming, then Projects to review', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-05T12:00:00.000Z'));
     storeState.tasks = [
@@ -1418,14 +1469,14 @@ describe('FocusScreen', () => {
     const sections = tree.root.findByType(SectionList).props.sections as { title: string }[];
     expect(sections.map((section) => section.title)).toEqual([
       'Today',
-      'Review Due',
       'Next Actions',
+      'Review Due',
       'Upcoming',
       'Projects to review',
     ]);
   });
 
-  it('keeps mobile Focus tasks exclusive with Schedule ahead of Review Due ahead of Next Actions', () => {
+  it('keeps mobile Focus tasks exclusive with Schedule ahead of Next Actions ahead of Review Due', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-05T12:00:00.000Z'));
     storeState.tasks = [
@@ -1456,7 +1507,7 @@ describe('FocusScreen', () => {
     expect(idsIn('Today')).toEqual(['scheduled-review-next']);
     expect(idsIn('Review Due')).toEqual(['review-next']);
     expect(idsIn('Next Actions')).toEqual(['plain-next']);
-    expect(allTaskIds).toEqual(['scheduled-review-next', 'review-next', 'plain-next']);
+    expect(allTaskIds).toEqual(['scheduled-review-next', 'plain-next', 'review-next']);
   });
 
   it('shows a next task with a timed start later today in Today, not Next Actions or Upcoming', () => {

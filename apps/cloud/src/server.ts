@@ -3,12 +3,15 @@ import { createHash } from 'crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'fs';
 import { basename, join } from 'path';
 import {
+    applyCapturedProject,
     applyTaskProjectReactivationTransition,
     applyTaskUpdates,
     applyProjectLifecycleTransition,
     areSyncPayloadsEqual,
+    buildCaptureTaskProps,
     buildHttpRemoteFileFingerprint,
     buildNewProject,
+    canonicalRecurringFollowUp,
     compactPurgedProjectSectionTombstone,
     compactPurgedProjectTombstone,
     filterNotDeleted,
@@ -16,6 +19,7 @@ import {
     generateUUID,
     getNextProjectOrder,
     getTaskOrder,
+    isTaskFutureFocusCandidate,
     mergeAppDataWithStats,
     normalizeTaskUpdate,
     normalizeTaskLifecycleFields,
@@ -379,17 +383,12 @@ function finalizeCloudDataForWrite(
     return repaired;
 }
 
-// Mirrors the store's stampNewRecurringFollowUp (packages/core/src/store-tasks.ts):
-// a follow-up is a fresh task, so it needs a reserved project order (missing sorts
-// as +Infinity in compareTasksByProjectOrder, dumping it below its siblings) and a
-// zeroed push count, same as every other task-creation path.
-// Mirrors core's stampNewRecurringFollowUp: the next occurrence inherits the
-// completed instance's place (that instance leaves the active list, and a series
-// only ever has one active instance) and only reserves a fresh order when the
-// completed task had none.
+// The next occurrence inherits the completed instance's place (that instance leaves the
+// active list, and a series has one active instance); it reserves a fresh order only when
+// the completed task had none. Its shape comes from core's canonicalRecurringFollowUp.
 const stampRecurringFollowUp = (task: Task, completedTask: Task, existingTasks: Task[]): Task => {
     const order = getTaskOrder(completedTask) ?? getNextProjectOrder(task.projectId, existingTasks);
-    return { ...task, pushCount: 0, order, orderNum: order };
+    return { ...canonicalRecurringFollowUp(task), order, orderNum: order };
 };
 
 type CloudEntity = {
@@ -537,6 +536,11 @@ const handleEntityRoute = async <T extends CloudEntity>(
             writeCloudData(context.filePath, finalized, {
                 assertStorageRoot: context.assertStorageRoot,
             });
+            if (route.path === '/v1/tasks') {
+                logInfo('Cloud quick-add capture saved', {
+                    releaseCheck: 'v1.3.2/cloud-quick-add-capture',
+                });
+            }
             const savedEntity = getEntityCollection(finalized, route).find((item) => item.id === entity.id) ?? entity;
             return jsonResponse({ [route.itemKey]: savedEntity }, { status: 201 });
         });
@@ -673,27 +677,52 @@ const ENTITY_ROUTES: Array<EntityRouteDefinition<any>> = [
                     buildQuickAddParseOptions(data.settings, { tasks: data.tasks, people: data.people }),
                 )
                 : { title: rawTitle, props: {} };
-            const title = (parsed.title || rawTitle || input).trim();
-            if (!title) return errorResponse('Missing task title');
+            if (parsed.invalidDateCommands?.length) {
+                return errorResponse('Invalid date command', 400);
+            }
+            const assembly = buildCaptureTaskProps({
+                parsed: { ...parsed, title: parsed.title || rawTitle },
+                rawInput: input,
+                fallbackTitle: rawTitle,
+                projects: data.projects,
+                extraProps: initialProps,
+            });
+            if (!assembly.ok) return errorResponse('Missing task title');
+            const { title } = assembly;
             if (title.length > MAX_TASK_TITLE_LENGTH) {
                 return errorResponse(`Task title too long (max ${MAX_TASK_TITLE_LENGTH} characters)`, 400);
             }
 
-            const props: Partial<Task> = {
+            const explicitProps: Partial<Task> = {
                 ...parsed.props,
                 ...initialProps,
             };
-
-            const rawStatus = props.status;
+            const rawStatus = explicitProps.status;
             const parsedStatus = asStatus(rawStatus);
             if (rawStatus !== undefined && parsedStatus === null) {
                 return errorResponse('Invalid task status', 400);
+            }
+            let props = assembly.props;
+            if (assembly.projectToCreate && !props.projectId) {
+                const project = buildNewProject({
+                    title: assembly.projectToCreate.title,
+                    color: assembly.projectToCreate.color,
+                    initialProps: assembly.projectToCreate.initialProps,
+                    existingProjects: data.projects,
+                    existingAreas: data.areas,
+                    settings: data.settings,
+                    deviceId: CLOUD_API_REV_BY,
+                    now: nowIso,
+                    id: generateUUID(),
+                });
+                data.projects.push(project);
+                props = applyCapturedProject(props, project.id);
             }
             // Mirrors the store's create-side promotion (addTasks): a
             // start date at capture is a clarify decision, so a task
             // created with a start date and no explicit status enters
             // as Next rather than Inbox.
-            const status = resolveCaptureStatusForStart(props, parsedStatus || 'inbox');
+            const status = resolveCaptureStatusForStart(explicitProps, parsedStatus || 'inbox');
             const tags = Array.isArray(props.tags) ? props.tags : [];
             const contexts = Array.isArray(props.contexts) ? props.contexts : [];
             const {
@@ -740,11 +769,12 @@ const ENTITY_ROUTES: Array<EntityRouteDefinition<any>> = [
                 });
                 task.status = focusDecision.status;
                 task.isFocusedToday = focusDecision.isFocusedToday;
+                const queued = task.isFocusedToday && isTaskFutureFocusCandidate(task);
                 logInfo('Cloud task Focus write policy applied', {
-                    releaseCheck: 'v1.3.0/cloud-focus-write-parity',
+                    releaseCheck: queued ? 'v1.3.3/scheduled-focus-cloud-write' : 'v1.3.0/cloud-focus-write-parity',
                     operation: 'create',
-                    outcome: focusDecision.outcome,
-                    count: focusedCount + (focusDecision.outcome === 'focused' ? 1 : 0),
+                    outcome: queued ? 'queued' : focusDecision.outcome,
+                    count: focusedCount + (focusDecision.outcome === 'focused' && !queued ? 1 : 0),
                 });
             }
             return task;
@@ -773,7 +803,8 @@ const ENTITY_ROUTES: Array<EntityRouteDefinition<any>> = [
             if (isAddingFocus) {
                 const focusedCount = selectFocusedCount([...data.tasks]);
                 const focusTaskLimit = normalizeFocusTaskLimit(data.settings.gtd?.focusTaskLimit);
-                if (focusedCount >= focusTaskLimit) {
+                const queued = isTaskFutureFocusCandidate({ ...existing, ...normalizedUpdates });
+                if (!queued && focusedCount >= focusTaskLimit) {
                     logInfo('Cloud task Focus write policy applied', {
                         releaseCheck: 'v1.3.0/cloud-focus-write-parity',
                         operation: 'patch',
@@ -783,10 +814,10 @@ const ENTITY_ROUTES: Array<EntityRouteDefinition<any>> = [
                     return errorResponse(`Focus limit of ${focusTaskLimit} reached`, 409);
                 }
                 logInfo('Cloud task Focus write policy applied', {
-                    releaseCheck: 'v1.3.0/cloud-focus-write-parity',
+                    releaseCheck: queued ? 'v1.3.3/scheduled-focus-cloud-write' : 'v1.3.0/cloud-focus-write-parity',
                     operation: 'patch',
-                    outcome: 'focused',
-                    count: focusedCount + 1,
+                    outcome: queued ? 'queued' : 'focused',
+                    count: focusedCount + (queued ? 0 : 1),
                 });
             }
             const { updatedTask, nextRecurringTask } = applyTaskUpdates(

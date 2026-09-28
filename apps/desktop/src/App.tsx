@@ -26,6 +26,7 @@ import {
     isSupportedLanguage,
     isSandboxMode,
     isTaskFinished,
+    isTaskFocusedNow,
     recordDonationPromptShown,
     recordUpdateReminderChecked,
     recordUpdateReminderDismissed,
@@ -45,6 +46,7 @@ import {
     type AppAnnouncementAction,
 } from '@mindwtr/core';
 import { buildTrayTooltip } from './lib/tray-tooltip';
+import { useLocalDayKey } from './hooks/useLocalDayKey';
 import { GlobalSearch } from './components/GlobalSearch';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { StartupPromptModal, type StartupPromptPresentation } from './components/StartupPromptModal';
@@ -53,6 +55,7 @@ import { Dialog, DialogBody, DialogFooter } from './components/ui/Dialog';
 import { useLanguage } from './contexts/language-context';
 import { KeybindingProvider } from './contexts/keybinding-context';
 import { QuickAddModal } from './components/QuickAddModal';
+import { runAfterTaskEditExit } from './components/Task/task-edit-session';
 import { CloseBehaviorModal } from './components/CloseBehaviorModal';
 import { PersistenceFailureBanner } from './components/PersistenceFailureBanner';
 import { startDesktopNotifications, stopDesktopNotifications } from './lib/notification-service';
@@ -63,12 +66,13 @@ import {
 } from './lib/desktop-calendar-push-sync';
 import { startMacWidgetSync, stopMacWidgetSync } from './lib/macos-widget-sync';
 import { SyncService } from './lib/sync-service';
+import { showSyncErrorToast } from './lib/sync-error-toast';
 import type { ExternalSyncChange, ExternalSyncChangeResolution } from './lib/sync-service';
 import { migratePortableAttachments } from './lib/portable-migration';
 import { logDesktopStartupContext } from './lib/startup-context';
 import * as LocalDataWatcher from './lib/local-data-watcher';
 import { invokeNative } from './lib/tauri-invoke';
-import { getInstallSourceOrFallback, isFlatpakRuntime, isTauriRuntime } from './lib/runtime';
+import { getInstallSourceOrFallback, isFlatpakRuntime, isLinuxRuntime, isTauriRuntime } from './lib/runtime';
 import { useDesktopShellSync } from './lib/desktop-shell-sync';
 import { reportError as reportAppError } from './lib/report-error';
 import { syncNativeProxyUrl } from './lib/tauri-http';
@@ -85,11 +89,12 @@ import { beginSettingsOpenTrace, markSettingsOpenTrace, wrapSettingsOpenImport }
 import {
     THEME_STORAGE_KEY,
     applyNativeTheme,
+    applySystemThemeChange,
     applyThemeMode,
     resolveDesktopThemeMode,
     resolveNativeTheme,
     resolveSystemThemeCommandPreference,
-    watchSystemThemeCommandPreference,
+    watchSystemThemePortalPreference,
     watchNativeSystemThemePreference,
     watchSystemThemePreference,
 } from './lib/theme';
@@ -99,7 +104,7 @@ import {
     applyDesktopTextSize,
     coerceDesktopTextSize,
 } from './lib/text-size';
-import { FONT_FAMILY_STORAGE_KEY, applyDesktopFontFamily, coerceDesktopFontFamily } from './lib/font-family';
+import { FONT_FAMILY_STORAGE_KEY, applyDesktopFontFamily, checkBoldFace, coerceDesktopFontFamily } from './lib/font-family';
 import { saveStoredFullscreen } from './lib/window-state';
 import { installWebviewZoomShortcuts } from './lib/webview-zoom';
 import { isEditableManualSyncShortcutTarget, isManualSyncShortcut } from './lib/manual-sync-shortcut';
@@ -323,13 +328,14 @@ function App() {
     // store's identity check and re-render on every write. NUL is the separator
     // because it cannot occur in a task title — a space would split multi-word
     // titles into separate entries.
-    const focusTaskTitles = useTaskStore((state) => (
-        sortTasksByFocusOrder(
-            state.tasks.filter((task) => (
-                task.isFocusedToday && !isTaskFinished(task)
-            ))
-        ).map((task) => task.title).join(FOCUS_TITLE_SEPARATOR)
-    ));
+    const focusTasks = useTaskStore((state) => state.tasks);
+    const localDayKey = useLocalDayKey();
+    const focusTaskTitles = useMemo(() => {
+        const now = new Date();
+        return sortTasksByFocusOrder(
+            focusTasks.filter((task) => isTaskFocusedNow(task, now) && !isTaskFinished(task))
+        ).map((task) => task.title).join(FOCUS_TITLE_SEPARATOR);
+    }, [focusTasks, localDayKey]);
     const trayTooltip = useMemo(() => buildTrayTooltip({
         appName: translateWithFallback(t, 'app.name', 'Mindwtr'),
         focusLabel: translateWithFallback(t, 'agenda.todaysFocus', "Today's Focus"),
@@ -539,13 +545,21 @@ function App() {
 
     const applyActiveNativeTheme = useCallback((stepPrefix = 'apply') => {
         if (!isTauriRuntime()) return;
-        const nativeTheme = resolveNativeTheme(getActiveThemeMode());
+        const mode = getActiveThemeMode();
+        const nativeTheme = resolveNativeTheme(mode);
         void applyNativeTheme(
             nativeTheme,
             () => import('@tauri-apps/api/app'),
             () => import('@tauri-apps/api/window'),
             (step, error) => void logError(error, { scope: 'theme', step: `${stepPrefix}:${step}` }),
-        );
+        ).then((applied) => {
+            if (applied && isLinuxRuntime() && (mode === 'system' || mode === 'system-oled')) {
+                void logInfo('Linux native system theme applied', {
+                    scope: 'theme',
+                    extra: { releaseCheck: 'v1.3.3/linux-titlebar-theme', theme: nativeTheme ?? 'unknown' },
+                });
+            }
+        });
     }, [getActiveThemeMode]);
 
     useEffect(() => {
@@ -554,11 +568,13 @@ function App() {
         const normalizedTheme = getActiveThemeMode();
         if (!sandboxMode) localStorage.setItem(THEME_STORAGE_KEY, normalizedTheme);
         applyThemeMode(normalizedTheme);
-        if (normalizedTheme === 'system' && isTauriRuntime()) {
+        if ((normalizedTheme === 'system' || normalizedTheme === 'system-oled') && isTauriRuntime()) {
             void resolveSystemThemeCommandPreference(
                 (step, error) => void logError(error, { scope: 'theme', step: `initial-command:${step}` }),
             ).then((theme) => {
-                if (!cancelled && theme) applyThemeMode('system', theme);
+                if (!cancelled && theme) {
+                    applySystemThemeChange(normalizedTheme, theme, () => applyActiveNativeTheme('system-command'));
+                }
             });
         }
         applyActiveNativeTheme();
@@ -630,15 +646,27 @@ function App() {
             else localStorage.removeItem(FONT_FAMILY_STORAGE_KEY);
         }
         applyDesktopFontFamily(fontFamily);
+        // #1244: the font list now only offers families that have a real bold face, because
+        // a family without one makes the renderer fake it and every bold label looks blurry.
+        // `boldFace` is the renderer's own answer, which is the one thing a screenshot of
+        // blurry text cannot give us; a font name carries nothing private.
+        void logInfo('Desktop font family applied', {
+            scope: 'ui',
+            extra: {
+                releaseCheck: 'v1.3.2/font-family-applied',
+                family: fontFamily || 'app-default',
+                boldFace: fontFamily ? checkBoldFace(fontFamily) : 'app-default',
+            },
+        });
     }, [hasHydratedSettings, sandboxMode, settingsFontFamily]);
 
     useEffect(() => {
         if (!hasHydratedSettings) return;
         const normalizedTheme = getActiveThemeMode();
-        if (normalizedTheme !== 'system') return;
+        if (normalizedTheme !== 'system' && normalizedTheme !== 'system-oled') return;
 
         const stopWatchingSystemTheme = watchSystemThemePreference((theme) => {
-            applyThemeMode('system', theme);
+            applySystemThemeChange(normalizedTheme, theme, () => applyActiveNativeTheme('media'));
         });
 
         if (!isTauriRuntime()) {
@@ -650,27 +678,28 @@ function App() {
         const stopWatchingNativeTheme = watchNativeSystemThemePreference(
             () => import('@tauri-apps/api/window'),
             (theme) => {
-                applyThemeMode('system', theme);
+                applyThemeMode(normalizedTheme, theme);
             },
             (step, error) => {
                 void logError(error, { scope: 'theme', step });
             }
         );
-        const stopWatchingCommandTheme = watchSystemThemeCommandPreference(
+        const stopWatchingPortalTheme = watchSystemThemePortalPreference(
+            () => import('@tauri-apps/api/event'),
             (theme) => {
-                applyThemeMode('system', theme);
+                applySystemThemeChange(normalizedTheme, theme, () => applyActiveNativeTheme('portal'));
             },
             (step, error) => {
-                void logError(error, { scope: 'theme', step: `command:${step}` });
+                void logError(error, { scope: 'theme', step: `portal:${step}` });
             }
         );
 
         return () => {
             stopWatchingSystemTheme();
             stopWatchingNativeTheme();
-            stopWatchingCommandTheme();
+            stopWatchingPortalTheme();
         };
-    }, [getActiveThemeMode, hasHydratedSettings]);
+    }, [applyActiveNativeTheme, getActiveThemeMode, hasHydratedSettings]);
 
     useEffect(() => {
         if (!settingsLanguage || !isSupportedLanguage(settingsLanguage)) return;
@@ -908,7 +937,7 @@ function App() {
             if (shouldAlert) {
                 lastSyncErrorRef.current = message;
                 lastSyncErrorAtRef.current = nowMs;
-                showToast(`${t('settings.lastSyncError')}: ${message}`, 'error', 6000);
+                showSyncErrorToast(message, 6000);
             }
         };
 
@@ -1272,24 +1301,28 @@ function App() {
 
     const handleViewChange = useCallback((view: string) => {
         const nextView = view === 'obsidian' && !useObsidianStore.getState().config.enabled ? 'settings' : view;
-        if (nextView !== 'settings') {
-            setSettingsInitialPage(undefined);
-            setSettingsOnboardingHintPage(undefined);
-        }
-        if (!sandboxMode) {
-            persistLastView(nextView, useUiStore.getState().projectView.selectedProjectId);
-        }
-        writeViewToUrl(nextView);
-        setCurrentView(nextView);
-        if (nextView === 'settings') {
-            beginSettingsOpenTrace('handleViewChange');
-        }
-        // Settings can still suspend on its first render after a preload.
-        // Keep the current screen visible, just as for the other lazy routes.
-        startTransition(() => {
-            setActiveView(nextView);
-        });
-    }, [sandboxMode, startTransition]);
+        const changeView = () => {
+            if (nextView !== 'settings') {
+                setSettingsInitialPage(undefined);
+                setSettingsOnboardingHintPage(undefined);
+            }
+            if (!sandboxMode) {
+                persistLastView(nextView, useUiStore.getState().projectView.selectedProjectId);
+            }
+            writeViewToUrl(nextView);
+            setCurrentView(nextView);
+            if (nextView === 'settings') {
+                beginSettingsOpenTrace('handleViewChange');
+            }
+            // Settings can still suspend on its first render after a preload.
+            // Keep the current screen visible, just as for the other lazy routes.
+            startTransition(() => {
+                setActiveView(nextView);
+            });
+        };
+        if (nextView === currentView) changeView();
+        else runAfterTaskEditExit(changeView);
+    }, [currentView, sandboxMode, startTransition]);
 
     useEffect(() => {
         if (!viewSettingsHydrated || isLoading || timelineEnabled) return;

@@ -20,6 +20,17 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const DEFAULT_REVIEW_ADVANCE_DAYS = 7;
 
+export type ReviewOverviewScope = 'due' | 'all';
+
+/** Only an explicit, reached review date creates an outstanding reminder. */
+export function isTaskDueForReview(task: Pick<Task, 'status' | 'reviewAt' | 'deletedAt' | 'purgedAt'>, now: Date = new Date()): boolean {
+    return !task.deletedAt && !task.purgedAt && isTaskActionable(task) && isDueForReview(task.reviewAt, now);
+}
+
+export function getReviewOverviewTasks(tasks: readonly Task[], scope: ReviewOverviewScope, now: Date = new Date()): Task[] {
+    return tasks.filter((task) => scope === 'due' ? isTaskDueForReview(task, now) : !task.deletedAt && !task.purgedAt && isTaskActionable(task));
+}
+
 /**
  * Next review date after marking an item reviewed: `days` from now, preserving
  * the original value's date-only vs datetime shape (time-of-day carries over).
@@ -526,6 +537,8 @@ export type GetReviewOverviewGroupsParams = {
     orderedAreas: Area[];
     areaFilter: AreaFilterSelection;
     sortBy: TaskSortBy;
+    scope?: ReviewOverviewScope;
+    now?: Date;
 };
 
 /**
@@ -539,12 +552,14 @@ export function getReviewOverviewGroups({
     orderedAreas,
     areaFilter,
     sortBy,
+    scope = 'all',
+    now = new Date(),
 }: GetReviewOverviewGroupsParams): ReviewOverviewAreaGroup[] {
     const projectById = new Map(projects.map((project) => [project.id, project]));
     const areaById = new Map(orderedAreas.map((area) => [area.id, area]));
     const areaOrderById = new Map(orderedAreas.map((area, index) => [area.id, index]));
     const visibleTasks = sortTasksBy(
-        tasks.filter((task) => (
+        getReviewOverviewTasks(tasks, scope, now).filter((task) => (
             (task.status === 'inbox'
                 ? isTaskVisibleInInbox(task, { projectById })
                 : isTaskVisibleInArea(task, {
@@ -552,7 +567,6 @@ export function getReviewOverviewGroups({
                     projectById,
                     resolvedAreaFilter: areaFilter,
                 }))
-            && isTaskActionable(task)
         )),
         sortBy,
     );
@@ -632,25 +646,34 @@ export function getExternalCalendarDaySummaries(
     for (let offset = 0; offset < days; offset += 1) {
         const dayStart = new Date(startOfToday);
         dayStart.setDate(dayStart.getDate() + offset);
-        const dayEnd = new Date(dayStart);
-        dayEnd.setDate(dayEnd.getDate() + 1);
-        const dayEvents = events
-            .filter((event) => {
-                const start = safeParseDate(event.start);
-                const end = safeParseDate(event.end);
-                if (!start || !end) return false;
-                return start.getTime() < dayEnd.getTime() && end.getTime() > dayStart.getTime();
-            })
-            .sort((a, b) => {
-                const aStart = safeParseDate(a.start)?.getTime() ?? Number.POSITIVE_INFINITY;
-                const bStart = safeParseDate(b.start)?.getTime() ?? Number.POSITIVE_INFINITY;
-                return aStart - bStart;
-            });
+        const dayEvents = getExternalCalendarEventsForDay(events, dayStart);
         if (dayEvents.length > 0) {
             summaries.push({ dayStart, events: dayEvents, totalCount: dayEvents.length });
         }
     }
     return summaries;
+}
+
+/** The events that overlap `date`'s local day, earliest start first. */
+export function getExternalCalendarEventsForDay(
+    events: readonly ExternalCalendarEvent[],
+    date: Date,
+): ExternalCalendarEvent[] {
+    const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const dayEnd = new Date(dayStart);
+    dayEnd.setDate(dayEnd.getDate() + 1);
+    return events
+        .filter((event) => {
+            const start = safeParseDate(event.start);
+            const end = safeParseDate(event.end);
+            if (!start || !end) return false;
+            return start.getTime() < dayEnd.getTime() && end.getTime() > dayStart.getTime();
+        })
+        .sort((a, b) => {
+            const aStart = safeParseDate(a.start)?.getTime() ?? Number.POSITIVE_INFINITY;
+            const bStart = safeParseDate(b.start)?.getTime() ?? Number.POSITIVE_INFINITY;
+            return aStart - bStart;
+        });
 }
 
 export type ReviewStepId =
@@ -759,6 +782,7 @@ export type DailyReviewStepsOptions = {
     todayCalendarEventCount?: number;
     tomorrowCalendarEventCount?: number;
     externalCalendarHasError?: boolean;
+    externalCalendarLoading?: boolean;
 };
 
 export type WeeklyReviewStepsOptions = {
@@ -766,6 +790,7 @@ export type WeeklyReviewStepsOptions = {
     includeContextStep?: boolean;
     externalCalendarDayCount?: number;
     externalCalendarHasError?: boolean;
+    externalCalendarLoading?: boolean;
 };
 
 /**
@@ -791,7 +816,8 @@ export function buildReviewSteps(
             || b.dueToday.length > 0
             || (opts.todayCalendarEventCount ?? 0) > 0
             || (opts.tomorrowCalendarEventCount ?? 0) > 0
-            || Boolean(opts.externalCalendarHasError);
+            || Boolean(opts.externalCalendarHasError)
+            || Boolean(opts.externalCalendarLoading);
         const steps: ReviewStepFlags[] = [
             { id: 'today', hasWork: todayHasWork },
             { id: 'inbox', hasWork: b.inbox.length > 0 },
@@ -809,7 +835,8 @@ export function buildReviewSteps(
     const b = buckets as WeeklyReviewBuckets;
     const calendarHasWork = b.calendarItems.length > 0
         || (opts.externalCalendarDayCount ?? 0) > 0
-        || Boolean(opts.externalCalendarHasError);
+        || Boolean(opts.externalCalendarHasError)
+        || Boolean(opts.externalCalendarLoading);
     // "Not due yet" (scheduled) items don't count as work: nothing to act on today.
     const waitingHasWork = b.waitingGroups.due.length + b.waitingGroups.unscheduled.length > 0;
     const somedayHasWork = b.somedayGroups.due.length + b.somedayGroups.unscheduled.length > 0;

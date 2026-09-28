@@ -4,12 +4,13 @@ import {
     applyFilter,
     createTaskFilterPredicate,
     hasActiveFilterCriteria,
+    keepSavedFilters,
     markSavedFilterDeleted,
     normalizeFilterCriteria,
     normalizeSavedFilters,
     SAVED_FILTER_NO_PROJECT_ID,
 } from './saved-filters';
-import type { Task } from './types';
+import type { SavedFilter, Task } from './types';
 
 const task = (overrides: Partial<Task>): Task => ({
     id: overrides.id ?? 'task',
@@ -330,7 +331,7 @@ describe('saved filters', () => {
         }
     });
 
-    it('normalizes saved filter payloads for settings sync and storage', () => {
+    it('reads the known fields of a stored saved filter for screens', () => {
         const filters = normalizeSavedFilters([
             {
                 id: 'filter-1',
@@ -408,6 +409,59 @@ describe('saved filters', () => {
                 updatedAt: '2026-05-03T00:00:00.000Z',
                 deletedAt: '2026-05-03T00:00:00.000Z',
             }),
+        ]);
+    });
+
+    it('changes only the deleted entry: every other one stays as stored, in stored order', () => {
+        // A newer app's view and fields, stored after an older filter.
+        const newer = {
+            id: 'filter-newer',
+            name: 'Board lane',
+            view: 'board-lane',
+            criteria: { contexts: ['@desk'], futureCriterion: true },
+            futureField: 'kept',
+            createdAt: '2026-05-05T00:00:00.000Z',
+            updatedAt: '2026-05-05T00:00:00.000Z',
+        } as unknown as SavedFilter;
+        const older: SavedFilter = {
+            id: 'filter-older',
+            name: 'Desk',
+            view: 'focus',
+            criteria: { contexts: ['@desk'] },
+            createdAt: '2026-05-01T00:00:00.000Z',
+            updatedAt: '2026-05-01T00:00:00.000Z',
+        };
+        const doomed = { ...older, id: 'filter-doomed', name: 'Doomed', futureField: 'kept too' } as SavedFilter;
+        const stored = [newer, doomed, older];
+        const before = structuredClone(stored);
+
+        const filters = markSavedFilterDeleted(stored, 'filter-doomed', '2026-05-06T00:00:00.000Z');
+
+        expect(filters).toEqual([
+            newer,
+            { ...doomed, updatedAt: '2026-05-06T00:00:00.000Z', deletedAt: '2026-05-06T00:00:00.000Z' },
+            older,
+        ]);
+        expect(filters[0]).toBe(newer);
+        expect(stored).toEqual(before);
+    });
+
+    it('keeps stored entries as written and reads only the ones this build can show', () => {
+        const newer = {
+            id: 'filter-newer', name: 'Calendar lane', view: 'calendar', color: '#ff0000', sortBy: 'somethingNew',
+            criteria: { contexts: ['@desk'] }, createdAt: '2026-05-05T00:00:00.000Z', updatedAt: '2026-05-05T00:00:00.000Z',
+        };
+        const undated = { id: 'filter-undated', name: 'Calls', view: 'focus', sortBy: 'somethingNew', criteria: {} };
+        const stored = [newer, { name: 'No id' }, undated, { ...undated, name: 'Calls again' }, 'not a filter'];
+
+        const kept = keepSavedFilters(stored);
+        // Only the id-less entries go; a repeated id keeps its last copy at the first place.
+        expect(kept).toEqual([newer, { ...undated, name: 'Calls again' }]);
+        expect(kept[0]).toBe(newer);
+
+        // Screens: the newer app's view is hidden, an unknown sort is dropped, no timestamp is invented.
+        expect(normalizeSavedFilters(stored)).toEqual([
+            { id: 'filter-undated', name: 'Calls again', view: 'focus', criteria: {}, createdAt: '', updatedAt: '' },
         ]);
     });
 });

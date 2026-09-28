@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     buildQuickAddParseOptions,
     buildReviewSteps,
@@ -44,6 +44,7 @@ import { fetchExternalCalendarEvents, summarizeExternalCalendarWarnings } from '
 import { useUiStore } from '../../../store/ui-store';
 import { getWorkspaceCache } from '../../../lib/workspace-cache';
 import { ShareCardDialog } from '../../ShareCardDialog';
+import { runAfterTaskEditExit } from '../../Task/task-edit-session';
 
 type ReviewStep = 'inbox' | 'stale' | 'calendar' | 'waiting' | 'contexts' | 'projects' | 'someday' | 'completed';
 type ReviewStepDefinition = {
@@ -74,6 +75,7 @@ function SummaryRow({ good, text }: { good: boolean; text: string }) {
 
 export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps) {
     const { t, language } = useLanguage();
+    const closeReview = useCallback(() => runAfterTaskEditExit(onClose), [onClose]);
     const [shareCardReviewDate] = useState(() => {
         try {
             return new Intl.DateTimeFormat(language, {
@@ -162,12 +164,25 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
     // Deliberately over tasks (visible tasks), not the store's _tasksById
     // (all tasks incl. hidden) — PERF-03 leaves this site alone on purpose.
     const taskById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
-    const staleTaskEntries = useMemo(() => staleItems
-        .filter((item) => !item.id.startsWith('project:'))
-        .flatMap((item) => {
-            const task = taskById.get(item.id);
-            return task ? [{ daysStale: item.daysStale, task }] : [];
-        }), [staleItems, taskById]);
+    // Any save bumps updatedAt, so a stale task stops being stale the moment it is
+    // touched. Its row is also its inline editor, so dropping the row closed the
+    // editor mid-edit (adding a checklist item did it). Every task this review has
+    // listed stays listed, in its first order, while it is still Next or Waiting, and
+    // the step keeps counting as having work, so the review does not jump ahead (#1262).
+    const seenStaleTasksRef = useRef(new Map<string, number>());
+    const staleTaskEntries = useMemo(() => {
+        const stillStale = new Set<string>();
+        for (const item of staleItems) {
+            if (item.id.startsWith('project:')) continue;
+            stillStale.add(item.id);
+            if (!seenStaleTasksRef.current.has(item.id)) seenStaleTasksRef.current.set(item.id, item.daysStale);
+        }
+        return Array.from(seenStaleTasksRef.current).flatMap(([id, daysStale]) => {
+            const task = taskById.get(id);
+            if (!task || (task.status !== 'next' && task.status !== 'waiting')) return [];
+            return [{ daysStale: stillStale.has(id) ? daysStale : null, task }];
+        });
+    }, [staleItems, taskById]);
     const staleProjectItems = useMemo(
         () => staleItems.filter((item) => item.id.startsWith('project:')),
         [staleItems],
@@ -217,7 +232,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
     const steps = useMemo<ReviewStepDefinition[]>(() => {
         const list: ReviewStepDefinition[] = [
             { id: 'inbox', title: t('review.inboxStep'), description: t('review.inboxStepDesc'), icon: CheckSquare, hasWork: stepHasWork.get('inbox') ?? false },
-            { id: 'stale', title: t('review.staleStep'), description: t('review.staleStepDesc'), icon: History, hasWork: stepHasWork.get('stale') ?? false },
+            { id: 'stale', title: t('review.staleStep'), description: t('review.staleStepDesc'), icon: History, hasWork: (stepHasWork.get('stale') ?? false) || staleTaskEntries.length > 0 },
         ];
         list.push(
             { id: 'calendar', title: t('review.calendarStep'), description: t('review.calendarStepDesc'), icon: Calendar, hasWork: stepHasWork.get('calendar') ?? false },
@@ -232,7 +247,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
             { id: 'completed', title: t('review.allDone'), description: t('review.allDoneDesc'), icon: Check, hasWork: true },
         );
         return list;
-    }, [includeContextStep, stepHasWork, t]);
+    }, [includeContextStep, staleTaskEntries.length, stepHasWork, t]);
     const {
         displayedStep,
         currentStepIndex: safeStepIndex,
@@ -262,12 +277,12 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
             if (event.defaultPrevented || shareCardOpen) return;
             if (event.key === 'Escape') {
                 event.preventDefault();
-                onClose();
+                closeReview();
             }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [onClose, shareCardOpen]);
+    }, [closeReview, shareCardOpen]);
 
     useEffect(() => {
         if (sandboxMode) return;
@@ -300,16 +315,18 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
     }, [sandboxMode]);
 
     const nextStep = () => {
-        if (nextStepId) setCurrentStep(nextStepId);
+        if (nextStepId) runAfterTaskEditExit(() => setCurrentStep(nextStepId));
     };
 
     const prevStep = () => {
-        if (previousStepId) setCurrentStep(previousStepId);
+        if (previousStepId) runAfterTaskEditExit(() => setCurrentStep(previousStepId));
     };
 
     const finishReview = () => {
-        getWorkspaceCache()?.removeItem(WEEKLY_REVIEW_STEP_STORAGE_KEY);
-        onClose();
+        runAfterTaskEditExit(() => {
+            getWorkspaceCache()?.removeItem(WEEKLY_REVIEW_STEP_STORAGE_KEY);
+            onClose();
+        });
     };
 
     const renderStepRail = () => (
@@ -394,7 +411,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
         }
         setAiLoading(true);
         try {
-            const provider = createAIProvider(await buildAIConfig(settings, apiKey));
+            const provider = createAIProvider(await buildAIConfig(settings, apiKey, language));
             const response = await provider.analyzeReview({ items: staleItems });
             // Filter here, not in the apply path, so what is displayed and what
             // can be written never diverge.
@@ -519,7 +536,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
         void createProjectTaskFromPrompt(value).then((taskId) => {
             // The new task renders as a TaskItem in the project step; claiming
             // editingTaskId opens its inline editor without leaving the review.
-            if (taskId) setEditingTaskId(taskId);
+            if (taskId) runAfterTaskEditExit(() => setEditingTaskId(taskId));
         });
     };
 
@@ -774,7 +791,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
                 return (
                     <div className="space-y-4">
                         <p className="text-muted-foreground">{t('review.staleStepDesc')}</p>
-                        {staleItems.length === 0 ? (
+                        {staleTaskEntries.length + staleProjectItems.length === 0 ? (
                             <div className="text-center py-12 text-muted-foreground">
                                 <p>{t('review.aiEmpty')}</p>
                             </div>
@@ -785,9 +802,11 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
                                         <div className="flex-1 min-w-0">
                                             <TaskItem task={task} showProjectBadgeInActions={false} />
                                         </div>
-                                        <span className="shrink-0 text-xs text-muted-foreground whitespace-nowrap">
-                                            {formatI18nTemplate(t('review.staleDaysInactive'), { days: daysStale })}
-                                        </span>
+                                        {daysStale !== null && (
+                                            <span className="shrink-0 text-xs text-muted-foreground whitespace-nowrap">
+                                                {formatI18nTemplate(t('review.staleDaysInactive'), { days: daysStale })}
+                                            </span>
+                                        )}
                                     </div>
                                 ))}
                                 {staleProjectItems.map((item) => (
@@ -1080,7 +1099,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
     return (
         <>
         <Dialog
-            onClose={onClose}
+            onClose={closeReview}
             label={t('review.title')}
             panelClassName="max-w-4xl mx-4 max-h-[85vh] bg-card rounded-lg border-border shadow-xl"
         >
@@ -1090,7 +1109,7 @@ export function WeeklyReviewGuideModal({ onClose }: WeeklyReviewGuideModalProps)
                     {t('review.title')}
                 </h3>
                 <button
-                    onClick={onClose}
+                    onClick={closeReview}
                     className="p-1.5 rounded-md hover:bg-muted/50 text-muted-foreground hover:text-foreground transition-colors"
                     aria-label={t('common.close')}
                 >

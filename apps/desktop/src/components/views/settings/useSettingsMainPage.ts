@@ -111,11 +111,19 @@ export function useSettingsMainPage({
     useEffect(() => {
         let cancelled = false;
         applyThemeMode(themeMode);
-        if (isTauri && themeMode === 'system') {
+        if (isTauri && (themeMode === 'system' || themeMode === 'system-oled')) {
             void resolveSystemThemeCommandPreference(
                 (_step, error) => reportError('Failed to resolve system theme', error),
             ).then((theme) => {
-                if (!cancelled && theme) applyThemeMode('system', theme);
+                if (!cancelled && theme) {
+                    applyThemeMode(themeMode, theme);
+                    if (isLinux) void applyNativeTheme(
+                        resolveNativeTheme(themeMode, theme),
+                        () => import('@tauri-apps/api/app'),
+                        () => import('@tauri-apps/api/window'),
+                        (_step, error) => reportError('Failed to set theme', error),
+                    );
+                }
             });
         }
 
@@ -130,7 +138,7 @@ export function useSettingsMainPage({
         return () => {
             cancelled = true;
         };
-    }, [isTauri, themeMode]);
+    }, [isLinux, isTauri, themeMode]);
 
     useEffect(() => {
         if (!isTauri || isFlatpak) return;

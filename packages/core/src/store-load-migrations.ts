@@ -300,11 +300,6 @@ const recoverLegacyProjectReferencesMigration: LoadMigration = {
             };
         });
         if (count === 0) return null;
-        logInfo('Legacy archived project references recovered during load migration', {
-            scope: 'store',
-            category: 'storage',
-            context: { releaseCheck: 'v1.3.1/archive-reference-recovered', count },
-        });
         return {
             ...data,
             tasks,
@@ -353,11 +348,13 @@ const promoteScheduledTasksMigration: LoadMigration = {
         if (count === 0) return null;
         // The counterpart to #1248: this line names the one status this pass is
         // still allowed to rewrite, so a later "my status changed back" report
-        // is settled by whether it appears at all.
+        // is settled by whether it appears at all. Forced: this runs inside the
+        // load that reads the logging setting, so an unforced line is dropped.
         logInfo('Inbox tasks whose date arrived promoted to next during load migration', {
             scope: 'store',
             category: 'storage',
             context: { releaseCheck: 'v1.3.2/scheduled-inbox-promoted', count },
+            force: true,
         });
         return { ...data, tasks };
     },

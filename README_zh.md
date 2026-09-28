@@ -8,7 +8,7 @@
 
 一款基于「搞定」（Getting Things Done，GTD）方法的免费待办应用。可离线使用，无需账号。
 
-20,000+ 用户 · Windows · macOS · Linux · iOS · Android
+30,000+ 用户 · Windows · macOS · Linux · iOS · Android
 
 [**下载**](https://mindwtr.app/#download) · [功能](#功能亮点) · [文档](https://docs.mindwtr.app/) · [English](./README.md)
 
@@ -61,6 +61,13 @@
          alt="Get it on F-Droid"
          style="height: 74px"
          height="74" />
+  </a>
+  <a href="https://appimage.github.io/Mindwtr/" target="_blank">
+    <img alt="Download as an AppImage"
+         src="https://docs.appimage.org/_images/download-appimage-banner.svg"
+         align="center"
+         style="height: 50px"
+         height="50" />
   </a>
   <a href="https://snapcraft.io/mindwtr" target="_blank">
     <img alt="从 Snap Store 获取"

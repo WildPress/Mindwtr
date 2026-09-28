@@ -6,7 +6,7 @@ import {
     getUsedTaskTokensFromUsage,
 } from './task-token-usage';
 import { resolveRelativeStartUpdates } from './task-relative-start';
-import { compareTasksByProjectOrder, isTaskFutureStart, rescheduleTask, shouldAutoArchiveCompletedTask, baseTextCollator } from './task-utils';
+import { compareTasksByProjectOrder, isTaskFocusedNow, isTaskFutureFocusCandidate, isTaskFutureStart, rescheduleTask, shouldAutoArchiveCompletedTask, baseTextCollator } from './task-utils';
 import {
     isTaskActionable,
     isTaskFinished,
@@ -55,6 +55,34 @@ export const ensureAnalyticsProfileId = (settings: AppData['settings']): { setti
         return { settings, updated: false };
     }
     return { settings: { ...settings, analyticsProfileId: uuidv4() }, updated: true };
+};
+
+/** Conservative replay check: a copy edited since creation cannot acknowledge a lost reply. */
+export const matchesDuplicateSource = (source: Task, copy: Task, asNextAction = false): boolean => {
+    if (source.id === copy.id || source.deletedAt || copy.deletedAt || copy.purgedAt
+        || copy.rev !== 1 || copy.createdAt !== copy.updatedAt
+        || copy.status !== (asNextAction ? 'next' : isTaskFinished(source) ? 'inbox' : source.status)
+        || copy.completedAt !== undefined || copy.cancelledAt !== undefined || copy.isFocusedToday !== false
+        || copy.focusOrder !== undefined || copy.statusBeforeProjectArchive !== undefined
+        || copy.completedAtBeforeProjectArchive !== undefined || copy.isFocusedTodayBeforeProjectArchive !== undefined
+        || copy.projectArchivedAt !== undefined) return false;
+    const ignored = new Set(['id', 'status', 'recurrence', 'checklist', 'attachments', 'completedAt', 'cancelledAt',
+        'isFocusedToday', 'focusOrder', 'statusBeforeProjectArchive', 'completedAtBeforeProjectArchive',
+        'isFocusedTodayBeforeProjectArchive', 'projectArchivedAt', 'deletedAt', 'purgedAt',
+        'createdAt', 'updatedAt', 'rev', 'revBy', 'order', 'orderNum', 'boardOrder']);
+    for (const key of new Set([...Object.keys(source), ...Object.keys(copy)])) {
+        if (!ignored.has(key) && JSON.stringify(source[key as keyof Task]) !== JSON.stringify(copy[key as keyof Task])) return false;
+    }
+    const recurrence = typeof source.recurrence === 'object' && source.recurrence
+        ? normalizeRecurrenceForLoad({ ...source.recurrence, seriesId: copy.id }) : source.recurrence;
+    if (JSON.stringify(recurrence) !== JSON.stringify(copy.recurrence)) return false;
+    const checklist = (source.checklist ?? []).map((item) => ({ ...item, id: '', isCompleted: false }));
+    if (JSON.stringify(checklist) !== JSON.stringify((copy.checklist ?? []).map((item) => ({ ...item, id: '' })))) return false;
+    const links = (source.attachments ?? []).filter((item) => item.kind !== 'file').map((item) => ({
+        ...item, id: '', createdAt: copy.createdAt, updatedAt: copy.createdAt,
+        deletedAt: undefined, cloudKey: undefined, fileHash: undefined, localStatus: undefined,
+    }));
+    return JSON.stringify(links) === JSON.stringify((copy.attachments ?? []).map((item) => ({ ...item, id: '' })));
 };
 
 export const getReferenceTaskFieldClears = (): Partial<Task> => ({
@@ -165,6 +193,10 @@ export function applyTaskUpdates(oldTask: Task, updates: Partial<Task>, now: str
         };
     }
 
+    if (hasOwnField(finalUpdates, 'suppressMindwtrReminders') && finalUpdates.suppressMindwtrReminders === undefined) {
+        finalUpdates = { ...finalUpdates, suppressMindwtrReminders: false };
+    }
+
     return {
         updatedTask: normalizeTaskLifecycleFields({ ...oldTask, ...finalUpdates, updatedAt: now }),
         nextRecurringTask,
@@ -216,12 +248,15 @@ export const normalizeTaskUpdate = (
                 : undefined);
         adjustedUpdates = {
             ...adjustedUpdates,
+            // Normalize again once seriesId is final, so the rrule carries the
+            // series stamp: the shape the sync pass writes (as in sync.ts's
+            // repairTaskRecurrenceSeriesIdentity).
             recurrence: recurrence
-                ? {
+                ? normalizeRecurrenceForLoad({
                     ...recurrence,
                     seriesId,
                     ...(completedOccurrences !== undefined ? { completedOccurrences } : {}),
-                }
+                })
                 : undefined,
         };
     }
@@ -235,21 +270,10 @@ export const normalizeTaskUpdate = (
             orderNum: normalizedOrder,
         };
     }
-    // A schedule edit that defers the task (future start, or a recurring task
-    // hidden until its due/review date, #843) drops the Today star with it:
-    // the row leaves Focus either way, and a star surviving invisibly would
-    // resurface unasked when the deferral ends. Evaluated on the merged task so
-    // e.g. clearing the start of a recurring due-later task also unstars.
     const editsSchedule = hasOwnField(updates, 'startTime')
         || hasOwnField(updates, 'dueDate')
         || hasOwnField(updates, 'reviewAt')
         || hasOwnField(updates, 'recurrence');
-    if (editsSchedule && isTaskFutureStart({ ...task, ...adjustedUpdates })) {
-        adjustedUpdates = {
-            ...adjustedUpdates,
-            isFocusedToday: false,
-        };
-    }
     // Star ↔ status invariant: starring an unprocessed inbox task promotes it
     // to next (committing to do it today is a clarify decision), and demoting a
     // starred task to inbox takes the star with it. When one patch does both,
@@ -291,6 +315,14 @@ export const normalizeTaskUpdate = (
             status: 'next',
         };
     }
+    // Resolve Inbox promotion first: adding a start and star together queues
+    // a Next action. Other deferred statuses still lose their stars.
+    const scheduledTask = { ...task, ...adjustedUpdates };
+    if ((editsSchedule || hasOwnField(updates, 'status'))
+        && isTaskFutureStart(scheduledTask)
+        && !isTaskFutureFocusCandidate(scheduledTask)) {
+        adjustedUpdates = { ...adjustedUpdates, isFocusedToday: false };
+    }
     if (
         hasOwnField(adjustedUpdates, 'status')
         && adjustedUpdates.status !== task.status
@@ -302,16 +334,14 @@ export const normalizeTaskUpdate = (
         };
     }
     // A manual Focus position only means something while the task is in
-    // Today's Focus: any path that turns isFocusedToday off — explicit unstar
-    // or one of the auto-unstars above (future-start defer, demotion to
-    // inbox) — drops focusOrder with it, unless the same patch sets
-    // focusOrder itself.
+    // Today's Focus: unstar and future-start queue both drop focusOrder,
+    // unless this patch explicitly sets it.
     const resolvedIsFocusedToday = hasOwnField(adjustedUpdates, 'isFocusedToday')
         ? adjustedUpdates.isFocusedToday
         : task.isFocusedToday;
     if (
-        task.isFocusedToday === true
-        && resolvedIsFocusedToday !== true
+        ((task.isFocusedToday === true && resolvedIsFocusedToday !== true)
+            || (resolvedIsFocusedToday === true && isTaskFutureFocusCandidate({ ...task, ...adjustedUpdates })))
         && !hasOwnField(updates, 'focusOrder')
     ) {
         adjustedUpdates = {
@@ -1065,13 +1095,13 @@ export const computeProjectDerivedState = (
 // their historical focus flag but should not consume today's focus limit —
 // the Focus views never show them, so a counted-but-invisible star would eat
 // a slot the user cannot free.
-const isTaskCountedAsFocused = (task: Task): boolean => (
+const isTaskCountedAsFocused = (task: Task, now: Date): boolean => (
     !task.deletedAt
-    && task.isFocusedToday === true
+    && isTaskFocusedNow(task, now)
     && task.status !== 'done' && task.status !== 'reference' && task.status !== 'archived'
 );
 
-let focusedCountCache: { tasks: Task[]; count: number } | null = null;
+let focusedCountCache: { tasks: Task[]; day: string; count: number } | null = null;
 
 // Cheap alternative to getDerivedState().focusedCount for callers that only
 // need the count: a single linear scan, cached by array identity so repeat
@@ -1081,20 +1111,23 @@ let focusedCountCache: { tasks: Task[]; count: number } | null = null;
 // `tasks` array identity itself changes. Must read the SAME collection
 // (visible tasks) with the SAME predicate as computeTaskDerivedState.
 export const selectFocusedCount = (tasks: Task[]): number => {
-    if (focusedCountCache && focusedCountCache.tasks === tasks) {
+    const now = new Date();
+    const day = now.toDateString();
+    if (focusedCountCache && focusedCountCache.tasks === tasks && focusedCountCache.day === day) {
         return focusedCountCache.count;
     }
     let count = 0;
     for (const task of tasks) {
-        if (isTaskCountedAsFocused(task)) count += 1;
+        if (isTaskCountedAsFocused(task, now)) count += 1;
     }
-    focusedCountCache = { tasks, count };
+    focusedCountCache = { tasks, day, count };
     return count;
 };
 
 export const computeTaskDerivedState = (
     tasks: Task[],
-    tasksById?: Map<string, Task>
+    tasksById?: Map<string, Task>,
+    now: Date = new Date(),
 ): Pick<DerivedState, 'tasksById' | 'activeTasksByStatus' | 'tasksByProjectId' | 'tasksByContext' | 'tasksByTag' | 'focusedTasks' | 'projectTaskSummaryById' | 'allContexts' | 'allTags' | 'contextTokenUsage' | 'tagTokenUsage' | 'dateCoherenceIssuesByTaskId' | 'focusedCount'> => {
     const resolvedTasksById = tasksById ?? new Map<string, Task>();
     const activeTasksByStatus = new Map<TaskStatus, Task[]>();
@@ -1154,7 +1187,7 @@ export const computeTaskDerivedState = (
         if (dateCoherenceIssues.length > 0) {
             dateCoherenceIssuesByTaskId.set(task.id, dateCoherenceIssues);
         }
-        if (isTaskCountedAsFocused(task)) {
+        if (isTaskCountedAsFocused(task, now)) {
             focusedCount += 1;
             focusedTasks.push(task);
         }

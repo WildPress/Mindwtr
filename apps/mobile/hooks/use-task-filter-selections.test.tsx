@@ -21,6 +21,7 @@ const ALL_VISIBLE: TaskMetadataFilterVisibility = {
 
 const t = (key: string) => ({
   'common.search': 'Search',
+  'search.title': 'Search',
   'taskEdit.locationLabel': 'Location',
   'priority.urgent': 'Urgent',
   'energyLevel.high': 'High energy',
@@ -223,7 +224,7 @@ describe('useTaskFilterSelections', () => {
     expect(handle.current.criteria.locations).toBeUndefined();
   });
 
-  it('drops selections whose chip the view stopped offering', () => {
+  it('keeps selections clearable when the view stops offering their tokens', () => {
     const { handle, rerender } = renderSelections({ view: 'focus', retainTokens: ['@desk', '@phone'] });
 
     act(() => {
@@ -237,7 +238,46 @@ describe('useTaskFilterSelections', () => {
     rerender({ view: 'focus', retainTokens: ['@desk'] });
 
     expect(handle.current.tokens).toEqual(['@desk']);
-    expect(handle.current.excludedTokens).toEqual([]);
+    expect(handle.current.excludedTokens).toEqual(['@phone']);
+    expect(handle.current.chips.some((chip) => chip.label === '@phone')).toBe(true);
+  });
+
+  it('keeps an applied saved filter token while pruning hidden metadata and projects', () => {
+    const savedFilter: SavedFilter = {
+      id: 'filter-urgent',
+      name: 'Urgent',
+      view: 'focus',
+      criteria: {
+        contexts: ['@desk', '@gone'],
+        projects: ['project-1', 'project-gone'],
+        priority: ['urgent', 'high'],
+        energy: ['high'],
+        timeEstimates: ['30min'],
+        locations: ['Office'],
+      },
+      createdAt: '2026-04-01T00:00:00.000Z',
+      updatedAt: '2026-04-01T00:00:00.000Z',
+    };
+    const hidden: TaskMetadataFilterVisibility = { energyLevel: false, location: false, priority: false, timeEstimate: false };
+    const retain = { retainTokens: ['@desk'], retainProjects: ['project-1'] };
+    const { handle, rerender } = renderSelections({ view: 'focus', visibility: hidden, savedFilters: [savedFilter], ...retain });
+
+    act(() => handle.current.applySaved(savedFilter));
+    expect(handle.current.activeSavedFilterId).toBe('filter-urgent');
+    expect(handle.current).toMatchObject({
+      tokens: ['@desk', '@gone'],
+      projects: ['project-1'],
+      priorities: [],
+      energyLevels: [],
+      timeEstimates: [],
+      locationQuery: '',
+    });
+
+    // Detached and shown again, the hidden selections do not come back.
+    act(() => handle.current.unbindSaved());
+    rerender({ view: 'focus', visibility: ALL_VISIBLE, savedFilters: [savedFilter], ...retain });
+    expect(handle.current).toMatchObject({ priorities: [], energyLevels: [], timeEstimates: [], locationQuery: '' });
+    expect(handle.current.criteria.priority).toBeUndefined();
   });
 
   it('offers one removable chip per selection, in picker order', () => {
@@ -272,7 +312,19 @@ describe('useTaskFilterSelections', () => {
 
     act(() => handle.current.chips[1].onPress());
     expect(handle.current.tokens).toEqual([]);
-    expect(handle.current.excludedTokens).toEqual(['#waiting', '@work']);
+    expect(handle.current.excludedTokens).toEqual(['#waiting']);
+  });
+
+  it('removes included and excluded token chips without cycling their picker state', () => {
+    const { handle } = renderSelections({ view: 'focus' });
+    act(() => { handle.current.toggleToken('@work'); });
+    act(() => { handle.current.chips.find((chip) => chip.id === 'token:@work')?.onPress(); });
+    expect(handle.current.tokens).toEqual([]);
+    expect(handle.current.excludedTokens).toEqual([]);
+    act(() => { handle.current.toggleToken('@work'); handle.current.toggleToken('@work'); });
+    act(() => { handle.current.chips.find((chip) => chip.id === 'excluded-token:@work')?.onPress(); });
+    expect(handle.current.tokens).toEqual([]);
+    expect(handle.current.excludedTokens).toEqual([]);
   });
 
   it('shows the match-mode control only once several tokens of a kind compete', () => {

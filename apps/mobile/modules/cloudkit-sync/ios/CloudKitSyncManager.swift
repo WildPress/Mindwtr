@@ -22,6 +22,14 @@ final class CloudKitSyncManager {
 
     private init() {}
 
+    private static func preservingRecordErrors(_ errors: [Error]) -> Error {
+        let primary = errors[0] as NSError
+        var details = primary.userInfo
+        details[CKPartialErrorsByItemIDKey] = Dictionary(uniqueKeysWithValues:
+            errors.enumerated().map { (AnyHashable($0.offset), $0.element) })
+        return NSError(domain: primary.domain, code: primary.code, userInfo: details)
+    }
+
     private let attachmentRecordType = "MindwtrAttachment"
     private let attachmentAssetField = "asset"
 
@@ -103,6 +111,8 @@ final class CloudKitSyncManager {
         let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
         op.savePolicy = .changedKeys
         op.qualityOfService = .userInitiated
+        // Moves the asset bytes up, so it gets the long transfer budget.
+        CloudKitOperationTimeouts.apply(to: op, resourceSeconds: CloudKitOperationTimeouts.assetResourceSeconds)
 
         let savedRecord = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CKRecord, Error>) in
             var perRecordError: Error?
@@ -194,6 +204,7 @@ final class CloudKitSyncManager {
             let zone = CKRecordZone(zoneID: zoneID)
             let op = CKModifyRecordZonesOperation(recordZonesToSave: [zone], recordZoneIDsToDelete: nil)
             op.qualityOfService = .userInitiated
+            CloudKitOperationTimeouts.apply(to: op)
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 op.modifyRecordZonesResultBlock = { result in
                     switch result {
@@ -250,6 +261,7 @@ final class CloudKitSyncManager {
                 subscriptionIDsToDelete: nil
             )
             op.qualityOfService = .utility
+            CloudKitOperationTimeouts.apply(to: op)
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 op.modifySubscriptionsResultBlock = { result in
                     switch result {
@@ -307,7 +319,9 @@ final class CloudKitSyncManager {
             let recordID = CKRecord.ID(recordName: id, zoneID: zoneID)
             if let existing = existingByID[recordID] {
                 CloudKitRecordMapper.updateRecord(existing, from: json, recordType: recordType)
-                recordsToSave.append(existing)
+                if !existing.changedKeys().isEmpty {
+                    recordsToSave.append(existing)
+                }
             } else {
                 if let newRecord = CloudKitRecordMapper.record(from: json, recordType: recordType, zoneID: zoneID) {
                     recordsToSave.append(newRecord)
@@ -328,6 +342,7 @@ final class CloudKitSyncManager {
             let op = CKModifyRecordsOperation(recordsToSave: batch, recordIDsToDelete: nil)
             op.savePolicy = .changedKeys
             op.qualityOfService = .userInitiated
+            CloudKitOperationTimeouts.apply(to: op)
 
             // Serialize per-record callbacks — CloudKit dispatches on arbitrary queues.
             let cbQueue = DispatchQueue(label: "tech.dongdongbh.mindwtr.savecb")
@@ -391,6 +406,8 @@ final class CloudKitSyncManager {
             var userInfo: [String: Any] = [
                 NSLocalizedDescriptionKey: message,
                 NSUnderlyingErrorKey: primary,
+                CKPartialErrorsByItemIDKey: Dictionary(uniqueKeysWithValues:
+                    nonConflictErrors.enumerated().map { (AnyHashable($0.offset), $0.element) }),
             ]
             if !conflictIDs.isEmpty {
                 userInfo["conflictIDs"] = conflictIDs.joined(separator: ",")
@@ -407,6 +424,11 @@ final class CloudKitSyncManager {
         if ids.isEmpty { return [:] }
         let op = CKFetchRecordsOperation(recordIDs: ids)
         op.qualityOfService = .userInitiated
+        // This is how both saveAttachmentAsset and fetchAttachmentAsset pull an
+        // existing attachment record down, asset bytes included, so it gets the
+        // long transfer budget too. (saveRecords also calls it, for conflict
+        // re-reads of plain records, which finish well inside either budget.)
+        CloudKitOperationTimeouts.apply(to: op, resourceSeconds: CloudKitOperationTimeouts.assetResourceSeconds)
 
         let cbQueue = DispatchQueue(label: "tech.dongdongbh.mindwtr.fetchcb")
 
@@ -435,7 +457,7 @@ final class CloudKitSyncManager {
                         if !perRecordErrors.isEmpty {
                             let descriptions = perRecordErrors.prefix(5).map { $0.localizedDescription }.joined(separator: "; ")
                             NSLog("[CloudKitSyncManager] fetchRecordsByID had \(perRecordErrors.count) per-record error(s): \(descriptions)")
-                            continuation.resume(throwing: perRecordErrors[0])
+                            continuation.resume(throwing: CloudKitSyncManager.preservingRecordErrors(perRecordErrors))
                             return
                         }
                         continuation.resume(returning: results)
@@ -448,7 +470,7 @@ final class CloudKitSyncManager {
                             } else {
                                 let descriptions = perRecordErrors.prefix(5).map { $0.localizedDescription }.joined(separator: "; ")
                                 NSLog("[CloudKitSyncManager] fetchRecordsByID had \(perRecordErrors.count) real partial error(s): \(descriptions)")
-                                continuation.resume(throwing: perRecordErrors[0])
+                                continuation.resume(throwing: CloudKitSyncManager.preservingRecordErrors(perRecordErrors))
                             }
                         } else {
                             continuation.resume(throwing: error)
@@ -473,6 +495,7 @@ final class CloudKitSyncManager {
 
             let op = CKModifyRecordsOperation(recordsToSave: nil, recordIDsToDelete: batch)
             op.qualityOfService = .utility
+            CloudKitOperationTimeouts.apply(to: op)
             let cbQueue = DispatchQueue(label: "tech.dongdongbh.mindwtr.deletecb")
 
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -505,7 +528,7 @@ final class CloudKitSyncManager {
                                 } else {
                                     let descriptions = realErrors.prefix(5).map { $0.localizedDescription }.joined(separator: "; ")
                                     NSLog("[CloudKitSyncManager] deleteRecords had \(realErrors.count) real error(s): \(descriptions)")
-                                    continuation.resume(throwing: realErrors[0])
+                                    continuation.resume(throwing: CloudKitSyncManager.preservingRecordErrors(realErrors))
                                 }
                             } else {
                                 continuation.resume(throwing: error)
@@ -537,6 +560,7 @@ final class CloudKitSyncManager {
         let initialOp = CKQueryOperation(query: query)
         initialOp.zoneID = zoneID
         initialOp.qualityOfService = .userInitiated
+        CloudKitOperationTimeouts.apply(to: initialOp)
 
         do {
             let firstResult = try await runQueryOperation(initialOp)
@@ -551,6 +575,7 @@ final class CloudKitSyncManager {
             let continueOp = CKQueryOperation(cursor: nextCursor)
             continueOp.zoneID = zoneID
             continueOp.qualityOfService = .userInitiated
+            CloudKitOperationTimeouts.apply(to: continueOp)
             let result = try await runQueryOperation(continueOp)
             allRecords.append(contentsOf: result.records)
             cursor = result.cursor

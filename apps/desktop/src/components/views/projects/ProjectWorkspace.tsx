@@ -17,6 +17,8 @@ import { Attachment,
     type Section,
     type TaskSortBy,
     generateUUID,
+    formatI18nTemplate,
+    parseAttachmentLinkBatch,
     getInlineMarkdownPreview,
     stripMarkdown,
     resolveTaskSortByForFeatures,
@@ -41,7 +43,6 @@ import { focusTaskRowWhenMounted, useTaskListScope } from '../list/task-list-sco
 import { useTaskSelection } from '../list/useTaskSelection';
 import { ListBulkActions } from '../list/ListBulkActions';
 import { TaskBulkOrganizeModal } from '../list/TaskBulkOrganizeModal';
-import { normalizeAttachmentInput } from '../../../lib/attachment-utils';
 import { cn } from '../../../lib/utils';
 import { reportError } from '../../../lib/report-error';
 import { showUndoToast } from '../../../lib/undo-registry';
@@ -213,6 +214,8 @@ function ProjectTaskRows({ tasks, renderTask, scrollRef, pinnedTaskId }: Project
     });
 
     const rowVirtualizer = useVirtualizer({
+        // Inactive section virtualizers must not reset the shared scroller on mount (#1262).
+        enabled: shouldVirtualize,
         count: shouldVirtualize ? tasks.length : 0,
         getScrollElement: () => scrollRef.current,
         estimateSize: () => PROJECT_TASK_ROW_ESTIMATE,
@@ -747,10 +750,8 @@ export function ProjectWorkspace({
     }, [completedProjectTasks, orderedProjectTasks, projectSections.length, sectionTaskGroups.sections, sectionTaskGroups.unsectioned]);
     const projectTaskSequenceCues = useMemo<Map<string, ProjectSequenceTaskCue>>(() => {
         if (!selectedProject || projectTaskSortBy !== 'default') return new Map();
-        return getSequentialProjectTaskCues(selectedProject, orderedProjectTaskList, {
-            sectionIds: projectSections.map((section) => section.id),
-        });
-    }, [orderedProjectTaskList, projectSections, projectTaskSortBy, selectedProject]);
+        return getSequentialProjectTaskCues(selectedProject, selectedProjectTasks, projectSections);
+    }, [projectSections, projectTaskSortBy, selectedProject, selectedProjectTasks]);
     const availableSequenceLabel = resolveText('projects.availableNextAction', 'Available next action');
     const laterSequenceLabel = resolveText('projects.laterInSequence', 'Later in sequence');
     const visibleProjectTaskList = useMemo(() => {
@@ -1072,6 +1073,7 @@ export function ProjectWorkspace({
                         key={task.id}
                         task={task}
                         project={selectedProject!}
+                        onToggleSelect={(options) => toggleMultiSelect(task.id, options)}
                         interactionDisabled={isArchivedProject}
                         narrow={columnsLayout}
                         sequenceCue={projectTaskSequenceCues.get(task.id)}
@@ -1093,6 +1095,7 @@ export function ProjectWorkspace({
                     key={task.id}
                     task={task}
                     project={selectedProject!}
+                    onToggleSelect={(options) => toggleMultiSelect(task.id, options)}
                     interactionDisabled={isArchivedProject}
                     narrow={columnsLayout}
                     sequenceCue={projectTaskSequenceCues.get(task.id)}
@@ -1135,6 +1138,9 @@ export function ProjectWorkspace({
                     key={task.id}
                     task={task}
                     project={selectedProject}
+                    onToggleSelect={isArchivedProject || task.status === 'reference'
+                        ? undefined
+                        : (options) => toggleMultiSelect(task.id, options)}
                     enableDoubleClickEdit
                     showProjectBadgeInActions={false}
                     showProjectBadgeInMetadata={false}
@@ -1985,9 +1991,14 @@ export function ProjectWorkspace({
             <PromptModal
                 isOpen={showLinkPrompt}
                 title={t('attachments.addLink')}
-                description={t('attachments.linkInputHint')}
+                description={t('attachments.linkBatchHint')}
                 placeholder={t('attachments.linkPlaceholder')}
                 defaultValue=""
+                multiline
+                validate={(value) => {
+                    const { invalidLine } = parseAttachmentLinkBatch(value, true);
+                    return invalidLine === null ? null : formatI18nTemplate(t('attachments.invalidLinkLine'), { line: invalidLine });
+                }}
                 browseLabel={isTauriRuntime() ? t('attachments.linkToFile') : undefined}
                 onBrowse={isTauriRuntime() ? () => browseForLinkTarget(t('attachments.linkToFile')) : undefined}
                 confirmLabel={t('common.save')}
@@ -1996,19 +2007,19 @@ export function ProjectWorkspace({
                 onConfirm={(value) => {
                     const current = getMutableSelectedProject();
                     if (!current) return;
-                    const normalized = normalizeAttachmentInput(value);
-                    if (!normalized.uri) return;
+                    const batch = parseAttachmentLinkBatch(value, true);
+                    if (batch.invalidLine !== null || batch.entries.length === 0) return;
                     const now = new Date().toISOString();
-                    const attachment: Attachment = {
+                    const attachments: Attachment[] = batch.entries.map((entry) => ({
                         id: generateUUID(),
-                        kind: normalized.kind,
-                        title: normalized.title,
-                        uri: normalized.uri,
+                        kind: entry.kind,
+                        title: entry.title,
+                        uri: entry.uri,
                         createdAt: now,
                         updatedAt: now,
-                    };
+                    }));
                     updateProject(current.id, {
-                        attachments: [...(current.attachments || []), attachment],
+                        attachments: [...(current.attachments || []), ...attachments],
                     });
                     setShowLinkPrompt(false);
                 }}

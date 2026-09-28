@@ -189,11 +189,20 @@ describe('widget-service', () => {
 
     it('skips the native render when nothing any widget shows changed (#766)', async () => {
         const data = buildData(3);
+        const releaseMarkerCalls = () => mockLogInfo.mock.calls.filter(
+            ([message]) => message === 'Widget Focus pools published to native host',
+        );
         expect(await updateMobileWidgetFromData(data)).toBe(true);
         expect(mockAndroidWidgetSetPayload).toHaveBeenCalledTimes(1);
+        expect(mockLogInfo).toHaveBeenCalledWith('Widget Focus pools published to native host', {
+            scope: 'widget',
+            force: true,
+            extra: { releaseCheck: 'v1.3.2/widget-focus-pools' },
+        });
 
         expect(await updateMobileWidgetFromData({ ...data, tasks: data.tasks.map((task) => ({ ...task })) })).toBe(true);
         expect(mockAndroidWidgetSetPayload).toHaveBeenCalledTimes(1);
+        expect(releaseMarkerCalls()).toHaveLength(1);
 
         const changed = {
             ...data,
@@ -201,6 +210,7 @@ describe('widget-service', () => {
         };
         expect(await updateMobileWidgetFromData(changed)).toBe(true);
         expect(mockAndroidWidgetSetPayload).toHaveBeenCalledTimes(2);
+        expect(releaseMarkerCalls()).toHaveLength(2);
     });
 
     it('publishes an honestly capped Android Focus + Today payload, then refreshes', async () => {
@@ -287,7 +297,6 @@ describe('widget-service', () => {
         expect(mockLogInfo).toHaveBeenCalledWith('Android widget list rendered within parcel budget', {
             scope: 'widget',
             extra: {
-                releaseCheck: 'v1.3.1/android-widget-list-budget',
                 count: '2',
                 items: '87',
                 totalItems: '240',
@@ -335,6 +344,21 @@ describe('widget-service', () => {
         expect(mockLogInfo).toHaveBeenCalledWith('Android widget check-offs hidden after Undo', {
             scope: 'widget',
             extra: { releaseCheck: 'v1.3.1/widget-checkoff-hide', count: '2' },
+        });
+    });
+
+    it('logs serialized native checkoff mutations without task data', async () => {
+        mockAndroidWidgetUpdateWidgets.mockReturnValue({
+            legacyWidgetCount: 0,
+            compactWidgetCount: 0,
+            serializedCheckoffCount: 2,
+        });
+
+        expect(await updateMobileWidgetFromData(buildData(3))).toBe(true);
+
+        expect(mockLogInfo).toHaveBeenCalledWith('Android widget check-off state serialized', {
+            scope: 'widget',
+            extra: { releaseCheck: 'v1.3.2/widget-checkoff-serialized', count: '2' },
         });
     });
 
@@ -757,6 +781,9 @@ describe('widget-service', () => {
 
         expect(await updateMobileWidgetFromStore()).toBe(false);
         expect(vi.mocked(createWidgetPayloadProjection)).toHaveBeenCalledTimes(1);
+        expect(mockLogInfo.mock.calls.some(
+            ([message]) => message === 'Widget Focus pools published to native host',
+        )).toBe(false);
 
         // Retry with unchanged inputs (the immediate + 800ms pair callers
         // use): gate 0 must not have cached the failed render, so the

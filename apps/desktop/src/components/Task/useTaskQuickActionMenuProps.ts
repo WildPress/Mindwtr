@@ -1,6 +1,8 @@
 import { createElement, useCallback, useMemo } from 'react';
 import {
+    canSkipRecurringTaskOccurrence,
     createBulkOrganizeProject,
+    createTaskCancellationUndo,
     DEFAULT_PROJECT_COLOR,
     isProjectedRecurringTask,
     isTaskActionable,
@@ -23,6 +25,7 @@ import { reportError } from '../../lib/report-error';
 import { registerUndoableAction } from '../../lib/undo-registry';
 import { undoTaskCompletion } from '../../lib/undo-task-completion';
 import { useUiStore } from '../../store/ui-store';
+import { runAfterTaskEditExit } from './task-edit-session';
 import { formatTaskMarkedDoneMessage, formatTaskMovedMessage } from '@mindwtr/core';
 import { TaskQuickActionMenu, type TaskQuickActionMenuProps } from './TaskQuickActionMenu';
 import { useTaskItemProjectContext } from './useTaskItemProjectContext';
@@ -93,19 +96,21 @@ export async function duplicateTaskAndReveal(
             useUiStore.getState().showToast(result.error || t('task.duplicateFailed'), 'error');
             return;
         }
-        useTaskStore.getState().setHighlightTask(result.id);
-        if (task.projectId) {
-            useUiStore.getState().setProjectView({ selectedProjectId: task.projectId });
-            dispatchNavigateEvent('projects');
-        } else if (isTaskFinished(task)) {
-            // The copy goes to the Inbox to be re-clarified, so it is never in the
-            // Done/Archived list it was made from. Without this the duplicate
-            // succeeds somewhere the user cannot see and the click reads as a
-            // no-op (#950).
-            dispatchNavigateEvent('inbox');
-        }
-        useUiStore.getState().setTaskExpanded(result.id, false);
-        useUiStore.getState().setEditingTaskId(result.id);
+        runAfterTaskEditExit(() => {
+            useTaskStore.getState().setHighlightTask(result.id!);
+            if (task.projectId) {
+                useUiStore.getState().setProjectView({ selectedProjectId: task.projectId });
+                dispatchNavigateEvent('projects');
+            } else if (isTaskFinished(task)) {
+                // The copy goes to the Inbox to be re-clarified, so it is never in the
+                // Done/Archived list it was made from. Without this the duplicate
+                // succeeds somewhere the user cannot see and the click reads as a
+                // no-op (#950).
+                dispatchNavigateEvent('inbox');
+            }
+            useUiStore.getState().setTaskExpanded(result.id!, false);
+            useUiStore.getState().setEditingTaskId(result.id!);
+        });
     } catch (error) {
         reportError('Failed to duplicate task', error);
         useUiStore.getState().showToast(t('task.duplicateFailed'), 'error');
@@ -216,27 +221,80 @@ export function useTaskQuickActionMenuProps(
 
     const cancelAction = useMemo(() => {
         if (readOnly || !isTaskActionable(task) || isProjectedRecurringTask(task)) return [];
-        return [{
+        return [
+            ...(canSkipRecurringTaskOccurrence(task) ? [{
+                id: 'skip-recurring-occurrence',
+                label: tFallback(t, 'task.skipOccurrence', 'Skip this occurrence'),
+                onSelect: async () => {
+                    try {
+                        const result = await useTaskStore.getState().skipRecurringTaskOccurrence(task.id);
+                        if (!result.success) {
+                            useUiStore.getState().showToast(
+                                result.error || tFallback(t, 'task.skipOccurrenceFailed', 'Failed to skip occurrence'),
+                                'error',
+                            );
+                        }
+                    } catch (error) {
+                        reportError('Failed to skip recurring occurrence', error);
+                        useUiStore.getState().showToast(
+                            tFallback(t, 'task.skipOccurrenceFailed', 'Failed to skip occurrence'),
+                            'error',
+                        );
+                    }
+                },
+            }] : []), {
             id: 'cancel-task',
             label: task.recurrence
                 ? tFallback(t, 'task.cancelRecurringSeries', 'Cancel recurring series')
                 : tFallback(t, 'task.cancel', 'Cancel task'),
             onSelect: async () => {
-                try {
-                    const result = await useTaskStore.getState().cancelTask(task.id);
-                    if (!result.success) {
+                const before = useTaskStore.getState()._tasksById.get(task.id) ?? task;
+                let cancellationInFlight = false;
+                const attempt = async () => {
+                    if (cancellationInFlight) return;
+                    cancellationInFlight = true;
+                    try {
+                        const result = await useTaskStore.getState().cancelTask(task.id);
+                        if (!result.success) throw new Error(result.error || tFallback(t, 'task.cancelFailed', 'Failed to cancel task'));
+                        const cancelledAt = useTaskStore.getState()._tasksById.get(task.id)?.cancelledAt;
+                        const undoCancellation = createTaskCancellationUndo(before, cancelledAt);
+                        const restore = async () => {
+                            const outcome = await undoCancellation();
+                            if (outcome.success) return;
+                            reportError('Failed to undo task cancellation', new Error(outcome.error || 'Cancellation was superseded'));
+                            useUiStore.getState().showToast(
+                                outcome.error || tFallback(t, 'task.updateFailed', 'Could not update task.'),
+                                'error',
+                                5000,
+                                outcome.retryable
+                                    ? { label: tFallback(t, 'common.undo', 'Undo'), onClick: registerUndoableAction(() => { void restore(); }) }
+                                    : undefined,
+                            );
+                        };
+                        const undo = registerUndoableAction(() => { void restore(); });
                         useUiStore.getState().showToast(
-                            result.error || tFallback(t, 'task.cancelFailed', 'Failed to cancel task'),
-                            'error',
+                            tFallback(t, 'task.cancelledWithRestore', 'Task cancelled. You can restore it from Archive.'),
+                            'info',
+                            5000,
+                            useTaskStore.getState().settings?.undoNotificationsEnabled === false
+                                ? undefined
+                                : { label: tFallback(t, 'common.undo', 'Undo'), onClick: undo },
                         );
+                    } catch (error) {
+                        reportError('Failed to cancel task', error);
+                        useUiStore.getState().showToast(
+                            error instanceof Error ? error.message : tFallback(t, 'task.cancelFailed', 'Failed to cancel task'),
+                            'error',
+                            5000,
+                            useTaskStore.getState()._tasksById.has(task.id)
+                                ? { label: tFallback(t, 'common.retry', 'Try again'), onClick: () => { void attempt(); } }
+                                : undefined,
+                        );
+                    } finally {
+                        cancellationInFlight = false;
                     }
-                } catch (error) {
-                    reportError('Failed to cancel task', error);
-                    useUiStore.getState().showToast(
-                        tFallback(t, 'task.cancelFailed', 'Failed to cancel task'),
-                        'error',
-                    );
-                }
+                };
+                await attempt();
             },
         }];
     }, [readOnly, t, task]);

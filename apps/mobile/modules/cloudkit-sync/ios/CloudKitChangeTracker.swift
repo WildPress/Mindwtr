@@ -20,12 +20,13 @@ enum CloudKitChangeTracker {
     ) async throws -> ChangeResult {
         let previousToken = deserializeToken(changeTokenBase64)
 
-        var config = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
+        let config = CKFetchRecordZoneChangesOperation.ZoneConfiguration()
         config.previousServerChangeToken = previousToken
 
         let op = CKFetchRecordZoneChangesOperation(recordZoneIDs: [zoneID], configurationsByRecordZoneID: [zoneID: config])
         op.fetchAllChanges = true
         op.qualityOfService = .userInitiated
+        CloudKitOperationTimeouts.apply(to: op)
 
         // CloudKit dispatches callbacks on arbitrary queues. Serialize all
         // mutations to shared state through a serial queue to prevent races.

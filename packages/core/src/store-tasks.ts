@@ -19,6 +19,7 @@ import {
     getNextProjectOrder,
     getTaskOrder,
     getReferenceTaskFieldClears,
+    matchesDuplicateSource,
     isRestorableProjectArchiveSection,
     nextRevision,
     normalizeTaskUpdate,
@@ -38,9 +39,10 @@ import {
 } from './task-status';
 import { beginNotifyProfile, endNotifyProfile, type NotifyProfile } from './store-notify-profiler';
 import { generateUUID as uuidv4 } from './uuid';
-import { normalizeRecurrenceForLoad } from './recurrence';
+import { canSkipRecurringTaskOccurrence, canonicalRecurringFollowUp, createNextRecurringTask, normalizeRecurrenceForLoad } from './recurrence';
 import { normalizeRepeatReminderMinutes } from './schedule-utils';
 import { normalizeFocusTaskLimit } from './focus-utils';
+import { boardOrderForDuplicate, isTaskFutureFocusCandidate } from './task-utils';
 import {
     buildTaskContainerMovePatch,
     normalizeOptionalContainerId,
@@ -162,10 +164,9 @@ const stampNewRecurringFollowUp = (
     if (!task) return null;
     const order = sourceOrder ?? reserveProjectOrder(task.projectId);
     return {
-        ...task,
+        ...canonicalRecurringFollowUp(task),
         rev: nextRevision(undefined),
         revBy: deviceId,
-        pushCount: 0,
         ...(order !== undefined ? { order, orderNum: order } : {}),
     };
 };
@@ -176,6 +177,7 @@ type TaskActions = Pick<
     | 'addTasks'
     | 'updateTask'
     | 'cancelTask'
+    | 'skipRecurringTaskOccurrence'
     | 'deleteTask'
     | 'restoreTask'
     | 'restoreTasks'
@@ -586,7 +588,7 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                 });
                 newTask.status = focusDecision.status;
                 newTask.isFocusedToday = focusDecision.isFocusedToday;
-                if (focusDecision.outcome === 'focused') {
+                if (focusDecision.outcome === 'focused' && !isTaskFutureFocusCandidate(newTask)) {
                     creationContext.focusedCount += 1;
                 }
             }
@@ -635,6 +637,13 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                     ? { settings: completedCreationContext.deviceState.settings }
                     : {}),
             };
+        });
+
+        const queuedCount = newTasks.filter((task) => task.isFocusedToday && isTaskFutureFocusCandidate(task)).length;
+        if (queuedCount > 0) logInfo('Scheduled Focus queued', {
+            scope: 'store',
+            category: 'storage',
+            context: { releaseCheck: 'v1.3.3/scheduled-focus-queue', operation: 'create', count: queuedCount },
         });
 
         return actionOk({ id: resultIds[0], ids: resultIds });
@@ -699,7 +708,7 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
             return actionFail(preparedUpdates.error);
         }
         const isPromotingTaskFocus = preparedUpdates.updates.isFocusedToday === true && existingTask.isFocusedToday !== true;
-        if (isPromotingTaskFocus) {
+        if (isPromotingTaskFocus && !isTaskFutureFocusCandidate({ ...existingTask, ...preparedUpdates.updates })) {
             const focusTaskLimit = normalizeFocusTaskLimit(currentState.settings.gtd?.focusTaskLimit);
             const focusedCount = currentState.getFocusedCount();
             if (focusedCount >= focusTaskLimit) {
@@ -870,6 +879,70 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
             }
             logTaskProjectReactivationSaved(incrementalPersistence.reactivatedProjectIds.length);
         }
+        if (isPromotingTaskFocus && incrementalPersistence.task?.isFocusedToday
+            && isTaskFutureFocusCandidate(incrementalPersistence.task)) {
+            logInfo('Scheduled Focus queued', {
+                scope: 'store',
+                category: 'storage',
+                context: { releaseCheck: 'v1.3.3/scheduled-focus-queue', operation: 'update' },
+            });
+        }
+        return actionOk();
+    },
+
+    /** Archive one occurrence and durably create the next without a completion. */
+    skipRecurringTaskOccurrence: async (id: string) => {
+        const task = get()._tasksById.get(id);
+        if (!task || !canSkipRecurringTaskOccurrence(task)) {
+            const message = 'Only an active fixed-schedule recurring task can be skipped';
+            set({ error: message });
+            return actionFail(message);
+        }
+        const now = new Date().toISOString();
+        const changeAt = Date.now();
+        set((state) => {
+            const currentTask = state._tasksById.get(id)!;
+            const deviceState = ensureDeviceId(state.settings);
+            const { updatedTask } = applyTaskUpdates(currentTask, {
+                status: 'archived',
+                cancelledAt: now,
+                rev: nextRevision(currentTask.rev),
+                revBy: deviceState.deviceId,
+            }, now);
+            const nextTask = stampNewRecurringFollowUp(
+                createNextRecurringTask(currentTask, now, currentTask.status, { advanceOne: true }),
+                deviceState.deviceId,
+                getTaskOrder(currentTask),
+                (projectId) => getNextProjectOrder(projectId, state._allTasks),
+            );
+            const followUp = findExistingRecurringFollowUp(state._allTasks, nextTask, id)
+                ? null
+                : nextTask;
+            const updatedTasks = replaceEntityInArray(state._allTasks, id, updatedTask);
+            const tasks = followUp ? [...updatedTasks, followUp] : updatedTasks;
+            persist(set, debouncedSave, state, {
+                tasks,
+                ...(deviceState.updated ? { settings: deviceState.settings } : {}),
+            });
+            return {
+                _allTasks: tasks,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt, changeAt),
+                ...(deviceState.updated ? { settings: deviceState.settings } : {}),
+            };
+        });
+        try {
+            await flushPendingSave();
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const message = `Failed to save skipped occurrence: ${detail}`;
+            set({ error: message });
+            return actionFail(message);
+        }
+        logInfo('Recurring occurrence skipped', {
+            scope: 'store',
+            category: 'storage',
+            context: { releaseCheck: 'v1.3.3/skip-recurring-occurrence' },
+        });
         return actionOk();
     },
 
@@ -956,9 +1029,27 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
      * Permanently delete a task (removes from storage).
      */
     purgeTask: async (id: string) => {
-        return mutateTasks({ set, debouncedSave }, {
+        // Only a task still in Trash may be deleted forever: sync can restore it between the
+        // Trash confirmation and the tap, and then this must not purge a live task.
+        const current = get()._tasksById.get(id);
+        if (current && (!current.deletedAt || current.purgedAt)) {
+            logWarn('Purge refused for a task not in Trash', {
+                scope: 'store',
+                category: 'storage',
+                context: { releaseCheck: 'v1.3.3/purge-refused-outside-trash', purged: Boolean(current.purgedAt) },
+            });
+            return actionFail('Task is not in Trash');
+        }
+        // The mutation checks again on the state it writes, as purgeTasks does, so a
+        // purge that waited behind a document restore never compacts a live task.
+        const refusal = { purged: null as boolean | null };
+        const result = await mutateTasks({ set, debouncedSave }, {
             selectTasks: (state) => {
                 const task = state._tasksById.get(id);
+                if (task && (!task.deletedAt || task.purgedAt)) {
+                    refusal.purged = Boolean(task.purgedAt);
+                    return [];
+                }
                 return task ? [task] : [];
             },
             buildUpdates: (task, { now }) => ({
@@ -975,6 +1066,13 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
             },
             missingMessage: 'Task not found',
         });
+        if (refusal.purged === null) return result;
+        logWarn('Purge refused for a task not in Trash', {
+            scope: 'store',
+            category: 'storage',
+            context: { releaseCheck: 'v1.3.3/purge-refused-outside-trash', purged: refusal.purged },
+        });
+        return actionFail('Task is not in Trash');
     },
 
     /**
@@ -1046,15 +1144,25 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
      * on the actionable list: work finished once is not automatically still worth
      * doing, so it gets clarified again like any other capture (#950).
      */
-    duplicateTask: async (id: string, asNextAction?: boolean) => {
+    duplicateTask: async (id: string, asNextAction?: boolean, copyId?: string) => {
         const changeAt = Date.now();
         const now = new Date().toISOString();
         let missingTask = false;
+        let refusedCopyId = false;
         let duplicatedTaskId: string | undefined;
         set((state) => {
             const sourceTask = state._tasksById.get(id);
             if (!sourceTask || sourceTask.deletedAt) {
                 missingTask = true;
+                return state;
+            }
+            const existing = copyId ? state._tasksById.get(copyId) : undefined;
+            if (existing) {
+                if (!matchesDuplicateSource(sourceTask, existing, asNextAction)) {
+                    refusedCopyId = true;
+                } else {
+                    duplicatedTaskId = copyId;
+                }
                 return state;
             }
             const deviceState = ensureDeviceId(state.settings);
@@ -1083,7 +1191,7 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
             const duplicatedOrder = sourceTask.projectId
                 ? projectOrderReserver(sourceTask.projectId)
                 : undefined;
-            const newTaskId = uuidv4();
+            const newTaskId = copyId ?? uuidv4();
             duplicatedTaskId = newTaskId;
 
             const newTask: Task = {
@@ -1095,8 +1203,9 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                     : isTaskFinished(sourceTask)
                         ? 'inbox'
                         : sourceTask.status,
+                // Normalized so the rrule's series stamp names the new series too.
                 recurrence: typeof sourceTask.recurrence === 'object'
-                    ? { ...sourceTask.recurrence, seriesId: newTaskId }
+                    ? normalizeRecurrenceForLoad({ ...sourceTask.recurrence, seriesId: newTaskId })
                     : sourceTask.recurrence,
                 checklist: duplicatedChecklist.length > 0 ? duplicatedChecklist : undefined,
                 attachments: duplicatedAttachments.length > 0 ? duplicatedAttachments : undefined,
@@ -1107,6 +1216,7 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                 // project, so neither the focus position nor the restore
                 // metadata of the source belongs to it.
                 focusOrder: undefined,
+                boardOrder: undefined,
                 statusBeforeProjectArchive: undefined,
                 completedAtBeforeProjectArchive: undefined,
                 isFocusedTodayBeforeProjectArchive: undefined,
@@ -1120,7 +1230,10 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                 order: duplicatedOrder,
                 orderNum: duplicatedOrder,
             };
-
+            if (newTask.status === sourceTask.status) {
+                newTask.boardOrder = boardOrderForDuplicate(sourceTask.boardOrder,
+                    state._allTasks.filter((task) => task.status === sourceTask.status && !task.deletedAt));
+            }
             const newAllTasks = [...state._allTasks, newTask];
             persist(set, debouncedSave, state, {
                 tasks: newAllTasks,
@@ -1132,7 +1245,7 @@ export const createTaskActions = ({ set, get, getStorage, debouncedSave, flushPe
                 ...(deviceState.updated ? { settings: deviceState.settings } : {}),
             };
         });
-        return missingTask ? actionFail('Task not found') : actionOk({ id: duplicatedTaskId });
+        return missingTask ? actionFail('Task not found') : refusedCopyId ? actionFail('Duplicate id does not match source') : actionOk({ id: duplicatedTaskId });
     },
 
     /**

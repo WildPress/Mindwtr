@@ -24,6 +24,8 @@ import {
     AREA_FILTER_ALL,
     AREA_FILTER_NONE,
     buildProjectGroups,
+    formatI18nTemplate,
+    isManageAreaNameTaken,
     projectMatchesAreaFilterSelection,
     tFallback,
     useTaskStore,
@@ -77,6 +79,7 @@ import {
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import { usePersistedViewState } from '../../hooks/usePersistedViewState';
 import { getWorkspaceCache } from '../../lib/workspace-cache';
+import { runAfterTaskEditExit } from '../Task/task-edit-session';
 
 const projectsViewDndMeasuring = {
     droppable: {
@@ -182,8 +185,11 @@ export function ProjectsView() {
     const showToast = useUiStore((state) => state.showToast);
     const { requestConfirmation, confirmModal } = useConfirmDialog();
     const setSelectedProjectId = useCallback(
-        (value: string | null) => setProjectView({ selectedProjectId: value }),
-        [setProjectView]
+        (value: string | null) => {
+            if (value === selectedProjectId) return;
+            runAfterTaskEditExit(() => setProjectView({ selectedProjectId: value }));
+        },
+        [selectedProjectId, setProjectView]
     );
     const [isCreating, setIsCreating] = useState(false);
     const [newProjectTitle, setNewProjectTitle] = useState('');
@@ -616,8 +622,7 @@ export function ProjectsView() {
                 if (result && result.success === false) {
                     throw new Error(result.error || 'Failed to move task');
                 }
-                const message = tFallback(t, 'projects.taskMovedTo', 'Moved to {{name}}')
-                    .replace('{{name}}', destinationName);
+                const message = formatI18nTemplate(tFallback(t, 'projects.taskMovedTo', 'Moved to {{name}}'), { name: destinationName });
                 const undo = () => {
                     void Promise.resolve(updateTask(taskId, previous)).catch(failTaskMove);
                 };
@@ -868,7 +873,8 @@ export function ProjectsView() {
                         onChangeNewAreaName={(event) => setNewAreaName(event.target.value)}
                         onCreateArea={async () => {
                             const name = newAreaName.trim();
-                            if (!name) return;
+                            // A live area has this name: nothing to create, and the typed name stays.
+                            if (!name || isManageAreaNameTaken('newArea', name, areas)) return;
                             setIsAreaCreating(true);
                             try {
                                 await addArea(name, { color: newAreaColor });
@@ -896,13 +902,16 @@ export function ProjectsView() {
                     defaultValue=""
                     confirmLabel={t('projects.create')}
                     cancelLabel={t('common.cancel')}
+                    validate={(value) => (isManageAreaNameTaken('newArea', value, areas)
+                        ? tFallback(t, 'areas.nameExists', 'An area with this name already exists.')
+                        : null)}
                     onCancel={() => {
                         setShowQuickAreaPrompt(false);
                         setPendingAreaAssignProjectId(null);
                     }}
                     onConfirm={async (value) => {
                         const name = value.trim();
-                        if (!name) return;
+                        if (!name || isManageAreaNameTaken('newArea', name, areas)) return;
                         const targetProjectId = pendingAreaAssignProjectId;
                         setIsAreaCreating(true);
                         try {

@@ -64,6 +64,18 @@ const renderListView = (statusFilter: 'inbox' | 'next' | 'waiting' | 'someday' |
   );
 
 describe('ListView', () => {
+  it('opens a Waiting task when double-clicking the bottom of its row', () => {
+    useTaskStore.setState({
+      _allTasks: [makeTask('waiting-row', { status: 'waiting', assignedTo: 'Maya' })],
+      lastDataChangeAt: 1,
+    });
+    const view = renderListView('waiting', 'Waiting');
+    const row = view.getByText('Task waiting-row').closest('[data-task-id]');
+    expect(row).not.toBeNull();
+    fireEvent.doubleClick(row!);
+    expect(view.getByDisplayValue('Task waiting-row')).toBeInTheDocument();
+  });
+
   it('keeps the quiet Waiting person selector functional and resettable', () => {
     useTaskStore.setState({
       _allTasks: [
@@ -291,6 +303,27 @@ describe('ListView', () => {
     expect(queryByText('Try: Call mom /due:tomorrow 5pm @phone #family')).not.toBeInTheDocument();
   });
 
+  it('finds an archived bare context in Inbox Quick Add while blank choices stay visible-only', () => {
+    useTaskStore.setState({
+      _allTasks: [
+        makeTask('active', { status: 'inbox', contexts: ['@active-only'] }),
+        makeTask('archived', { status: 'archived', contexts: ['Seasonal Planning'] }),
+        makeTask('deleted', { status: 'next', contexts: ['@deleted-only'], deletedAt: now }),
+      ],
+      lastDataChangeAt: 1,
+    });
+    const view = renderListView('inbox', 'Inbox');
+    const input = view.getByPlaceholderText(/Add Task/i);
+    fireEvent.change(input, { target: { value: '@' } });
+    expect(view.queryByRole('option', { name: '@Seasonal Planning' })).not.toBeInTheDocument();
+    fireEvent.change(input, { target: { value: '@Seas' } });
+    expect(view.getByRole('option', { name: '@Seasonal Planning' })).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: 'Plan @Seasonal Planning' } });
+    expect(view.getByTestId('quick-add-preview')).toHaveTextContent('@Seasonal Planning');
+    fireEvent.change(input, { target: { value: '@dele' } });
+    expect(view.queryByRole('option', { name: '@deleted-only' })).not.toBeInTheDocument();
+  });
+
   it('keeps Mind Sweep open when the first capture populates an empty inbox', async () => {
     const addTask = vi.fn(async (title: string, initialProps?: Partial<Task>) => {
       const task = makeTask('captured', {
@@ -348,6 +381,13 @@ describe('ListView', () => {
   it('renders local search input in done view', () => {
     const html = renderStaticListView('done', 'Done');
     expect(html).toContain('data-view-filter-input');
+  });
+
+  it('labels the Done search chip with Search instead of the input placeholder', () => {
+    useTaskStore.setState({ _allTasks: [makeTask('done', { status: 'done', title: 'Milk' })], lastDataChangeAt: 1 });
+    const view = renderListView('done', 'Done');
+    fireEvent.change(view.container.querySelector('[data-view-filter-input]')!, { target: { value: 'Milk' } });
+    expect(view.getAllByText('Search: Milk').length).toBeGreaterThan(0);
   });
 
   it('keeps a legacy completed sort in Done without leaking it after navigation', () => {
@@ -1395,6 +1435,32 @@ describe('ListView', () => {
       expect(queryByText('Errand task')).toBeInTheDocument();
     });
     expect(useUiStore.getState().listFilters.criteria).not.toHaveProperty('excludedContexts');
+  });
+
+  it('offers a parent context filter and keeps it clearable after its task completes', async () => {
+    const tasks = [
+      makeTask('tool', { title: 'Tool task', contexts: ['@tools/excavator'] }),
+      makeTask('home', { title: 'Home task', contexts: ['@home'] }),
+    ];
+    useTaskStore.setState({ _allTasks: tasks, lastDataChangeAt: 1 });
+    const view = renderListView();
+    act(() => useUiStore.getState().setListFilters({ open: true }));
+    const panel = () => within(document.getElementById('list-filters-panel') as HTMLElement);
+    fireEvent.click(panel().getByRole('button', { name: 'Contexts & tags' }));
+    fireEvent.click(panel().getByRole('button', { name: /^@tools(?:\s|$)/ }));
+    expect(view.getByText('Tool task')).toBeInTheDocument();
+    expect(view.queryByText('Home task')).not.toBeInTheDocument();
+
+    act(() => useTaskStore.setState({
+      _allTasks: tasks.map((task) => task.id === 'tool' ? { ...task, status: 'done' as const } : task),
+      lastDataChangeAt: 2,
+    }));
+    expect(panel().getByRole('button', { name: /^@tools(?:\s|$)/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(view.queryByText('Home task')).not.toBeInTheDocument();
+    fireEvent.click(panel().getByRole('button', { name: /^@tools(?:\s|$)/ }));
+    fireEvent.click(panel().getByRole('button', { name: /^@tools(?:\s|$)/ }));
+    expect(useUiStore.getState().listFilters.criteria).not.toHaveProperty('contexts');
+    expect(view.getByText('Home task')).toBeInTheDocument();
   });
 
   it('selects and clears all visible tasks from the shared list toolbar', async () => {

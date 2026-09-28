@@ -92,6 +92,7 @@ describe('recurrence updates', () => {
             seriesId: 'series-1',
             count: 10,
             completedOccurrences: 3,
+            rrule: 'FREQ=WEEKLY;COUNT=10;X-MINDWTR-SERIES-ID=series-1',
         });
         const newSeries = normalizeTaskUpdate(task, {
             recurrence: { rule: 'weekly', seriesId: 'series-2', count: 10 },
@@ -134,6 +135,7 @@ describe('reference task invariants', () => {
         expect(updatedTask).toMatchObject({
             status: 'reference',
             isFocusedToday: false,
+            suppressMindwtrReminders: false,
             pushCount: 0,
         });
         for (const field of [
@@ -144,7 +146,6 @@ describe('reference task invariants', () => {
             'recurrence',
             'priority',
             'timeEstimate',
-            'suppressMindwtrReminders',
             'repeatReminderMinutes',
             'showFutureRecurrence',
             'focusOrder',

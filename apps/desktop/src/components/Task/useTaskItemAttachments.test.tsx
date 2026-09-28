@@ -39,7 +39,9 @@ vi.mock('../../lib/runtime', () => ({
 }));
 
 const logWarnMock = vi.fn();
+const logInfoMock = vi.fn();
 vi.mock('../../lib/app-log', () => ({
+    logInfo: (...args: unknown[]) => logInfoMock(...args),
     logWarn: (...args: unknown[]) => logWarnMock(...args),
 }));
 
@@ -65,7 +67,7 @@ const task = {
     updatedAt: new Date().toISOString(),
 } as unknown as Task;
 
-const t = (key: string) => key;
+const t = (key: string) => key === 'attachments.invalidLinkLine' ? 'Line {{line}}: invalid link.' : key;
 
 describe('useTaskItemAttachments addFileAttachment', () => {
     beforeEach(() => {
@@ -184,6 +186,7 @@ describe('useTaskItemAttachments resetAttachmentState orphan cleanup', () => {
         mkdirMock.mockClear();
         writeFileMock.mockClear();
         removeMock.mockClear();
+        logInfoMock.mockClear();
         invokeMock.mockRejectedValue(new Error('get_managed_data_dir not supported'));
     });
 
@@ -219,6 +222,105 @@ describe('useTaskItemAttachments resetAttachmentState orphan cleanup', () => {
         });
 
         expect(removeMock).toHaveBeenCalledWith(addedUri);
+    });
+
+    it('keeps a managed file that arrived from the store while retaining dictation audio', async () => {
+        const initialAttachment = {
+            id: 'initial-file',
+            kind: 'file' as const,
+            title: 'initial.txt',
+            uri: '/data/mindwtr/attachments/initial-file.txt',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const storeAttachment = {
+            id: 'store-file',
+            kind: 'file' as const,
+            title: 'store.txt',
+            uri: '/data/mindwtr/attachments/store-file.txt',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const retainedAudio = {
+            id: 'audio-file',
+            kind: 'file' as const,
+            title: 'Audio note',
+            uri: '/data/mindwtr/audio/audio-file.wav',
+            mimeType: 'audio/wav',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const localDraft = {
+            id: 'local-draft',
+            kind: 'file' as const,
+            title: 'draft.txt',
+            uri: '/data/mindwtr/attachments/local-draft.txt',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const taskWithAttachment = { ...task, attachments: [initialAttachment] };
+        const { result, unmount } = renderHook(() => useTaskItemAttachments({ task: taskWithAttachment, t }));
+
+        act(() => {
+            result.current.appendRetainedAttachment(retainedAudio, [storeAttachment]);
+        });
+        act(() => {
+            result.current.setEditAttachments((current) => [...current, localDraft]);
+        });
+        await act(async () => {
+            unmount();
+            await Promise.resolve();
+        });
+
+        expect(removeMock).not.toHaveBeenCalledWith(storeAttachment.uri);
+        expect(removeMock).not.toHaveBeenCalledWith(initialAttachment.uri);
+        expect(removeMock).toHaveBeenCalledWith(localDraft.uri);
+        expect(logInfoMock).toHaveBeenCalledWith(
+            'Store attachment files protected during draft settlement',
+            {
+                scope: 'attachment',
+                extra: { releaseCheck: 'v1.3.2/dictation-store-files-protected' },
+                force: true,
+            },
+        );
+    });
+
+    it('keeps both file generations when the store updates a baseline attachment id', async () => {
+        const baselineGeneration = {
+            id: 'shared-file',
+            kind: 'file' as const,
+            title: 'old.txt',
+            uri: '/data/mindwtr/attachments/shared-file.old.txt',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const storeGeneration = {
+            ...baselineGeneration,
+            title: 'new.txt',
+            uri: '/data/mindwtr/attachments/shared-file.new.txt',
+            updatedAt: new Date().toISOString(),
+        };
+        const retainedAudio = {
+            id: 'audio-file',
+            kind: 'file' as const,
+            title: 'Audio note',
+            uri: '/data/mindwtr/audio/audio-file.wav',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const taskWithAttachment = { ...task, attachments: [baselineGeneration] };
+        const { result, unmount } = renderHook(() => useTaskItemAttachments({ task: taskWithAttachment, t }));
+
+        act(() => {
+            result.current.appendRetainedAttachment(retainedAudio, [storeGeneration]);
+        });
+        await act(async () => {
+            unmount();
+            await Promise.resolve();
+        });
+
+        expect(removeMock).not.toHaveBeenCalledWith(baselineGeneration.uri);
+        expect(removeMock).not.toHaveBeenCalledWith(storeGeneration.uri);
     });
 
     it('removes the managed copy when a converted link persists, keeps it on cancel', async () => {
@@ -441,6 +543,7 @@ describe('useTaskItemAttachments resetAttachmentState orphan cleanup', () => {
             await Promise.resolve();
         });
 
+        expect(result.current.editAttachments).toHaveLength(0);
         expect(removeMock).not.toHaveBeenCalled();
     });
 
@@ -535,11 +638,25 @@ describe('TaskAttachmentOverlays', () => {
         fireEvent.click(screen.getByText('add-link'));
         expect(screen.getByRole('dialog', { name: 'attachments.addLink' })).toBeTruthy();
 
-        fireEvent.change(screen.getByRole('combobox'), { target: { value: 'https://example.com' } });
+        fireEvent.change(screen.getByRole('textbox'), { target: { value: 'https://example.com\nhttps://mindwtr.app' } });
         fireEvent.click(screen.getByText('common.save'));
 
         expect(screen.queryByRole('dialog')).toBeNull();
         expect(screen.getByText('https://example.com')).toBeTruthy();
+        expect(screen.getByText('https://mindwtr.app')).toBeTruthy();
+    });
+
+    it('keeps the original paste and appends nothing when a later line is invalid', () => {
+        render(<OverlaysHarness />);
+        fireEvent.click(screen.getByText('add-link'));
+        const input = screen.getByRole('textbox');
+        const pasted = 'https://example.com\n\nnot a link';
+        fireEvent.change(input, { target: { value: pasted } });
+
+        expect(screen.getByRole('alert')).toHaveTextContent('3');
+        expect(screen.getByText('common.save')).toBeDisabled();
+        expect(input).toHaveValue(pasted);
+        expect(screen.queryByText('https://example.com')).toBeNull();
     });
 
     it('labels the prompt for the Obsidian variant', () => {

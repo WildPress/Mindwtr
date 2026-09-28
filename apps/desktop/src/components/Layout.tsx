@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import {
     Calendar,
-    Inbox,
     GanttChartSquare,
     Kanban,
     Tag,
@@ -14,9 +13,6 @@ import {
     ChevronsLeft,
     ChevronsRight,
     Trash2,
-    PauseCircle,
-    Book,
-    Clock3,
     History as HistoryIcon,
     BookOpen,
     AlertTriangle,
@@ -33,6 +29,7 @@ import { useLanguage } from '../contexts/language-context';
 import { useUiStore } from '../store/ui-store';
 import { useObsidianStore } from '../store/obsidian-store';
 import { reportError } from '../lib/report-error';
+import { showSyncErrorToast } from '../lib/sync-error-toast';
 import { ToastHost } from './ToastHost';
 import { areaFilterSelectionToFilters, isTaskVisibleInInbox, resolveAreaFilterSelection, type AreaFilterSelection } from '@mindwtr/core';
 import { SyncService } from '../lib/sync-service';
@@ -41,6 +38,7 @@ import { getCalendarTaskDragTaskId, hasCalendarTaskDragData } from '../lib/calen
 import { stageCalendarDropLanding } from '../lib/calendar-view-params';
 import { SandboxBanner } from './sandbox/SandboxBanner';
 import { getWorkspaceCache } from '../lib/workspace-cache';
+import { TASK_STATUS_ICONS } from '../lib/task-status-icons';
 
 interface LayoutProps {
     children: React.ReactNode;
@@ -345,7 +343,7 @@ export function Layout({
             label: tFallback(t, 'nav.sectionFocus', 'Focus'),
             items: [
                 { id: 'agenda', labelKey: 'nav.agenda', icon: Target, tone: 'primary' },
-                { id: 'inbox', labelKey: 'nav.inbox', icon: Inbox, count: inboxCount, tone: 'primary' },
+                { id: 'inbox', labelKey: 'nav.inbox', icon: TASK_STATUS_ICONS.inbox, count: inboxCount, tone: 'primary' },
             ],
         },
         {
@@ -353,8 +351,8 @@ export function Layout({
             label: tFallback(t, 'nav.sectionLists', 'Lists'),
             items: [
                 { id: 'projects', labelKey: 'nav.projects', icon: Folder, tone: 'primary' },
-                { id: 'someday', labelKey: 'nav.someday', icon: Clock3 },
-                { id: 'waiting', labelKey: 'nav.waiting', icon: PauseCircle },
+                { id: 'someday', labelKey: 'nav.someday', icon: TASK_STATUS_ICONS.someday },
+                { id: 'waiting', labelKey: 'nav.waiting', icon: TASK_STATUS_ICONS.waiting },
             ],
         },
         {
@@ -370,7 +368,7 @@ export function Layout({
             key: 'secondary',
             label: tFallback(t, 'common.more', 'More'),
             items: [
-                { id: 'reference', labelKey: 'nav.reference', icon: Book },
+                { id: 'reference', labelKey: 'nav.reference', icon: TASK_STATUS_ICONS.reference },
                 ...(isObsidianEnabled
                     ? [{ id: 'obsidian', labelKey: 'nav.obsidian', fallbackLabel: 'Obsidian', icon: BookOpen }]
                     : []),
@@ -614,7 +612,7 @@ export function Layout({
                     'Mindwtr kept the local attachment. File Sync can only sync attachments under 100 MB. Replace it with a smaller file or remove the attachment, then sync again.',
                 ), 'info', 6000);
             } else if (result.success && result.remoteWriteDeferred) {
-                showToast(result.error || settings?.lastSyncError || tFallback(t, 'settings.lastSyncError', 'Sync failed'), 'error');
+                showSyncErrorToast(result.error || settings?.lastSyncError || tFallback(t, 'settings.lastSyncError', 'Sync failed'));
             } else if (result.success && result.attachmentWriteDeferred) {
                 showToast(tFallback(
                     t,
@@ -654,12 +652,12 @@ export function Layout({
             } else if (result.success) {
                 showToast(tFallback(t, 'settings.lastSyncSuccess', 'Sync completed'), 'success');
             } else {
-                showToast(result.error || tFallback(t, 'settings.lastSyncError', 'Sync failed'), 'error');
+                showSyncErrorToast(result.error || tFallback(t, 'settings.lastSyncError', 'Sync failed'));
             }
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            reportError('Sync failed', error);
-            showToast(`${tFallback(t, 'settings.lastSyncError', 'Sync failed')}: ${message}`, 'error');
+            reportError('Sync failed', error, { toast: false });
+            showSyncErrorToast(message);
         } finally {
             setIsManualSyncing(false);
         }

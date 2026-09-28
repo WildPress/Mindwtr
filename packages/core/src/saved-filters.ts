@@ -15,6 +15,7 @@ import type { BulkTaskTokenField } from './bulk-task-tokens';
 import { normalizeBulkTaskTokenInput } from './bulk-task-tokens';
 import { safeParseDate, safeParseDueDate } from './date';
 import { matchesHierarchicalToken, normalizePrefixedToken } from './hierarchy-utils';
+import { logInfo } from './logger';
 import type {
     DateRange,
     FilterCriteria,
@@ -431,22 +432,67 @@ export function createTaskFilterPredicate(
     return (task: Task) => taskMatchesPreparedFilterCriteria(task, context);
 }
 
+/**
+ * True when the normalized criteria ask for nothing. `normalizeFilterCriteria`
+ * only ever writes a key it means — no key is set to `undefined` or to an empty
+ * array, and the two match-mode keys ride along with the tokens they belong to
+ * — so an empty object is exactly "no criterion". A criterion added there later
+ * shows up here as a key and takes the full path, which is the safe direction.
+ */
+const hasNoCriteria = (context: PreparedFilterContext): boolean => (
+    Object.keys(context.normalized).length === 0
+);
+
 export function applyFilter<T extends Task>(
     tasks: readonly T[],
     criteria: FilterCriteria | undefined,
     options: ApplyFilterOptions = {}
 ): T[] {
-    return tasks.filter(createTaskFilterPredicate(criteria, options));
+    const context = prepareFilterContext(criteria, options);
+    // With no criteria, every one of the ~20 checks below passes and only the
+    // deleted-task rule is left, so run that rule alone. This is the common
+    // case, not a corner: Focus narrows four pools through here on every
+    // derivation and the screen has no saved filter until the user picks one.
+    // On an engine without a JIT those four passes were the single largest
+    // cost in the whole derivation.
+    if (hasNoCriteria(context)) return tasks.filter((task) => !task.deletedAt);
+    return tasks.filter((task) => taskMatchesPreparedFilterCriteria(task, context));
 }
 
+/**
+ * The storage and sync form of the saved filters: every entry exactly as
+ * written — views, fields and values this build does not know included — in
+ * stored order. Only an entry with no id is dropped; a repeated id keeps its
+ * last copy at the first copy's place. Nothing is interpreted or invented
+ * here (a missing createdAt stays missing), so load, save and merge never
+ * rewrite a filter. Entries may hold values the SavedFilter type does not
+ * list: screens read them through normalizeSavedFilter(s).
+ */
+export function keepSavedFilters(value: unknown): SavedFilter[] {
+    if (!Array.isArray(value)) return [];
+    const byId = new Map<string, SavedFilter>();
+    for (const item of value) {
+        if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;
+        byId.set(item.id, item as unknown as SavedFilter);
+    }
+    return Array.from(byId.values());
+}
+
+/**
+ * One stored saved filter as this build reads it: the fields it knows, with
+ * values it does not know dropped. Null when the filter cannot be shown here —
+ * no id, no name, or a view this build does not know (a newer app's view is
+ * hidden, never shown as a Focus filter). The id is kept as stored so writes
+ * find the stored entry. For reading only: writes change the stored entry.
+ */
 export function normalizeSavedFilter(value: unknown): SavedFilter | null {
     if (!isRecord(value)) return null;
     if (typeof value.id !== 'string' || !value.id.trim()) return null;
     if (typeof value.name !== 'string' || !value.name.trim()) return null;
-    const view = typeof value.view === 'string' && SAVED_FILTER_VIEW_VALUES.has(value.view as SavedFilterView)
-        ? value.view as SavedFilterView
-        : 'focus';
-    const createdAt = typeof value.createdAt === 'string' && value.createdAt.trim() ? value.createdAt : new Date().toISOString();
+    if (typeof value.view !== 'string' || !SAVED_FILTER_VIEW_VALUES.has(value.view as SavedFilterView)) return null;
+    const view = value.view as SavedFilterView;
+    // A missing timestamp reads as empty here and is never written back.
+    const createdAt = typeof value.createdAt === 'string' ? value.createdAt : '';
     const updatedAt = typeof value.updatedAt === 'string' && value.updatedAt.trim() ? value.updatedAt : createdAt;
     const sortBy = typeof value.sortBy === 'string' && SORT_FIELD_VALUES.has(value.sortBy as SortField)
         ? value.sortBy as SortField
@@ -459,7 +505,7 @@ export function normalizeSavedFilter(value: unknown): SavedFilter | null {
     const deletedAt = typeof value.deletedAt === 'string' && value.deletedAt.trim() ? value.deletedAt.trim() : undefined;
 
     return {
-        id: value.id.trim(),
+        id: value.id,
         name: value.name.trim(),
         ...(icon ? { icon } : {}),
         view,
@@ -473,29 +519,32 @@ export function normalizeSavedFilter(value: unknown): SavedFilter | null {
     };
 }
 
+/** The stored saved filters this build can show, read through normalizeSavedFilter, in stored order. */
 export function normalizeSavedFilters(value: unknown): SavedFilter[] {
-    if (!Array.isArray(value)) return [];
-    const byId = new Map<string, SavedFilter>();
-    for (const item of value) {
-        const normalized = normalizeSavedFilter(item);
-        if (!normalized) continue;
-        byId.set(normalized.id, normalized);
-    }
-    return Array.from(byId.values()).sort((a, b) => {
-        const createdDiff = Date.parse(a.createdAt) - Date.parse(b.createdAt);
-        if (Number.isFinite(createdDiff) && createdDiff !== 0) return createdDiff;
-        return a.name.localeCompare(b.name);
+    return keepSavedFilters(value).flatMap((filter) => {
+        const normalized = normalizeSavedFilter(filter);
+        return normalized ? [normalized] : [];
     });
 }
 
+/**
+ * Tombstone one saved filter. Only that entry changes: the others stay as
+ * stored, in stored order, including a newer app's views and fields.
+ */
 export function markSavedFilterDeleted(
     filters: readonly SavedFilter[] | undefined,
     filterId: string,
     deletedAt: string = new Date().toISOString(),
 ): SavedFilter[] {
-    return normalizeSavedFilters(filters).map((filter) => (
+    const next = (filters ?? []).map((filter) => (
         filter.id === filterId
             ? { ...filter, updatedAt: deletedAt, deletedAt }
             : filter
     ));
+    logInfo('Saved filter deleted; other saved filters kept as stored', {
+        scope: 'saved-filters',
+        category: 'storage',
+        context: { releaseCheck: 'v1.3.3/saved-filter-delete-keeps-others', count: next.length - 1 },
+    });
+    return next;
 }

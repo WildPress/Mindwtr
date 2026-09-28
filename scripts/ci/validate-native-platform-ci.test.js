@@ -15,6 +15,16 @@ test("native CI generates clean projects and compiles Android and iOS sources", 
   )?.[1];
 
   expect(workflow).toContain('apps/mobile/modules/**/android/**');
+  expect(workflow.match(/- "apps\/android-native\/\*\*"/g)).toHaveLength(2);
+  expect(workflow.match(/- "packages\/core\/package\.json"/g)).toHaveLength(2);
+  expect(workflow).toContain('android_client: ${{ steps.filter.outputs.android_client }}');
+  expect(workflow).toContain('apps/android-native/*|packages/core/src/*|packages/core/package.json|');
+  const clientJob = parse(workflow).jobs['android-client'];
+  expect(clientJob.if).toContain("needs.changes.outputs.android_client == 'true'");
+  expect(clientJob.steps.find((step) => step.name === 'Build Android Compose client')).toMatchObject({
+    'working-directory': 'apps/android-native/android',
+    run: './gradlew :app:assembleDebug --no-daemon',
+  });
   expect(workflow).toContain('apps/mobile/modules/**/ios/**');
   expect(
     workflow.match(/- "apps\/mobile\/modules\/\*\*\/expo-module\.config\.json"/g),
@@ -74,9 +84,8 @@ test("native CI generates clean projects and compiles Android and iOS sources", 
   expect(workflow).toContain("name: iOS Swift compile");
   expect(workflow).toContain("gem install cocoapods --version 1.16.2 --no-document");
   expect(workflow).toMatch(/prebuild \\\n\s+--clean \\\n\s+--platform ios/);
-  expect(iosJob).toContain("-destination 'generic/platform=iOS Simulator'");
   const hostCompile = parse(workflow).jobs["ios-native"].steps
-    .find((step) => step.name === "Compile iOS app and native Swift modules").run;
+    .find((step) => step.name === "Build bundled Release app for the iOS 27 simulator").run;
   expect(hostCompile).not.toContain("-sdk iphonesimulator");
   expect(iosJob).toContain("-target MindwtrWatch");
   expect(iosJob).toContain("-sdk watchsimulator");
@@ -124,16 +133,16 @@ test("native CI generates clean projects and compiles Android and iOS sources", 
   );
 });
 
-test("native CI keeps the Xcode 26 baseline and adds isolated Xcode 27 evidence", () => {
+test("native CI uses one Xcode 27 lane and retains Apple validation coverage", () => {
   const workflowText = readFileSync(".github/workflows/native-platform-ci.yml", "utf8");
   const workflow = parse(workflowText);
   const job = workflow.jobs["ios-native"];
   const lanes = Object.fromEntries(
-    job.strategy.matrix.include.map((entry) => [entry.lane, entry]),
+    appleRouting(false, false).matrix.include.map((entry) => [entry.lane, entry]),
   );
 
   expect(job.strategy["fail-fast"]).toBe(false);
-  expect(lanes.xcode26.runner).toBe("macos-15");
+  expect(Object.keys(lanes)).toEqual(["xcode27"]);
   expect(lanes.xcode27.runner).toBe("xcode-27");
   expect(workflow.on.push.branches).toContain("fix/ios27-1193");
 
@@ -167,13 +176,10 @@ test("native CI keeps the Xcode 26 baseline and adds isolated Xcode 27 evidence"
     expect(step.if).toBeUndefined();
   }
 
-  for (const stepName of [
-    "Compile Watch app and complications",
-    "Compile iOS app and native Swift modules",
-  ]) {
-    expect(job.steps.find((step) => step.name === stepName)?.if)
-      .toContain("matrix.lane == 'xcode26'");
-  }
+  expect(job.steps.find((step) => step.name === "Compile Watch app and complications").if)
+    .toBeUndefined();
+  expect(job.steps.find((step) => step.name === "Select the requested Apple SDK").run)
+    .toContain("select-apple-sdk.sh 27");
 
   const simulatorBuild = job.steps.find((step) => step.name === "Build bundled Release app for the iOS 27 simulator");
   expect(simulatorBuild.if).toContain("matrix.lane == 'xcode27'");
@@ -444,6 +450,7 @@ test("desktop Rust pull requests check and test the native library on Windows", 
 test("manual native CI selects one platform or all platforms", () => {
   const workflow = parse(readFileSync(".github/workflows/native-platform-ci.yml", "utf8"));
   const platforms = ["ios", "android", "macos", "windows"];
+  const outputs = [...platforms, "android_client"];
   expect(workflow.on.workflow_dispatch.inputs.platform.default).toBe("all");
   const script = workflow.jobs.changes.steps.find((step) => step.id === "filter").run;
   const directory = mkdtempSync(join(tmpdir(), "mindwtr-native-dispatch-"));
@@ -454,8 +461,8 @@ test("manual native CI selects one platform or all platforms", () => {
         env: { ...process.env, EVENT_NAME: "workflow_dispatch", DISPATCH_PLATFORM: selection, GITHUB_OUTPUT: output },
       });
       const actual = Object.fromEntries(readFileSync(output, "utf8").trim().split("\n").map((line) => line.split("=")));
-      expect(actual).toEqual(Object.fromEntries(platforms.map((platform) => [
-        platform, String(selection === "all" || selection === platform),
+      expect(actual).toEqual(Object.fromEntries(outputs.map((platform) => [
+        platform, String(selection === "all" || selection === platform || (platform === "android_client" && selection === "android")),
       ])));
     }
   } finally {
@@ -485,4 +492,46 @@ test("macOS native CI links the release Rust and Swift bridges", () => {
   expect(loadStep.run).toContain("path /usr/lib/swift (offset");
   expect(loadStep.run).toContain("ctypes.CDLL(sys.argv[1])");
   expect(loadStep.run).toContain("env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH");
+});
+
+function appleRouting(privateRunner, enabled) {
+  const workflow = parse(readFileSync(".github/workflows/native-platform-ci.yml", "utf8"));
+  const step = workflow.jobs.changes.steps.find((step) => step.id === "routing");
+  const root = mkdtempSync(join(tmpdir(), "mindwtr-routing-"));
+  try {
+    const output = join(root, "output");
+    execFileSync("bash", ["-c", step.run], { env: {
+      ...process.env, GITHUB_OUTPUT: output,
+      PRIVATE_MACMINI: String(privateRunner), USE_MACMINI: String(enabled),
+    }});
+    const values = Object.fromEntries(readFileSync(output, "utf8").trim().split("\n")
+      .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+    return { matrix: JSON.parse(values.matrix), macmini: values.macmini };
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+test("Apple routing keeps hosted fallback and isolates the private Mac runner", () => {
+  expect(appleRouting(false, false).matrix.include.map((lane) => lane.runner))
+    .toEqual(["xcode-27"]);
+  expect(appleRouting(false, true)).toMatchObject({
+    matrix: { include: [{ lane: "xcode27", runner: "xcode-27" }] }, macmini: "true",
+  });
+  const privateRoute = appleRouting(true, true);
+  expect(privateRoute.macmini).toBe("false");
+  expect(privateRoute.matrix.include).toHaveLength(1);
+  expect(privateRoute.matrix.include[0].runner).toEqual(["self-hosted", "macOS", "ARM64", "mindwtr-apple"]);
+  const workflow = parse(readFileSync(".github/workflows/native-platform-ci.yml", "utf8"));
+  const steps = workflow.jobs.changes.steps;
+  const routing = steps.find((step) => step.id === "routing");
+  expect(routing.env.USE_MACMINI).toContain("github.ref == 'refs/heads/main'");
+  expect(routing.env.USE_MACMINI).toContain("github.event_name == 'push' || github.event_name == 'workflow_dispatch'");
+  expect(routing.env.USE_MACMINI).toContain("inputs.apple_runner != 'github'");
+  expect(routing.env.PRIVATE_MACMINI).toContain("github.repository == 'dongdongbh/Mindwtr-native-ci'");
+  const guard = steps.find((step) => step.name === "Require a commit already merged into public main");
+  expect(guard.run).toBe('git merge-base --is-ancestor "$SOURCE_SHA" origin/main');
+  expect(steps.indexOf(guard)).toBeLessThan(steps.indexOf(routing));
+  expect(workflow.jobs["ios-native"].needs).toBe("changes");
+  expect(workflow.jobs["ios-native"].if).toContain("needs.changes.outputs.macmini != 'true'");
+  expect(workflow.jobs["ios-macmini"].if).toContain("needs.changes.outputs.macmini == 'true'");
+  expect(workflow.jobs["ios-macmini"]["runs-on"]).toBe("ubuntu-latest");
 });

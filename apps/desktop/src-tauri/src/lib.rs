@@ -116,7 +116,7 @@ use platform::{
 use storage::{
     create_data_snapshot, delete_calendar_sync_entry, get_all_calendar_sync_entries,
     get_calendar_sync_entry, get_config_path_for_startup, get_data, get_data_path_cmd,
-    get_db_path_cmd, list_data_snapshots, query_tasks, read_data_json, restore_data_snapshot,
+    get_db_path_cmd, list_data_snapshots, query_tasks, read_data_json, read_data_snapshot,
     save_data, save_task, search_fts, upsert_calendar_sync_entry,
 };
 use sync::{
@@ -140,6 +140,7 @@ use sync_encryption::{
     clear_sync_encryption_key_material, derive_sync_encryption_key,
     get_sync_encryption_key_material, get_sync_encryption_status,
     mark_sync_encryption_remote_discovered, mark_sync_encryption_remote_plaintext,
+    restore_sync_encryption_verified_remote,
     mark_sync_encryption_transition_incomplete, set_sync_encryption_key_material,
 };
 use ui::{
@@ -1733,6 +1734,8 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            #[cfg(target_os = "linux")]
+            ui::start_portal_theme_watcher(app.handle().clone());
             #[cfg(target_os = "macos")]
             log::info!(
                 "macOS native startup reached after runtime loading extra.releaseCheck=v1.3.0/macos-swift-runtime"
@@ -1755,7 +1758,7 @@ pub fn run() {
             save_task,
             create_data_snapshot,
             list_data_snapshots,
-            restore_data_snapshot,
+            read_data_snapshot,
             query_tasks,
             search_fts,
             get_data_path_cmd,
@@ -1811,6 +1814,7 @@ pub fn run() {
             derive_sync_encryption_key,
             mark_sync_encryption_remote_discovered,
             mark_sync_encryption_remote_plaintext,
+            restore_sync_encryption_verified_remote,
             mark_sync_encryption_transition_incomplete,
             enable_sync_encryption,
             disable_sync_encryption,

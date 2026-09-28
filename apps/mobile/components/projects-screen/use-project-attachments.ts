@@ -4,10 +4,10 @@ import {
   Attachment,
   generateUUID,
   isSandboxMode,
-  normalizeLinkAttachmentInput,
+  parseAttachmentLinkBatch,
   Project,
   useTaskStore,
-  validateAttachmentForUpload, tFallback } from '@mindwtr/core';
+  validateAttachmentForUpload, tFallback, formatI18nTemplate } from '@mindwtr/core';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Linking from 'expo-linking';
 import { isLikelyFilePath } from '@/lib/sync-service-utils';
@@ -183,7 +183,7 @@ export function useProjectAttachments({
         // example D:\\Documents\\x.docx) and is never uploaded; handing it to the
         // OS as a URL failed silently (#1001).
         if (isLikelyFilePath(resolved.uri) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(resolved.uri)) {
-            Alert.alert(t('attachments.title'), tFallback(t, 'attachments.linkedFileElsewhere', 'This link points to a file on another device: {{path}}. Open it there, or attach the file instead of linking it.').replace('{{path}}', resolved.uri));
+            Alert.alert(t('attachments.title'), formatI18nTemplate(tFallback(t, 'attachments.linkedFileElsewhere', 'This link points to a file on another device: {{path}}. Open it there, or attach the file instead of linking it.'), { path: resolved.uri }));
             return;
         }
         Linking.openURL(resolved.uri).catch((error) => {
@@ -297,23 +297,27 @@ export function useProjectAttachments({
     }
     const current = getMutableSelectedProject();
     if (!current) return;
-    const normalized = normalizeLinkAttachmentInput(linkInput);
-    if (!normalized.uri) return;
+    const batch = parseAttachmentLinkBatch(linkInput);
+    if (batch.invalidLine !== null) {
+      Alert.alert(t('attachments.title'), formatI18nTemplate(t('attachments.invalidLinkLine'), { line: batch.invalidLine }));
+      return;
+    }
+    if (batch.entries.length === 0) return;
     const now = new Date().toISOString();
-    const attachment: Attachment = {
+    const added: Attachment[] = batch.entries.map((entry) => ({
       id: generateUUID(),
-      kind: normalized.kind,
-      title: normalized.title,
-      uri: normalized.uri,
+      kind: entry.kind,
+      title: entry.title,
+      uri: entry.uri,
       createdAt: now,
       updatedAt: now,
-    };
-    const next = [...(current.attachments || []), attachment];
+    }));
+    const next = [...(current.attachments || []), ...added];
     updateProject(current.id, { attachments: next });
     setSelectedProject({ ...current, attachments: next });
     setLinkModalVisible(false);
     setLinkInput('');
-  }, [getMutableSelectedProject, linkInput, setSelectedProject, showSandboxUnavailable, updateProject]);
+  }, [getMutableSelectedProject, linkInput, setSelectedProject, showSandboxUnavailable, t, updateProject]);
 
   const removeProjectAttachment = useCallback((id: string) => {
     const current = getMutableSelectedProject();

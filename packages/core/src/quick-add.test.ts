@@ -19,6 +19,19 @@ describe('quick-add', () => {
         expect(splitQuickAddBulkLines(' \n\t\r\n ')).toEqual([]);
     });
 
+    it('trims a trailing hyphen or dash before a detected date, and nothing between } and the dashes', () => {
+        const now = new Date('2025-01-01T10:00:00Z');
+        // Each separator on its own, before a date the parser reads out of the prose.
+        for (const sep of [' - ', ' – ', ' — ', ' -- ', '- ']) {
+            const result = parseQuickAdd(`Pay rent${sep}tomorrow`, undefined, now);
+            expect(result.detectedDate?.titleWithoutDate).toBe('Pay rent');
+        }
+        // If the class ever became `}-–` (a range), every character between `}`
+        // and `–` in code-point order, `~` among them, would be trimmed as well.
+        expect(parseQuickAdd('Fix bug ~ tomorrow', undefined, now).detectedDate?.titleWithoutDate).toBe('Fix bug ~');
+        expect(parseQuickAdd('Fix bug } tomorrow', undefined, now).detectedDate?.titleWithoutDate).toBe('Fix bug');
+    });
+
     it('parses status, due, note, tags, contexts', () => {
         const now = new Date('2025-01-01T10:00:00Z');
         const result = parseQuickAdd('Call mom @phone #family /next /due:tomorrow 5pm /note:ask about trip', undefined, now);
@@ -1514,6 +1527,22 @@ describe('quick-add', () => {
             expect(options.defaultScheduleTime).toBe('09:00');
             expect(options.preserveText).toBe(false);
             expect(options.naturalLanguageDates).toBe(true);
+        });
+
+        it('recognizes contexts retained on done and archived tasks, but not deleted tasks', () => {
+            const active = task({ id: 'active', status: 'next', contexts: ['@active-only'] });
+            const done = task({ id: 'done', status: 'done', contexts: ['@done-only'] });
+            const archived = task({ id: 'archived', status: 'archived', contexts: ['@archived-only'] });
+            const bare = task({ id: 'bare', status: 'archived', contexts: ['Seasonal Planning'] });
+            const deleted = task({ id: 'deleted', deletedAt: '2026-07-02T00:00:00.000Z', contexts: ['@deleted-only'] });
+            const options = buildQuickAddParseOptions({}, {
+                tasks: [active, done],
+                _allTasks: [active, done, archived, bare, deleted],
+            });
+
+            expect(options.knownContexts).toEqual(['@active-only', '@archived-only', '@done-only', '@Seasonal Planning']);
+            expect(parseQuickAdd('Plan @Seasonal Planning', undefined, undefined, undefined, options).props.contexts)
+                .toEqual(['@Seasonal Planning']);
         });
 
         it('keeps preserve-text on and natural-language dates off when settings say so', () => {

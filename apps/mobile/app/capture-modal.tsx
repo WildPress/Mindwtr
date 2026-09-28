@@ -12,6 +12,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Check, Sparkles } from 'lucide-react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useNavigation, usePreventRemove } from '@react-navigation/native';
 import { Ionicons } from '@expo/vector-icons';
@@ -36,6 +37,7 @@ import {
   type Attachment,
   type CaptureAssemblyInput,
   type CaptureTransactionOptions,
+  type Language,
   type Project,
   type Task,
   type TimeEstimate,
@@ -212,19 +214,20 @@ export default function CaptureScreen() {
   const params = useLocalSearchParams<CaptureSearchParams>();
   const router = useRouter();
   const navigation = useNavigation();
-  const { addProject, addTask, addTasks, projects, tasks, settings, areas, people } = useTaskStore((state) => ({
+  const { addProject, addTask, addTasks, projects, tasks, allTasks, settings, areas, people } = useTaskStore((state) => ({
     addProject: state.addProject,
     addTask: state.addTask,
     addTasks: state.addTasks,
     projects: state.projects,
     tasks: state.tasks,
+    allTasks: state._allTasks,
     settings: state.settings,
     areas: state.areas,
     people: state.people,
   }), shallow);
   const tc = useThemeColors();
   const { showToast } = useToast();
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
   const initialText = (
     decodeSearchParam(params.initialValue)
     || decodeSearchParam(params.text)
@@ -244,7 +247,8 @@ export default function CaptureScreen() {
   const [value, setValue] = useState(initialText);
   const [pendingBulkLines, setPendingBulkLines] = useState<string[] | null>(null);
   const [descriptionValue, setDescriptionValue] = useState(initialDescription);
-  const [copilotSuggestion, setCopilotSuggestion] = useState<{ context?: string; timeEstimate?: TimeEstimate; tags?: string[] } | null>(null);
+  const [copilotSuggestion, setCopilotSuggestion] = useState<{ language: Language; context?: string; timeEstimate?: TimeEstimate; tags?: string[] } | null>(null);
+  const visibleCopilotSuggestion = copilotSuggestion?.language === language ? copilotSuggestion : null;
   const [aiKey, setAiKey] = useState('');
   const [copilotContext, setCopilotContext] = useState<string | undefined>(undefined);
   const [copilotEstimate, setCopilotEstimate] = useState<TimeEstimate | undefined>(undefined);
@@ -328,8 +332,8 @@ export default function CaptureScreen() {
     return getUsedTaskTokens(tasks, (task) => task.tags, { prefix: '#' });
   }, [tasks]);
   const quickAddParseOptions = React.useMemo(
-    () => buildQuickAddParseOptions(settings, { tasks, people }),
-    [people, settings, tasks]
+    () => buildQuickAddParseOptions(settings, { tasks, _allTasks: allTasks, people }),
+    [allTasks, people, settings, tasks]
   );
 
   // The parse the save path runs, one keystroke early. Same options object, so
@@ -358,7 +362,7 @@ export default function CaptureScreen() {
         if (copilotAbortRef.current) copilotAbortRef.current.abort();
         const abortController = typeof AbortController === 'function' ? new AbortController() : null;
         copilotAbortRef.current = abortController;
-        const provider = createAIProvider(buildCopilotConfig(settings, aiKey));
+        const provider = createAIProvider(buildCopilotConfig(settings, aiKey, language));
         const suggestion = await provider.predictMetadata(
           { title, contexts: contextOptions, tags: tagOptions },
           abortController ? { signal: abortController.signal } : undefined
@@ -367,7 +371,7 @@ export default function CaptureScreen() {
         if (!suggestion.context && (!timeEstimatesEnabled || !suggestion.timeEstimate) && !suggestion.tags?.length) {
           setCopilotSuggestion(null);
         } else {
-          setCopilotSuggestion(suggestion);
+          setCopilotSuggestion({ ...suggestion, language });
         }
       } catch {
         if (!cancelled) {
@@ -391,6 +395,7 @@ export default function CaptureScreen() {
     aiProvider,
     contextOptions,
     keyRequired,
+    language,
     settings,
     settings.ai?.copilotModel,
     settings.ai?.thinkingBudget,
@@ -420,19 +425,19 @@ export default function CaptureScreen() {
   // Same per-part apply as the task editor (#1022); here the parts are stashed
   // for task creation instead of written into a draft.
   const pendingCopilotParts = React.useMemo<CopilotPart[]>(() => {
-    if (!copilotSuggestion) return [];
+    if (!visibleCopilotSuggestion) return [];
     const parts: CopilotPart[] = [];
-    if (copilotSuggestion.context && copilotSuggestion.context !== copilotContext) {
-      parts.push({ kind: 'context', value: copilotSuggestion.context });
+    if (visibleCopilotSuggestion.context && visibleCopilotSuggestion.context !== copilotContext) {
+      parts.push({ kind: 'context', value: visibleCopilotSuggestion.context });
     }
-    if (timeEstimatesEnabled && copilotSuggestion.timeEstimate && copilotSuggestion.timeEstimate !== copilotEstimate) {
-      parts.push({ kind: 'timeEstimate', value: copilotSuggestion.timeEstimate });
+    if (timeEstimatesEnabled && visibleCopilotSuggestion.timeEstimate && visibleCopilotSuggestion.timeEstimate !== copilotEstimate) {
+      parts.push({ kind: 'timeEstimate', value: visibleCopilotSuggestion.timeEstimate });
     }
-    for (const tag of copilotSuggestion.tags ?? []) {
+    for (const tag of visibleCopilotSuggestion.tags ?? []) {
       if (!copilotTags.includes(tag)) parts.push({ kind: 'tag', value: tag });
     }
     return parts;
-  }, [copilotContext, copilotEstimate, copilotSuggestion, copilotTags, timeEstimatesEnabled]);
+  }, [copilotContext, copilotEstimate, copilotTags, timeEstimatesEnabled, visibleCopilotSuggestion]);
 
   const hasAppliedCopilot = Boolean(copilotContext) || Boolean(copilotEstimate) || copilotTags.length > 0;
 
@@ -861,7 +866,7 @@ export default function CaptureScreen() {
           {pendingCopilotParts.length > 0 && (
             <View style={[styles.copilotPill, { borderColor: tc.border, backgroundColor: tc.inputBg }]}>
               <View style={styles.copilotChipRow}>
-                <Text style={[styles.copilotText, { color: tc.text }]}>✨</Text>
+                <Sparkles size={13} color={tc.text} />
                 <Text style={[styles.copilotText, { color: tc.text }]}>{t('copilot.suggested')}</Text>
                 {pendingCopilotParts.map((part) => (
                   <TouchableOpacity
@@ -893,7 +898,7 @@ export default function CaptureScreen() {
           {hasAppliedCopilot && (
             <View style={[styles.copilotPill, { borderColor: tc.border, backgroundColor: tc.inputBg }]}>
               <View style={{ flexDirection: 'row', alignItems: 'flex-start', columnGap: 4 }}>
-                <Text style={[styles.copilotText, { color: tc.text }]}>✅</Text>
+                <Check size={13} color={tc.text} style={{ marginTop: 1 }} />
                 <Text style={[styles.copilotText, { color: tc.text, flexShrink: 1 }]}>
                   {t('copilot.applied')}{' '}
                   {copilotContext ? `${copilotContext} ` : ''}
