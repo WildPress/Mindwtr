@@ -83,6 +83,18 @@ jobs:
             exit 1
           fi
 
+      - name: Reset workflow files so GITHUB_TOKEN can push
+        if: steps.need.outputs.update == 'true' && steps.merge.outcome == 'success'
+        run: |
+          set -euo pipefail
+          # GITHUB_TOKEN cannot push changes to .github/workflows/.
+          # After the upstream merge, restore that directory to what
+          # origin/main already has so the push diff is workflow-free.
+          git checkout origin/main -- .github/workflows/
+          if ! git diff --cached --quiet -- .github/workflows/; then
+            git commit -m "ci(fork): reset workflow dir to pre-merge state (GITHUB_TOKEN limitation)"
+          fi
+
       - name: File an issue on merge conflict
         if: failure() && steps.merge.outcome == 'failure'
         env:
