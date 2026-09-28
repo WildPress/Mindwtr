@@ -22,6 +22,7 @@ permissions:
   contents: write # push the merge commit to main
   packages: write # push the cloud image to GHCR
   issues: write # file an issue when a sync conflicts or the gate fails
+  workflows: write # push upstream workflow file changes (.github/workflows/*)
 
 concurrency:
   group: upstream-webhook-sync
