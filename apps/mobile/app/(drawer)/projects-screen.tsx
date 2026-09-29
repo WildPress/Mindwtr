@@ -4,7 +4,7 @@ import { workspaceSessionStorage as AsyncStorage } from '@/lib/workspace-session
 import { View, Text, TextInput, TouchableOpacity, FlatList, Platform, useWindowDimensions } from 'react-native';
 import type { GettingStartedAction } from '@/components/GettingStartedActions';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { AREA_PRESET_COLORS, Attachment, collectProjectTaskLinks, DEFAULT_PROJECT_COLOR, getProjectSectionsForView, Project, shallow, Task, type Section, type TaskSortBy, undoProjectDelete, useTaskStore } from '@mindwtr/core';
+import { AREA_PRESET_COLORS, areaOrderIdsForIntent, Attachment, collectProjectTaskLinks, DEFAULT_PROJECT_COLOR, getProjectSectionsForView, Project, projectTagsForIntent, shallow, Task, type Section, type TaskSortBy, undoProjectDelete, useTaskStore } from '@mindwtr/core';
 import { useFocusEffect, useLocalSearchParams, usePathname, useRouter } from 'expo-router';
 import { ChevronDown, ChevronRight, Plus } from 'lucide-react-native';
 
@@ -418,24 +418,13 @@ export default function ProjectsScreen() {
   }, [allTasks, openToken, taskId, projectId, selectedProject, taskTab, setHighlightTask]);
 
   const sortAreasByName = () => {
-    const reordered = [...sortedAreas]
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((area) => area.id);
-    reorderAreas(reordered);
+    const orderedIds = areaOrderIdsForIntent(sortedAreas, { kind: 'sortName' });
+    if (orderedIds) reorderAreas(orderedIds);
   };
 
   const sortAreasByColor = () => {
-    const reordered = [...sortedAreas]
-      .sort((a, b) => {
-        const colorA = (a.color || '').toLowerCase();
-        const colorB = (b.color || '').toLowerCase();
-        if (colorA && colorB && colorA !== colorB) return colorA.localeCompare(colorB);
-        if (colorA && !colorB) return -1;
-        if (!colorA && colorB) return 1;
-        return a.name.localeCompare(b.name);
-      })
-      .map((area) => area.id);
-    reorderAreas(reordered);
+    const orderedIds = areaOrderIdsForIntent(sortedAreas, { kind: 'sortColor' });
+    if (orderedIds) reorderAreas(orderedIds);
   };
 
   const toggleProjectTag = (tag: string) => {
@@ -446,8 +435,7 @@ export default function ProjectsScreen() {
       projectId: selectedProject.id,
       updates: (project) => {
         const current = project.tagIds || [];
-        const exists = current.includes(normalized);
-        return { tagIds: exists ? current.filter((value) => value !== normalized) : [...current, normalized] };
+        return { tagIds: projectTagsForIntent(current, { kind: 'toggle', input: tag }) };
       },
       updateProject,
       setSelectedProject,
@@ -585,9 +573,10 @@ export default function ProjectsScreen() {
   }, [persistProjectListViewState]);
 
   const projectTagFilterActive = selectedTagFilter !== ALL_TAGS;
+  const projectTagLabel = (tag: string) => tag === '' ? t('projects.emptyTag') : tag;
   const selectedTagFilterLabel = selectedTagFilter === NO_TAGS
     ? t('projects.noTags')
-    : selectedTagFilter;
+    : projectTagLabel(selectedTagFilter);
   const projectTagFilterHeading = projectTagFilterActive
     ? `${t('projects.tagFilter')}: ${selectedTagFilterLabel}`
     : t('projects.tagFilter');
@@ -626,7 +615,7 @@ export default function ProjectsScreen() {
           ]}
           onPress={() => setSelectedTagFilter(tag)}
           accessibilityRole="button"
-          accessibilityLabel={tag}
+          accessibilityLabel={projectTagLabel(tag)}
           accessibilityState={{ selected: selectedTagFilter === tag }}
         >
           <Text
@@ -635,7 +624,7 @@ export default function ProjectsScreen() {
               { color: selectedTagFilter === tag ? tc.onTint : tc.text },
             ]}
           >
-            {tag}
+            {projectTagLabel(tag)}
           </Text>
         </TouchableOpacity>
       ))}

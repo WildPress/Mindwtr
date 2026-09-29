@@ -1,5 +1,6 @@
-- Aufgabenansichten sind uebersichtlicher und Fokus gruppiert schneller.
-- Apple-Erinnerungen lassen sich automatisch und ohne doppelte Aufgaben importieren.
-- iCloud-Aenderungen kommen per stillem Push an; blockierter Hintergrund-Sync endet frueher.
-- Widgets folgen dem Datumsformat und Kalenderausnahmen funktionieren zuverlaessig.
-- Suche versteht @Kontext, #Tag und %Person; Sync und Anhaenge sind robuster.
+- Wartende Aufgaben zeigen zugewiesene Personen; Fokus ist klarer.
+- Monatsserien unterstuetzen positionierte Wochentage und das Ueberspringen eines Termins.
+- Kalender bieten Bereichsfilter und genauere Zeitlinien.
+- Widgets folgen Sprache und 12/24-Stunden-Einstellung.
+- Kurzbefehle oeffnen gespeicherte Listen und starten Audioerfassung im Fokus.
+- Filter, Sync, Speicher und Wiederherstellung schuetzen neuere Aenderungen besser.

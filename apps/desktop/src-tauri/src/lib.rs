@@ -48,6 +48,8 @@ mod install;
 mod system_fonts;
 mod linux_calendar;
 mod linux_notification;
+#[cfg(target_os = "linux")]
+mod portal_secrets;
 mod local_api;
 mod logging;
 mod macos_widget;
@@ -561,6 +563,8 @@ struct ExternalCalendarSubscription {
     url: String,
     enabled: bool,
     color: Option<String>,
+    #[serde(rename = "areaIds", skip_serializing_if = "Option::is_none")]
+    area_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

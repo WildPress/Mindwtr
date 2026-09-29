@@ -1,8 +1,11 @@
+import type { ProjectTaskSummary } from './project-row-meta';
 import type { FocusStarAction } from './focus-star';
 import type { AppData, Area, Person, Project, Section, Task, TaskStatus } from './types';
 import type { TaskQueryOptions } from './storage';
 import type { TaskDateCoherenceIssue } from './task-date-coherence';
 import type { TaskTokenUsage } from './task-token-usage';
+import type { ProcessInboxPlan } from './process-inbox-plan';
+import type { AreaOrderIntent } from './area-ordering';
 
 export type StoreActionResult = {
     success: boolean;
@@ -11,6 +14,300 @@ export type StoreActionResult = {
     ids?: string[];
     /** For promoteTaskToProject: true when an existing same-named project was reused instead of created. */
     reused?: boolean;
+};
+
+/** Internal native journal mutation. Null is an explicit clear, never omission. */
+export type PreparedTaskEdit = {
+    before: Task;
+    changes: { [K in keyof Task]?: Exclude<Task[K], undefined> | null };
+};
+export type PreparedTaskEditResult = StoreActionResult & {
+    outcome?: 'applied' | 'replayed';
+    reason?: 'missing' | 'conflict' | 'invalid';
+};
+
+/** One frozen project-only creation. The full project row is its durable receipt. */
+export type PreparedProjectCreate = {
+    project: Project;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    selectedArea: { id: string; name: string; color: string | null; deletedAt: null } | null;
+    orderMax: number;
+    defaultProjectFlowMode: string | null;
+};
+
+/** One frozen native Project Focus star change and its complete Project receipt. */
+export type PreparedProjectFocus = {
+    scope: { project: Project; focusedProjectCount: number };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen native Project title edit and its complete Project receipt. */
+export type PreparedProjectRename = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+export type ProjectFlowAction = { kind: 'toggleType' }
+    | { kind: 'setScope'; scope: 'project' | 'section' };
+
+/** One frozen native Project type or sequential-scope change and its complete Project receipt. */
+export type PreparedProjectFlow = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen synced Project task sort change; Task and Section rows are untouched. */
+export type PreparedProjectTaskSort = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen native raw Project Notes edit and its complete Project receipt. */
+export type PreparedProjectNotesWrite = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen native Project Tags edit and its complete Project receipt. */
+export type PreparedProjectTagsWrite = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen nonarchived Project status change and its complete Project receipt. */
+export type PreparedProjectStatus = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen Project date change and its complete Project receipt. */
+export type PreparedProjectDate = {
+    scope: { project: Project };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** One frozen Project Area assignment with its selected Area and destination-order witness. */
+export type PreparedProjectArea = {
+    scope: { project: Project; selectedArea: { id: string; name: string } | null; orderMax: number };
+    effect: { project: { before: Project; after: Project } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** Frozen parent/order witness and the new Section's complete receipt. */
+export type PreparedProjectSectionCreate = {
+    request: { requestId: string; projectId: string; title: string };
+    scope: { project: Project; orderMax: number };
+    section: Section;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    preparedAt: string;
+};
+
+/** Frozen parent and complete before/after Section rows for a native rename. */
+export type PreparedProjectSectionRename = {
+    scope: { project: Project };
+    effect: { section: { before: Section; after: Section } };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    preparedAt: string;
+};
+
+/** Frozen Section tombstone and every linked Task detach, including trashed Tasks. */
+export type PreparedProjectSectionDelete = {
+    scope: { project: Project; section: Section; tasks: Task[] };
+    effect: { section: { before: Section; after: Section };
+        tasks: Array<{ before: Task; after: Task }> };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    preparedAt: string;
+};
+
+/** Frozen complete live Section scope and sparse order effect for a native move. */
+export type PreparedProjectSectionOrder = {
+    request: { requestId: string; projectId: string; sectionId: string; direction: 'up' | 'down';
+        expectedSections: Section[] };
+    scope: { project: Project; sections: Section[] };
+    effect: { sections: Array<{ before: Section; after: Section }> };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    preparedAt: string;
+    result: { projectId: string; orderedIds: string[] };
+};
+
+/** Frozen final rows for a native Area create or legacy tombstone restoration. */
+export type PreparedAreaCreate = {
+    kind: 'fresh' | 'restored';
+    scope: { area: Area | null; projects: Project[]; sections: Section[]; tasks: Task[] };
+    effect: {
+        area: { before: Area | null; after: Area };
+        projects: Array<{ before: Project; after: Project }>;
+        sections: Array<{ before: Section; after: Section }>;
+        tasks: Array<{ before: Task; after: Task }>;
+    };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    orderMax: number;
+    restoreAt: string;
+    updateAt: string;
+};
+
+/** Frozen Area recolor and all linked Project rows the RN writer inspected. */
+export type PreparedAreaColor = {
+    scope: { area: Area; projects: Project[] };
+    effect: { area: { before: Area; after: Area }; projects: Array<{ before: Project; after: Project }> };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** Frozen live Area resolution inventory and complete linked-row witnesses for rename/merge. */
+export type PreparedAreaRename = {
+    scope: { areas: Area[]; projects: Project[]; tasks: Task[] };
+    effect: {
+        areas: Array<{ before: Area; after: Area }>;
+        projects: Array<{ before: Project; after: Project }>;
+        tasks: Array<{ before: Task; after: Task }>;
+    };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** Frozen order revision for every live Area, including unchanged numeric orders. */
+export type PreparedAreaOrder = {
+    scope: { areas: Area[] };
+    effect: { areas: Array<{ before: Area; after: Area }> };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** Frozen native manager Area tombstone and every directly linked Task detach. */
+export type PreparedAreaDelete = {
+    scope: { area: Area; tasks: Task[]; liveProjects: Project[] };
+    effect: { area: { before: Area; after: Area }; tasks: Array<{ before: Task; after: Task }> };
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    updateAt: string;
+};
+
+/** Internal native Board journal: before is the source guard, after the sole written row. */
+export type PreparedBoardTask = {
+    kind: 'duplicateTask' | 'trashTask';
+    before: Task;
+    after: Task;
+    deviceIdToInitialize: string | null;
+};
+
+/** One frozen Calendar scheduling row; its complete after-row is the receipt. */
+export type PreparedCalendarTask = {
+    before: Task;
+    after: Task;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+};
+
+/** Native Calendar New task: the task row is the receipt, project is an atomic companion. */
+export type PreparedCalendarCreate = {
+    task: Task;
+    project: Project | null;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    intent: { props: Partial<Task>; projectToCreate: { name: string; color: string; areaId: string | null } | null };
+    creation: {
+        selectedProject: Project | null;
+        areas: Area[];
+        projectOrderMax: number | null;
+        taskOrderMax: number | null;
+        defaultAreaMode: string | null;
+        defaultAreaId: string | null;
+        defaultProjectFlowMode: string | null;
+        focusCount: number;
+        focusLimit: number;
+        focusRequested: boolean;
+        sequentialEmpty: boolean;
+        focusEndOfTodayIso: string | null;
+        focusEndOffsetMinutes: number | null;
+        preparedOffsetMinutes: number;
+        preparedLocalDay: string;
+    };
+};
+
+/** One Process Inbox decision's complete atomic affected-row set. */
+export type PreparedInboxEffect = {
+    kind: 'decision' | 'skip' | 'projectCreate';
+    tasks: Array<{ before: Task | null; after: Task }>;
+    projects: Array<{ before: Project | null; after: Project }>;
+    sections: Array<{ before: Section | null; after: Section }>;
+    sourceBefore: Task;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    guards: {
+        selectedProject: Project | null;
+        selectedArea: Area | null;
+        projectOrder: { areaId: string | null; max: number } | null;
+        taskOrders: Array<{ projectId: string; max: number }>;
+        reactivation: { projectId: string; taskIds: string[]; sectionIds: string[] } | null;
+        recurringCandidate: Task | null;
+        recurringDuplicate: Task | null;
+        defaultScheduleTime: string | null;
+        defaultProjectFlowMode: string | null;
+        creationSettings: { defaultAreaMode: string | null; defaultAreaId: string | null;
+            defaultProjectFlowMode: string | null } | null;
+        plan: ProcessInboxPlan;
+        focusCount: number | null;
+        focusLimit: number | null;
+        focusBoundary: string | null;
+    };
+};
+
+/** A native checklist Save or Reset's complete, bounded atomic affected-row set. */
+export type PreparedChecklistEffect = {
+    tasks: Array<{ before: Task | null; after: Task }>;
+    projects: Array<{ before: Project | null; after: Project }>;
+    sections: Array<{ before: Section | null; after: Section }>;
+    sourceBefore: Task;
+    deviceIdBefore: string | null;
+    deviceIdToInitialize: string | null;
+    guards: {
+        selectedProject: Project | null;
+        selectedArea: Area | null;
+        taskOrders: Array<{ projectId: string; max: number }>;
+        reactivation: { projectId: string; taskIds: string[]; sectionIds: string[] } | null;
+        recurringCandidate: Task | null;
+        recurringDuplicate: Task | null;
+        focusCount: number | null;
+        focusLimit: number | null;
+        focusBoundary: string | null;
+        autoArchiveDays: number | null;
+    };
 };
 
 /** Device-local recovery state for a snapshot that exhausted durable-save retries. */
@@ -64,6 +361,9 @@ export interface TaskStore {
         preloadedData?: AppData;
         /** Re-throw storage failures after updating store error state. */
         throwOnError?: boolean;
+        /** Exclusive native owner only: preserve adapter rows while resolving a durable journal.
+         * Run a normal load before exposing UI to resume normalization and migrations. */
+        recoveryLoad?: boolean;
         /** Skip applying or acknowledging the read when its owning lifecycle has ended. */
         isResultStillRelevant?: () => boolean;
     }) => Promise<void>;
@@ -81,6 +381,20 @@ export interface TaskStore {
         initialProps?: Partial<Task>;
         captureId?: string;
     }>) => Promise<StoreActionResult>;
+    /** Internal prepared-capture commit; the native contract validates the journal envelope first. */
+    commitPreparedCapture: (input: {
+        task: Task;
+        project: Project | null;
+        deviceIdToInitialize: string | null;
+    }) => Promise<StoreActionResult>;
+    /** Internal prepared edit; native validates the journal before this atomic guarded overlay. */
+    commitPreparedTaskEdit: (input: PreparedTaskEdit) => Promise<PreparedTaskEditResult>;
+    /** Native validates the action-specific envelope before this atomic guarded write. */
+    commitPreparedBoardTask: (input: PreparedBoardTask) => Promise<PreparedTaskEditResult>;
+    commitPreparedCalendarTask: (input: PreparedCalendarTask) => Promise<PreparedTaskEditResult>;
+    commitPreparedCalendarCreate: (input: PreparedCalendarCreate) => Promise<PreparedTaskEditResult>;
+    commitPreparedInboxEffect: (input: PreparedInboxEffect) => Promise<PreparedTaskEditResult>;
+    commitPreparedChecklistEffect: (input: PreparedChecklistEffect) => Promise<PreparedTaskEditResult>;
     /** Update an existing task */
     updateTask: (id: string, updates: Partial<Task>) => Promise<StoreActionResult>;
     /** Archive a task as cancelled without completing it */
@@ -133,6 +447,29 @@ export interface TaskStore {
     // Project Actions
     /** Add a new project */
     addProject: (title: string, color: string, initialProps?: Partial<Project>) => Promise<Project | null>;
+    /** Private native journal writer; the contract validates the frozen project first. */
+    commitPreparedProjectCreate: (input: PreparedProjectCreate) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectFocus: (input: PreparedProjectFocus & { request: { projectId: string; focused: boolean } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectRename: (input: PreparedProjectRename & { request: { projectId: string; title: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectFlow: (input: PreparedProjectFlow & { request: { projectId: string; action: ProjectFlowAction } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectTaskSort: (input: PreparedProjectTaskSort & { request: { projectId: string; sortBy: import('./types').TaskSortBy } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectNotesWrite: (input: PreparedProjectNotesWrite & { request: { projectId: string; text: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectTagsWrite: (input: PreparedProjectTagsWrite & { request: { projectId: string; intent: import('./project-tags').ProjectTagsIntent } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectStatus: (input: PreparedProjectStatus & { request: { projectId: string; status: 'active' | 'waiting' | 'someday' } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectDate: (input: PreparedProjectDate & { request: { projectId: string; field: 'startDate' | 'dueDate' | 'reviewAt'; value: string | null } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectArea: (input: PreparedProjectArea & { request: { projectId: string; areaId: string | null } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectSectionCreate: (input: PreparedProjectSectionCreate) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectSectionRename: (input: PreparedProjectSectionRename & { request: {
+        projectId: string; sectionId: string; title: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectSectionDelete: (input: PreparedProjectSectionDelete & { request: {
+        projectId: string; sectionId: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedProjectSectionOrder: (input: PreparedProjectSectionOrder) => Promise<PreparedTaskEditResult>;
+    commitPreparedAreaCreate: (input: PreparedAreaCreate & { request: { requestId: string; name: string; color: string; expectedAreaId: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedAreaColor: (input: PreparedAreaColor & { request: { requestId: string; areaId: string; color: string | null } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedAreaRename: (input: PreparedAreaRename & { request: { requestId: string; areaId: string; name: string };
+        result: { id: string; areaId: string; name: string } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedAreaOrder: (input: PreparedAreaOrder & { request: { requestId: string; intent: AreaOrderIntent; expectedAreas: unknown[] }; result: { orderedIds: string[] } }) => Promise<PreparedTaskEditResult>;
+    commitPreparedAreaDelete: (input: PreparedAreaDelete & { request: { requestId: string; areaId: string }; result: { areaId: string } }) => Promise<PreparedTaskEditResult>;
     /** Update a project */
     updateProject: (id: string, updates: Partial<Project>) => Promise<StoreActionResult>;
     /** Archive a project as cancelled and cancel its unfinished child tasks */
@@ -174,7 +511,7 @@ export interface TaskStore {
     /** Reorder projects within a specific area by id list */
     reorderProjects: (orderedIds: string[], areaId?: string) => Promise<void>;
     /** Reorder tasks within a project or section */
-    reorderProjectTasks: (projectId: string, orderedIds: string[], sectionId?: string | null) => Promise<void>;
+    reorderProjectTasks: (projectId: string, orderedIds: string[], sectionId?: string | null, movedTaskId?: string) => Promise<void>;
     /** Reorder tasks within a Board status column by id list */
     reorderBoardTasks: (status: TaskStatus, orderedIds: string[], movedTaskId?: string) => Promise<void>;
 
@@ -225,7 +562,7 @@ export type DerivedState = {
     tasksByContext: Map<string, Task[]>;
     tasksByTag: Map<string, Task[]>;
     focusedTasks: Task[];
-    projectTaskSummaryById: Map<string, { activeTaskCount: number; nextAction?: Task }>;
+    projectTaskSummaryById: Map<string, ProjectTaskSummary>;
     allContexts: string[];
     allTags: string[];
     contextTokenUsage: TaskTokenUsage[];

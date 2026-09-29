@@ -23,6 +23,16 @@ const appLogMocks = vi.hoisted(() => ({
     logWarn: vi.fn(async () => undefined),
 }));
 vi.mock('./app-log', () => appLogMocks);
+// The device store that keeps the last queued command applied to each task.
+const deviceStorage = vi.hoisted(() => {
+    const items = new Map<string, string>();
+    return {
+        items,
+        getItem: vi.fn(async (key: string) => items.get(key) ?? null),
+        setItem: vi.fn(async (key: string, value: string) => { items.set(key, value); }),
+    };
+});
+vi.mock('@react-native-async-storage/async-storage', () => ({ default: deviceStorage }));
 
 // eslint-disable-next-line import/first
 import {
@@ -321,6 +331,7 @@ describe('ingestPendingCaptures', () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        deviceStorage.items.clear();
         fileSystemMocks.getInfoAsync.mockResolvedValue({ exists: true });
         fileSystemMocks.deleteAsync.mockResolvedValue(undefined);
         addProject = vi.fn<AddProject>(async (title: string) => project({ id: 'created-project', title }));
@@ -878,6 +889,134 @@ describe('ingestPendingCaptures', () => {
         expect(outcomes).toEqual(['completed', 'already-done', 'terminal']);
     });
 
+    // A task changed after a queued command was made keeps its newer state. A command
+    // replayed after its own queue delete failed is such a command: its write landed.
+    it('never lets a replayed older Watch defer or check-off undo a later change', async () => {
+        const files = new Map<string, Record<string, unknown>>([
+            ['a.json', { kind: 'defer', id: 'd1', taskId: 'deferred', startDate: '2026-09-20', createdAt: '2026-09-10T10:00:00.000Z', source: 'apple-watch' }],
+            ['b.json', { kind: 'defer', id: 'd2', taskId: 'deferred', startDate: '2026-09-21', createdAt: '2026-09-10T10:01:00.000Z', source: 'apple-watch' }],
+            ['c.json', { kind: 'complete', id: 'c1', taskId: 'reopened', completedAt: '2026-09-10T10:02:00.000Z', source: 'android-widget' }],
+        ]);
+        fileSystemMocks.readDirectoryAsync.mockImplementation(async () => [...files.keys()]);
+        fileSystemMocks.readAsStringAsync.mockImplementation(async (uri: string) => JSON.stringify(files.get(uri.split('/').pop()!)));
+        // The first pass's deletes of a.json and c.json fail after their writes landed.
+        const failDelete = new Set(['a.json', 'c.json']);
+        fileSystemMocks.deleteAsync.mockImplementation(async (uri: string) => {
+            const name = uri.split('/').pop()!;
+            if (failDelete.delete(name)) throw new Error('killed before the delete');
+            files.delete(name);
+        });
+        const tasks = [
+            { id: 'deferred', title: 'Deferred', status: 'next', updatedAt: '2026-09-01T00:00:00.000Z' } as Task,
+            { id: 'reopened', title: 'Reopened', status: 'next', updatedAt: '2026-09-01T00:00:00.000Z' } as Task,
+        ];
+        let clock = Date.parse('2026-09-11T08:00:00.000Z');
+        const storeUpdate = vi.fn(async (id: string, updates: Partial<Task>) => {
+            Object.assign(tasks.find((task) => task.id === id)!, updates, { updatedAt: new Date(clock += 1_000).toISOString() });
+            return { success: true };
+        });
+        const deps = {
+            addTask: addTaskMock(), updateTask: storeUpdate, addProject, projects: [], areas: [], tasks, getTasks: () => tasks,
+            people: [], settings: emptySettings, flushPendingSave: vi.fn(async () => undefined),
+        };
+
+        await ingestPendingCaptures(deps);
+        expect(tasks[0].startTime).toBe('2026-09-21');
+        expect([...files.keys()]).toEqual(['a.json', 'c.json']);
+        expect(tasks[1].status).toBe('done');
+        // The user reopens the checked-off task before the next drain.
+        await storeUpdate('reopened', { status: 'next' });
+        storeUpdate.mockClear();
+        appLogMocks.logInfo.mockClear();
+
+        expect(await ingestPendingCaptures(deps)).toBe(2);
+
+        expect(storeUpdate).not.toHaveBeenCalled();
+        expect(tasks[0].startTime).toBe('2026-09-21');
+        expect(tasks[1].status).toBe('next');
+        expect(files.size).toBe(0);
+        expect(appLogMocks.logInfo.mock.calls).toEqual([
+            ['Queued command skipped', {
+                scope: 'capture', extra: { releaseCheck: 'v1.3.3/stale-queued-command-skipped', kind: 'defer', outcome: 'stale' },
+            }],
+            ['Queued command skipped', {
+                scope: 'capture', extra: { releaseCheck: 'v1.3.3/stale-queued-command-skipped', kind: 'complete', outcome: 'replayed' },
+            }],
+        ]);
+    });
+
+    // A load, a sync or an in-app edit after the tap never makes a queued command stale:
+    // the store's updatedAt says nothing about which command came last.
+    it('applies a widget check-off to a task a load promoted after the tap', async () => {
+        oneFile('c.json', { kind: 'complete', id: 'c1', taskId: 'promoted', completedAt: '2026-09-10T09:00:03.000Z', source: 'android-widget' });
+        const tasks = [{ id: 'promoted', title: 'Promoted', status: 'next', updatedAt: '2026-09-10T10:00:00.000Z' } as Task];
+
+        expect(await ingestPendingCaptures({
+            addTask: addTaskMock(), updateTask, addProject, projects: [], areas: [], tasks, getTasks: () => tasks, people: [], settings: emptySettings,
+        })).toBe(1);
+
+        expect(updateTask).toHaveBeenCalledWith('promoted', { status: 'done', completedAt: '2026-09-10T09:00:03.000Z' });
+    });
+
+    it('applies a newer Watch command that arrives in a later drain, and skips an older straggler', async () => {
+        const tasks = [{ id: 'deferred', title: 'Deferred', status: 'next', updatedAt: '2026-09-01T00:00:00.000Z' } as Task];
+        let clock = Date.parse('2026-09-11T08:00:00.000Z');
+        const storeUpdate = vi.fn(async (id: string, updates: Partial<Task>) => {
+            Object.assign(tasks.find((task) => task.id === id)!, updates, { updatedAt: new Date(clock += 1_000).toISOString() });
+            return { success: true };
+        });
+        const deps = {
+            addTask: addTaskMock(), updateTask: storeUpdate, addProject, projects: [], areas: [], tasks, getTasks: () => tasks,
+            people: [], settings: emptySettings, flushPendingSave: vi.fn(async () => undefined),
+        };
+        const defer = (id: string, startDate: string, createdAt: string) => oneFile(`${id}.json`, {
+            kind: 'defer', id, taskId: 'deferred', startDate, createdAt, source: 'apple-watch',
+        });
+
+        defer('d1', '2026-09-20', '2026-09-10T10:00:00.000Z');
+        expect(await ingestPendingCaptures(deps)).toBe(1);
+        defer('d2', '2026-09-21', '2026-09-10T10:01:00.000Z');
+        expect(await ingestPendingCaptures(deps)).toBe(1);
+        expect(tasks[0].startTime).toBe('2026-09-21');
+
+        defer('d0', '2026-09-19', '2026-09-10T09:59:00.000Z');
+        expect(await ingestPendingCaptures(deps)).toBe(1);
+        expect(tasks[0].startTime).toBe('2026-09-21');
+        expect(storeUpdate).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the queue file until the record of the applied command is stored, and a replay after that writes nothing', async () => {
+        oneFile('c.json', { kind: 'complete', id: 'c1', taskId: 'open', completedAt: '2026-09-10T09:00:03.000Z', source: 'android-widget' });
+        const tasks = [{ id: 'open', title: 'Open', status: 'next' } as Task];
+        const storeUpdate = vi.fn(async (id: string, updates: Partial<Task>) => {
+            Object.assign(tasks.find((task) => task.id === id)!, updates);
+            return { success: true };
+        });
+        const deps = {
+            addTask: addTaskMock(), updateTask: storeUpdate, addProject, projects: [], areas: [], tasks, getTasks: () => tasks,
+            people: [], settings: emptySettings, flushPendingSave: vi.fn(async () => undefined),
+        };
+
+        // Killed between the durable save and the record.
+        deviceStorage.setItem.mockRejectedValueOnce(new Error('killed before the record'));
+        expect(await ingestPendingCaptures(deps)).toBe(0);
+        expect(fileSystemMocks.deleteAsync).not.toHaveBeenCalled();
+        expect(storeUpdate).toHaveBeenCalledOnce();
+
+        // Killed between the record and the delete.
+        fileSystemMocks.deleteAsync.mockRejectedValueOnce(new Error('killed before the delete'));
+        expect(await ingestPendingCaptures(deps)).toBe(0);
+        expect(deviceStorage.setItem).toHaveBeenCalledTimes(2);
+        expect(storeUpdate).toHaveBeenCalledOnce();
+
+        // The user reopens the task; the replay of the recorded command leaves it open.
+        tasks[0].status = 'next';
+        expect(await ingestPendingCaptures(deps)).toBe(1);
+        expect(storeUpdate).toHaveBeenCalledOnce();
+        expect(tasks[0].status).toBe('next');
+        expect(fileSystemMocks.deleteAsync).toHaveBeenLastCalledWith('file:///data/Documents/pending-captures/c.json', { idempotent: true });
+    });
+
     it('orders Watch commands by createdAt even when UUID filenames sort differently', async () => {
         fileSystemMocks.readDirectoryAsync.mockResolvedValue(['a-start.json', 'z-reset.json']);
         fileSystemMocks.readAsStringAsync.mockImplementation(async (uri: string) => JSON.stringify(
@@ -1347,7 +1486,7 @@ describe('ingestPendingCaptures', () => {
             source: 'apple-watch',
             outboxRetried: true,
         });
-        const addTask = addTaskMock();
+        const addTask = vi.fn(async (_title: string, _props?: Partial<Task>, _options?: { captureId: string }) => ({ id: WATCH_AUDIO_ID }));
         const flushPendingSave = vi.fn(async () => undefined);
         const transcribeAudio = vi.fn(async () => 'Buy milk /due:tomorrow');
 
@@ -1364,7 +1503,11 @@ describe('ingestPendingCaptures', () => {
             transcribeAudio,
         })).toBe(1);
 
-        expect(addTask).toHaveBeenCalledWith('Buy milk', expect.objectContaining({ status: 'inbox', dueDate: '2026-09-07' }));
+        expect(addTask).toHaveBeenCalledWith(
+            'Buy milk',
+            expect.objectContaining({ status: 'inbox', dueDate: '2026-09-07' }),
+            { captureId: WATCH_AUDIO_ID },
+        );
         expect(addTask.mock.calls[0]?.[1]).not.toHaveProperty('outboxRetried');
         expect(transcribeAudio).toHaveBeenCalledWith(
             `file:///data/Documents/watch-audio/${WATCH_AUDIO_ID}.wav`,
@@ -1421,7 +1564,7 @@ describe('ingestPendingCaptures', () => {
             outboxRetried: true,
         });
         const common = {
-            addTask: addTaskMock(),
+            addTask: vi.fn(async () => ({ success: true, id: WATCH_AUDIO_ID })),
             updateTask,
             addProject,
             projects: [],
@@ -1451,6 +1594,42 @@ describe('ingestPendingCaptures', () => {
         expect(appLogMocks.logInfo).not.toHaveBeenCalledWith(
             'Watch outbox retry ingested',
             expect.anything(),
+        );
+    });
+
+    it('stores a Watch audio capture once when the app dies between the save and the queue delete', async () => {
+        oneFile('audio.json', {
+            kind: 'audio',
+            id: WATCH_AUDIO_ID,
+            audioPath: `file:///data/Documents/watch-audio/${WATCH_AUDIO_ID}.wav`,
+            source: 'apple-watch',
+        });
+        // The first pass saves the task, then the queue delete fails, as a kill would leave it.
+        fileSystemMocks.deleteAsync.mockRejectedValueOnce(new Error('killed before the delete'));
+        const created: Task[] = [];
+        const addTask = vi.fn(async (title: string, _props?: Partial<Task>, options?: { captureId: string }) => {
+            const id = options?.captureId ?? `generated-${created.length}`;
+            if (!created.some((task) => task.id === id)) created.push({ id, title, status: 'inbox' } as Task);
+            return { success: true, id };
+        });
+        const transcribeAudio = vi.fn(async () => 'Captured thought');
+        const deps = {
+            addTask, updateTask, addProject, projects: [], areas: [], tasks: [], getTasks: () => created,
+            people: [], settings: emptySettings, flushPendingSave: vi.fn(async () => undefined), transcribeAudio,
+        };
+
+        expect(await ingestPendingCaptures(deps)).toBe(0);
+        expect(await ingestPendingCaptures(deps)).toBe(1);
+
+        expect(created).toEqual([expect.objectContaining({ id: WATCH_AUDIO_ID, title: 'Captured thought' })]);
+        expect(transcribeAudio).toHaveBeenCalledOnce();
+        expect(appLogMocks.logInfo).toHaveBeenLastCalledWith('Watch capture ingested', {
+            scope: 'capture',
+            extra: { releaseCheck: 'v1.3.3/watch-audio-capture-once', kind: 'audio', outcome: 'already-created' },
+        });
+        expect(fileSystemMocks.deleteAsync).toHaveBeenLastCalledWith(
+            `file:///data/Documents/watch-audio/${WATCH_AUDIO_ID}.wav`,
+            { idempotent: true },
         );
     });
 

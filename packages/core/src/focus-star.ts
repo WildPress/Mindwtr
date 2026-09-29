@@ -3,9 +3,12 @@ import {
     FOCUS_ELIGIBILITY_ACTIVE_STATUSES,
     getTaskFocusEligibility,
     isTaskFutureFocusCandidate,
+    isTaskFutureFocusCandidateBeforeBoundary,
 } from './task-utils';
 import { formatFocusTaskLimitText } from './focus-utils';
 import { tFallback } from './i18n';
+import { isTaskActionable } from './task-status';
+import { taskDraftToUpdatePatch, type TaskDraft } from './task-draft';
 
 /**
  * The Today's Focus star as one module: every surface that toggles a task's
@@ -92,6 +95,40 @@ export function resolveFocusStarAction(task: Task, context: FocusStarContext): F
     };
 }
 
+/** Resolve an editor's unsaved values against the same Focus rules as a task row. */
+export function resolveTaskEditorFocusStar(
+    task: Task,
+    draft: TaskDraft,
+    context: FocusStarContext,
+): FocusStarAction & { queued: boolean } {
+    const candidate: Task = {
+        ...task,
+        ...(taskDraftToUpdatePatch(draft, task) ?? {}),
+        status: draft.status === 'inbox' ? 'next' : draft.status,
+        isFocusedToday: false,
+    };
+    const add = resolveFocusStarAction(candidate, {
+        ...context,
+        tasks: context.tasks.some((item) => item.id === task.id)
+            ? context.tasks.map((item) => item.id === task.id ? candidate : item)
+            : [...context.tasks, candidate],
+        focusedCount: Math.max(0, context.focusedCount - (task.isFocusedToday && !isTaskFutureFocusCandidate(task, context.now) ? 1 : 0)),
+    });
+    const available = !task.deletedAt && isTaskActionable(draft.status);
+    return {
+        ...add,
+        ...(!available ? { canToggle: false, blockedReason: 'clarify' as const } : {}),
+        ...(draft.focusedToday ? {
+            isFocused: true,
+            canToggle: true,
+            blockedReason: null,
+            labelKey: 'agenda.removeFromFocus' as const,
+            patch: { isFocusedToday: false },
+        } : {}),
+        queued: isTaskFutureFocusCandidate(candidate, context.now),
+    };
+}
+
 /**
  * Resolve a task's initial Focus state before it is persisted. A starred Inbox
  * capture is evaluated as Next, but that promotion is committed only when the
@@ -99,7 +136,8 @@ export function resolveFocusStarAction(task: Task, context: FocusStarContext): F
  */
 export function resolveTaskFocusCreation(
     task: Task,
-    context: Pick<FocusStarContext, 'tasks' | 'projects' | 'sections' | 'focusedCount' | 'focusTaskLimit'>,
+    context: Pick<FocusStarContext, 'tasks' | 'projects' | 'sections' | 'focusedCount' | 'focusTaskLimit' | 'now'>
+        & { endOfTodayIso?: string },
 ): TaskFocusCreationDecision {
     if (task.isFocusedToday !== true) {
         return {
@@ -115,11 +153,15 @@ export function resolveTaskFocusCreation(
         status: promotedStatus,
         isFocusedToday: false,
     };
-    const queued = isTaskFutureFocusCandidate(candidate);
+    const queued = context.endOfTodayIso
+        ? isTaskFutureFocusCandidateBeforeBoundary(candidate, context.endOfTodayIso)
+        : isTaskFutureFocusCandidate(candidate, context.now);
     const eligibility = getTaskFocusEligibility(candidate, {
         tasks: [...context.tasks, candidate],
         projects: context.projects,
         sections: context.sections,
+        now: context.now,
+        endOfTodayIso: context.endOfTodayIso,
         allowFutureStart: queued,
     });
 

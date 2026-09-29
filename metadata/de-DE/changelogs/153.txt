@@ -1,0 +1,5 @@
+- Wartende Aufgaben zeigen zugewiesene Personen; Fokus ist klarer.
+- Monatsserien unterstuetzen positionierte Wochentage und das Ueberspringen eines Termins.
+- Kalender bieten Bereichsfilter und genauere Zeitlinien.
+- Widgets folgen Sprache und 12/24-Stunden-Einstellung.
+- Erfassung, Filter, Sync und Wiederherstellung schuetzen neuere Aenderungen besser.

@@ -4,13 +4,14 @@ import { markCoreStartupPhase, measureCoreStartupPhase } from './startup-profile
 import { normalizeTaskForLoad } from './task-status';
 import { normalizeProjectLifecycleFields } from './project-status';
 import type { StorageAdapter } from './storage';
-import type { AppData } from './types';
+import type { AppData, SavedFilter } from './types';
 import type { DerivedCache, TaskStore } from './store-types';
 import {
     computeProjectDerivedState,
     computeTaskDerivedState,
     ensureDeviceId,
     getNextDataChangeAt,
+    hasSameEntityIdentity,
     normalizeAiSettingsForSync,
     persist,
     reconcileEntityCollection,
@@ -25,7 +26,7 @@ import {
     stripSensitiveSettings,
     withTimeout,
 } from './store-helpers';
-import { SYNC_STATUS_BOOKKEEPING_SETTINGS_KEYS } from './sync-helpers';
+import { advanceLatestSyncTimestamp, SYNC_STATUS_BOOKKEEPING_SETTINGS_KEYS } from './sync-helpers';
 import { getGtdSyncSnapshot } from './settings-options';
 import { DEFAULT_TOMBSTONE_RETENTION_DAYS, purgeExpiredTombstones } from './sync-tombstones';
 import { buildLoadContext, runAutoArchive, runLoadMigrations } from './store-load-migrations';
@@ -70,6 +71,36 @@ const consumeDocumentReplacementMark = (): boolean => {
 };
 
 const settingsValueChanged = (left: unknown, right: unknown): boolean => JSON.stringify(left ?? null) !== JSON.stringify(right ?? null);
+
+const timestampAtLeastAfter = (floor: string, ...knownValues: Array<string | undefined>): string => {
+    const floorMs = Date.parse(floor);
+    const beforeFloor = Number.isFinite(floorMs) ? new Date(floorMs - 1).toISOString() : undefined;
+    return advanceLatestSyncTimestamp(beforeFloor, ...knownValues) ?? floor;
+};
+
+const prepareLocalSavedFilterUpdates = (
+    previous: readonly SavedFilter[] | undefined,
+    next: SavedFilter[],
+    nowIso: string,
+): SavedFilter[] => {
+    const previousById = new Map((previous ?? []).map((filter) => [filter.id, filter]));
+    return next.map((filter) => {
+        const before = previousById.get(filter.id);
+        if (!before || !settingsValueChanged(before, filter)) return filter;
+        const requestedMs = Math.max(
+            ...[nowIso, filter.updatedAt, filter.deletedAt]
+                .map((value) => Date.parse(value ?? ''))
+                .filter(Number.isFinite),
+        );
+        const requestedAt = Number.isFinite(requestedMs) ? new Date(requestedMs).toISOString() : nowIso;
+        const operationAt = timestampAtLeastAfter(requestedAt, before.updatedAt, before.deletedAt);
+        return {
+            ...filter,
+            updatedAt: operationAt,
+            ...(filter.deletedAt ? { deletedAt: operationAt } : {}),
+        };
+    });
+};
 
 const mergeSettingsUpdates = (
     settings: AppData['settings'],
@@ -122,7 +153,9 @@ export const createSettingsActions = ({
     hasPendingSaveWork,
     getSaveGeneration,
     getStorage,
-}: SettingsActionContext): SettingsActions => ({
+}: SettingsActionContext): SettingsActions => {
+    let lastLoadWasRecovery = false;
+    return {
     seedGettingStarted: createSeedGettingStartedAction(set, debouncedSave, flushPendingSave),
 
     /**
@@ -216,8 +249,12 @@ export const createSettingsActions = ({
             // migration: it always runs and never itself is a reason to persist,
             // same as `stripSensitiveSettings` above. Loading data never mutates it
             // for persistence purposes — only the explicit one-time passes below do.
-            const normalizedTasks = rawTasks.map((task) => normalizeTaskForLoad(task, nowIso));
-            const normalizedProjects = rawProjects.map(normalizeProjectLifecycleFields);
+            // A pending native journal must compare the exact adapter rows before
+            // clock-dependent normalization or maintenance can change its receipt.
+            // The exclusive host runs a normal load after clearing that journal.
+            const recoveryLoad = options?.recoveryLoad === true;
+            const normalizedTasks = recoveryLoad ? rawTasks : rawTasks.map((task) => normalizeTaskForLoad(task, nowIso));
+            const normalizedProjects = recoveryLoad ? rawProjects : rawProjects.map(normalizeProjectLifecycleFields);
 
             const loadContext = buildLoadContext(settings, isFreshInstall, nowIso, nowMs);
             const initialData: AppData = {
@@ -228,7 +265,9 @@ export const createSettingsActions = ({
                 people: rawPeople,
                 settings,
             };
-            const { data: migratedData, applied } = runLoadMigrations(initialData, loadContext);
+            const { data: migratedData, applied } = recoveryLoad
+                ? { data: initialData, applied: [] }
+                : runLoadMigrations(initialData, loadContext);
             const allTasks = migratedData.tasks;
             const allProjects = migratedData.projects;
             const allSections = migratedData.sections;
@@ -243,6 +282,7 @@ export const createSettingsActions = ({
             let tasksReplaced = 0;
             let projectsReplaced = 0;
             let attachmentOnlyTasksReplaced = 0;
+            let normalizedFocusTasksReplaced = 0;
             let settingsReused = false;
             let visibleTasksReused = false;
             let stateUpdateSkipped = false;
@@ -266,8 +306,28 @@ export const createSettingsActions = ({
                             setProducerMs = Date.now() - producerStartedAt;
                             return options?.silent || !state.isLoading ? state : { isLoading: false };
                         }
-                        const nextTasks = reconcileEntityCollection(state._allTasks, state._tasksById, allTasks);
-                        const nextProjects = reconcileEntityCollection(state._allProjects, state._projectsById, allProjects);
+                        // Normalization can change a view-only field without a new
+                        // revision. Reusing by revision across recovery boundaries
+                        // would keep either the normalized receipt or the raw UI row.
+                        const reuseEntities = recoveryLoad === lastLoadWasRecovery;
+                        let previousTasksById: TaskStore['_tasksById'] = reuseEntities ? state._tasksById : new Map();
+                        if (reuseEntities && !recoveryLoad) {
+                            for (const task of allTasks) {
+                                const existing = previousTasksById.get(task.id);
+                                if (existing
+                                    && (existing.isFocusedToday !== task.isFocusedToday || existing.focusOrder !== task.focusOrder)
+                                    && hasSameEntityIdentity(existing, task)) {
+                                    // Local-day normalization can change focus without a
+                                    // revision. Keep all other cached rows and only copy the
+                                    // lookup if a row would hide this load's normalized view.
+                                    if (previousTasksById === state._tasksById) previousTasksById = new Map(previousTasksById);
+                                    previousTasksById.delete(task.id);
+                                    normalizedFocusTasksReplaced += 1;
+                                }
+                            }
+                        }
+                        const nextTasks = reconcileEntityCollection(state._allTasks, previousTasksById, allTasks);
+                        const nextProjects = reconcileEntityCollection(state._allProjects, reuseEntities ? state._projectsById : new Map(), allProjects);
                         const nextSections = reconcileEntityCollection(state._allSections, state._sectionsById, allSections);
                         const nextAreas = reconcileEntityCollection(state._allAreas, state._areasById, allAreas);
                         const nextPeople = reconcileEntityCollection(state._allPeople, state._peopleById, allPeople);
@@ -487,6 +547,21 @@ export const createSettingsActions = ({
             }
 
             markCoreStartupPhase('core.fetch_data.end');
+            lastLoadWasRecovery = recoveryLoad;
+            if (normalizedFocusTasksReplaced > 0) {
+                try {
+                    logInfo('Reload refreshed normalized task focus', {
+                        scope: 'store',
+                        category: 'storage',
+                        context: {
+                            releaseCheck: 'v1.3.3/reload-focus-normalization',
+                            count: normalizedFocusTasksReplaced,
+                        },
+                    });
+                } catch {
+                    // Diagnostics must not turn an accepted reload into a failure.
+                }
+            }
         } catch (err) {
             if (!isResultStillRelevant()) {
                 finishIrrelevantFetch();
@@ -521,12 +596,22 @@ export const createSettingsActions = ({
         set((state) => {
             const deviceState = ensureDeviceId(state.settings);
             const nowIso = new Date().toISOString();
-            const nextSettings = mergeSettingsUpdates(deviceState.settings, updates);
+            const preparedUpdates = updates.savedFilters
+                ? {
+                    ...updates,
+                    savedFilters: prepareLocalSavedFilterUpdates(
+                        deviceState.settings.savedFilters,
+                        updates.savedFilters,
+                        nowIso,
+                    ),
+                }
+                : updates;
+            const nextSettings = mergeSettingsUpdates(deviceState.settings, preparedUpdates);
             const nextSyncUpdatedAt = { ...(deviceState.settings.syncPreferencesUpdatedAt ?? {}) };
             let syncUpdated = false;
 
             const markSyncUpdated = (key: keyof NonNullable<AppData['settings']['syncPreferencesUpdatedAt']>) => {
-                nextSyncUpdatedAt[key] = nowIso;
+                nextSyncUpdatedAt[key] = timestampAtLeastAfter(nowIso, nextSyncUpdatedAt[key]);
                 syncUpdated = true;
             };
 
@@ -665,4 +750,5 @@ export const createSettingsActions = ({
     },
 
     getFocusedCount: () => selectFocusedCount(get().tasks),
-});
+    };
+};

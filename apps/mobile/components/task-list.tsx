@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { View, FlatList, Text, RefreshControl, Modal, Pressable, Switch, TouchableOpacity, useWindowDimensions, type NativeScrollEvent, type NativeSyntheticEvent } from 'react-native';
-import { router, useNavigation } from 'expo-router';
+import { useNavigation } from 'expo-router';
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, GripVertical } from 'lucide-react-native';
 import DraggableFlatList, { type DragEndParams, type RenderItemParams } from 'react-native-draggable-flatlist';
 import {
@@ -1166,7 +1166,7 @@ function TaskListComponent({
     };
     const sourceSectionId = moved.task.sectionId ?? null;
     if (sourceSectionId === plan.sectionId) {
-      void Promise.resolve(reorderProjectTasks(projectId, plan.orderedIds, plan.sectionId)).catch(reportFailure);
+      void Promise.resolve(reorderProjectTasks(projectId, plan.orderedIds, plan.sectionId, moved.task.id)).catch(reportFailure);
       return;
     }
     // Crossing a header re-homes the task into the section it was dropped in.
@@ -1174,7 +1174,7 @@ function TaskListComponent({
       await Promise.resolve(updateTask(moved.task.id, {
         sectionId: plan.sectionId ?? undefined,
       }));
-      await Promise.resolve(reorderProjectTasks(projectId, plan.orderedIds, plan.sectionId));
+      await Promise.resolve(reorderProjectTasks(projectId, plan.orderedIds, plan.sectionId, moved.task.id));
     })().catch(reportFailure);
   }, [projectId, reorderProjectTasks, showToast, t, updateTask]);
 
@@ -1923,11 +1923,6 @@ function TaskListComponent({
           onProjectNavigate={projectId ? undefined : openProjectScreen}
           onContextNavigate={openContextsScreen}
           onTagNavigate={openContextsScreen}
-          onFocusMode={(taskId) => {
-            clearTaskListActivitySession();
-            setIsModalVisible(false);
-            router.push(`/check-focus?id=${taskId}`);
-          }}
         />
       </ErrorBoundary>
     </View>

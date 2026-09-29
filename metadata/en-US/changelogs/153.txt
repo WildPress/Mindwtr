@@ -1,0 +1,5 @@
+- Waiting tasks show assigned people, and Focus planning is clearer.
+- Monthly repeats support positioned weekdays and skipping one fixed occurrence.
+- Calendar views gain Area filters and more accurate time lines.
+- Widgets follow your language and 12/24-hour setting.
+- Captures, saved filters, sync, and recovery preserve newer edits more reliably.

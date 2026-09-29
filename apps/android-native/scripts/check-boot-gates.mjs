@@ -16,6 +16,13 @@ for (const text of ['mailto:alex@example.com', 'tel:+1-555-0100', 'MAILTO:bea@ex
     const parts = (url) => [url.protocol, url.pathname, url.search, url.hash, url.host, String(url)];
     assert.deepEqual(parts(new consoleState.URL(text)), parts(new URL(text)), text);
 }
+// Query values read as WHATWG (and RN's URL shim) read them: everything after the first "=", "+" as a space; a "+" in a
+// query survives the polyfill's own String(url).
+const queryPairs = (params) => { const pairs = []; params.forEach((value, key) => pairs.push([key, value])); return pairs; };
+for (const text of ['mindwtr:///capture?title=a=b&note=Buy+milk+%2B+eggs&empty=&flag&x%20y=1+2', 'https://host/dav/?dir=a+b']) {
+    assert.deepEqual(queryPairs(new consoleState.URL(text).searchParams), queryPairs(new URL(text).searchParams), text);
+}
+assert.equal(String(new consoleState.URL('https://host/dav/?dir=a+b')), 'https://host/dav/?dir=a+b');
 // QuickJS has no Intl: the polyfill's Collator and localeCompare sort by the host's ICU collation keys (one bridge call per
 // text and options), so titles order as in RN; without the bridge they fall back to a plain comparison.
 {
@@ -34,6 +41,224 @@ for (const text of ['mailto:alex@example.com', 'tel:+1-555-0100', 'MAILTO:bea@ex
     const noKeys = vm.createContext({ console: { info() {} }, Intl: undefined, __mindwtrNative: { log() {} } });
     vm.runInContext(polyfills, noKeys);
     assert.deepEqual([...vm.runInContext("['b', 'a', 'C'].sort(new Intl.Collator().compare)", noKeys)], ['C', 'a', 'b'], 'the fallback without the bridge');
+}
+// A context automation link names a context with a space as "+" (core's parseContextAutomationUrl reads the query).
+assert.equal(new consoleState.URL('mindwtr://contexts?token=home+office&contextAction=activate').searchParams.get('token'), 'home office');
+assert.equal(new consoleState.URL('mindwtr://activate-context?name=%40home+office%2Bgym').searchParams.get('name'), '@home office+gym');
+// URLSearchParams.toString() has no "?", as WHATWG writes it: core posts it as a form body (dropbox-auth-tokens.ts) and puts
+// its own "?" before it (sync-helpers.ts); String(url) still writes the "?" before a query.
+for (const init of ['?a=1&b=x+y', 'a=1', '', { grant_type: 'refresh_token', refresh_token: 'r t+s' }, { a: 'x y', b: '1+1' }]) {
+    assert.equal(new consoleState.URLSearchParams(init).toString(), new URLSearchParams(init).toString(), JSON.stringify(init));
+}
+for (const text of ['https://host/dav/?dir=a+b&_=1', 'https://host/dav/', 'mindwtr:///capture?title=a', 'mailto:alex@example.com?subject=Hi']) {
+    assert.equal(String(new consoleState.URL(text)), String(new URL(text)), text);
+}
+// fetch and the secret calls (HostIo.kt): the polyfill hands each call to the bridge and settles it only when the pump
+// takes the host's answer (ioNext), as timers fire. A stand-in bridge answers here.
+{
+    const sent = [];
+    // The host's queue: each answer's JSON, and its body apart (ioBody), as HostIo keeps them.
+    const answers = [];
+    let taken = '';
+    const aborted = [];
+    const store = new Map();
+    let clock = 0;
+    let ids = 0;
+    let nextCalls = 0;
+    const bridge = {
+        log() {},
+        nowMs: () => clock,
+        netFetch(json) {
+            const request = JSON.parse(json);
+            if (request.url.startsWith('ftp:')) return '!MindwtrNativeError:Expected URL scheme \'http\' or \'https\'';
+            sent.push(request);
+            return String(++ids);
+        },
+        netAbort(id) { aborted.push(id); return null; },
+        secretCall(json) {
+            const { op, key, value } = JSON.parse(json);
+            if (!/^[\w.-]+$/.test(key)) return '!MindwtrNativeError:Invalid secret key';
+            const id = String(++ids);
+            if (op === 'set') store.set(key, value);
+            if (op === 'delete') store.delete(key);
+            answers.push({ json: JSON.stringify({ id, value: op === 'get' ? store.get(key) ?? null : null }) });
+            return id;
+        },
+        ioNext() {
+            nextCalls += 1;
+            const next = answers.shift();
+            taken = next?.body ?? '';
+            return next?.json ?? '';
+        },
+        ioBody() { return taken; },
+    };
+    const net = vm.createContext({ console: { info() {} }, Intl: undefined, __mindwtrNative: bridge });
+    vm.runInContext(readFileSync(resolve(app, 'bundle/host-polyfills.js'), 'utf8'), net);
+    const run = (code) => vm.runInContext(code, net);
+    const answer = ({ base64, ...fields }) => answers.push(base64 === undefined
+        ? { json: JSON.stringify(fields) } : { json: JSON.stringify({ ...fields, body: true }), body: base64 });
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    const failure = async (promise) => promise.then(() => assert.fail('expected a rejection'), (error) => ({ name: error.name, message: error.message }));
+    const text = 'Grüße ✓ 😀';
+
+    let settled = false;
+    const get = run("fetch('https://dav.example/data.json', { headers: { 'Accept-Encoding': 'identity', Depth: '0' } })").then((res) => { settled = true; return res; });
+    assert.deepEqual(sent.at(-1), { url: 'https://dav.example/data.json', method: 'GET', redirect: 'follow', headers: [['accept-encoding', 'identity'], ['depth', '0']] });
+    answer({ id: '1', status: 207, statusText: 'Multi-Status', url: 'https://dav.example/data.json', redirected: false,
+        headers: [['ETag', '"v1"'], ['X-A', '1'], ['x-a', '2']], base64: Buffer.from(JSON.stringify({ text })).toString('base64') });
+    await new Promise((done) => setImmediate(done));
+    assert.equal(settled, false, 'an answer settles only in the pump');
+    assert.equal(net.__pumpTimers(), 1);
+    const res = await get;
+    assert.deepEqual([res.status, res.statusText, res.ok, res.body, res.headers.get('etag'), res.headers.get('X-A')], [207, 'Multi-Status', true, null, '"v1"', '1, 2']);
+    assert.deepEqual(plain(await res.clone().json()), { text });
+    assert.equal(await res.text(), JSON.stringify({ text }));
+    assert.equal(res.bodyUsed, true);
+
+    // Request bodies: text as text (RN's default type when none is set), bytes as base64, a form as its text.
+    const bytes = Uint8Array.from({ length: 256 }, (_, i) => i);
+    net.bytes = bytes;
+    const bodies = run("[fetch('https://dav.example/a', { method: 'put', body: 'Grüße' }),"
+        + " fetch('https://dav.example/b', { method: 'PUT', body: new Uint8Array(bytes), redirect: 'error', headers: [['Content-Type', 'application/octet-stream']] }),"
+        + " fetch('https://dav.example/c', { method: 'POST', body: new URLSearchParams('?a=1&b=%C3%BC') }),"
+        + " fetch('https://dav.example/d', { method: 'PROPFIND', body: new Uint8Array(bytes).buffer })]");
+    assert.deepEqual(sent.slice(-4).map(({ method, text: body, base64, headers, redirect }) => [method, body ?? base64, headers, redirect]), [
+        ['PUT', 'Grüße', [['content-type', 'text/plain;charset=UTF-8']], 'follow'],
+        ['PUT', Buffer.from(bytes).toString('base64'), [['content-type', 'application/octet-stream']], 'error'],
+        ['POST', 'a=1&b=%C3%BC', [['content-type', 'application/x-www-form-urlencoded;charset=UTF-8']], 'follow'],
+        ['PROPFIND', Buffer.from(bytes).toString('base64'), [], 'follow'],
+    ]);
+    // The answers: every byte back from base64, a failed request as RN's TypeError, the host's own refusal as it is.
+    answer({ id: '3', status: 200, statusText: 'OK', url: 'https://dav.example/final', redirected: true, headers: [], base64: Buffer.from(bytes).toString('base64') });
+    answer({ id: '2', error: 'Network request failed: Failed to connect to dav.example/10.0.0.1:443' });
+    answer({ id: '4', error: 'fetch failed: unexpected redirect' });
+    answer({ id: '5', status: 404, statusText: '', url: 'https://dav.example/d', redirected: false, headers: [], base64: '' });
+    assert.equal(net.__pumpTimers(), 4);
+    const [a, b, c, d] = await Promise.allSettled(bodies);
+    assert.deepEqual([a.status, a.reason.name, a.reason.message], ['rejected', 'TypeError', 'Network request failed: Failed to connect to dav.example/10.0.0.1:443']);
+    assert.deepEqual([b.value.url, b.value.redirected, Buffer.from(await b.value.arrayBuffer()).equals(Buffer.from(bytes))], ['https://dav.example/final', true, true]);
+    assert.deepEqual([c.reason.name, c.reason.message], ['TypeError', 'fetch failed: unexpected redirect']);
+    assert.deepEqual([d.value.status, d.value.ok, await d.value.text()], [404, false, '']);
+    // A body is whole or the fetch rejects, never a short or empty body: core reads an unreadable sync document as a
+    // missing remote and writes local data over it. HostIo answers a body cut short, a reset mid-body, an oversized body
+    // and a broken gzip stream as errors; an answer whose body is not whole base64 is refused here.
+    const whole = (base64) => ({ status: 200, statusText: 'OK', url: 'https://dav.example/data.json', redirected: false, headers: [], base64 });
+    const cases = [
+        ...['Network request failed: unexpected end of stream on http://127.0.0.1:18765/...', 'Network request failed: Connection reset',
+            'Response exceeds the 104857600 byte download limit', 'Network request failed: gzip finished without exhausting source'].map((error) => [{ error }, error]),
+        ...[undefined, 'eyJ0ZXh0Ijo', 'ey*0', 'e=J0', 'eyJ0ZX\u00e90', 'eyJ0\n'].map((base64) => [whole(base64), 'Network request failed: the host sent an unreadable body']),
+    ];
+    const cut = run(`[${cases.map((_, i) => `fetch('https://dav.example/cut/${i}')`).join(', ')}]`);
+    cases.forEach(([fields], i) => answer({ id: String(ids - cases.length + i + 1), ...fields }));
+    assert.equal(net.__pumpTimers(), cases.length);
+    const outcomes = await Promise.allSettled(cut);
+    outcomes.forEach((outcome, i) => {
+        assert.equal(outcome.status, 'rejected', `case ${i} rejects`);
+        assert.deepEqual([outcome.reason.name, outcome.reason.message], ['TypeError', cases[i][1]], `case ${i}`);
+    });
+    // Whole base64 with its padding reads back exactly, the empty body included.
+    const padded = run("['', 'QQ==', 'QUI=', 'QUJD'].map((_, i) => fetch('https://dav.example/pad/' + i))");
+    ['', 'QQ==', 'QUI=', 'QUJD'].forEach((base64, i) => answer({ id: String(ids - 3 + i), ...whole(base64) }));
+    net.__pumpTimers();
+    assert.deepEqual(await Promise.all((await Promise.all(padded)).map((res) => res.text())), ['', 'A', 'AB', 'ABC']);
+    // Refused before the bridge: a GET body, a method outside the list, a bad header; the host's own refusal is a TypeError too.
+    const before = sent.length;
+    for (const [code, message] of [
+        ["fetch('https://dav.example', { body: 'x' })", /GET\/HEAD method cannot have body/], ["fetch('https://dav.example', { method: 'TRACE' })", /Unsupported method: TRACE/],
+        ["fetch('https://dav.example', { headers: { 'Bad Name': 'x' } })", /Invalid header name/], ["fetch('ftp://dav.example')", /Expected URL scheme/],
+    ]) {
+        const error = await failure(run(code));
+        assert.equal(error.name, 'TypeError', code);
+        assert.match(error.message, message);
+    }
+    assert.equal(sent.length, before, 'a refused request never reaches the host');
+
+    // Abort: the promise rejects at once with the signal's reason, the host cancels the call, and its late answer is dropped.
+    const aborting = run("const controller = new AbortController(); globalThis.aborting = fetch('https://dav.example/slow', { signal: controller.signal }); controller.abort(); aborting");
+    assert.deepEqual(await failure(aborting), { name: 'AbortError', message: 'This operation was aborted' });
+    assert.deepEqual(aborted, [String(ids)]);
+    const reasoned = run("const withReason = new AbortController(); const call = fetch('https://dav.example/slow', { signal: withReason.signal }); withReason.abort(new Error('Sync cancelled')); call");
+    assert.equal((await failure(reasoned)).message, 'Sync cancelled');
+    assert.deepEqual(await failure(run("fetch('https://dav.example', { signal: AbortSignal.abort() })")), { name: 'AbortError', message: 'This operation was aborted' });
+    // AbortSignal.timeout fires on the host's timers: a TimeoutError once the clock passes it.
+    const timed = run("fetch('https://dav.example/slow', { signal: AbortSignal.timeout(1000) })");
+    clock = 999;
+    net.__pumpTimers();
+    clock = 1000;
+    net.__pumpTimers();
+    assert.deepEqual(await failure(timed), { name: 'TimeoutError', message: 'The operation timed out.' });
+    assert.equal(aborted.length, 3);
+    for (const id of aborted) answer({ id, error: 'Request cancelled' });
+    assert.equal(net.__pumpTimers(), 0, 'a cancelled call\'s late answer settles nothing');
+    const asked = nextCalls;
+    net.__pumpTimers();
+    assert.equal(nextCalls, asked, 'the pump asks the host only while a call is open');
+
+    // Secrets: each call settles in the pump; a bad key is the host's refusal; a value must be a string.
+    const secrets = net.__mindwtrSecrets;
+    const saved = secrets.setSecret('mindwtr_webdav_password', text);
+    net.__pumpTimers();
+    assert.equal(await saved, undefined);
+    const read = secrets.getSecret('mindwtr_webdav_password');
+    net.__pumpTimers();
+    assert.equal(await read, text);
+    const removed = secrets.deleteSecret('mindwtr_webdav_password');
+    net.__pumpTimers();
+    await removed;
+    const gone = secrets.getSecret('mindwtr_webdav_password');
+    net.__pumpTimers();
+    assert.equal(await gone, null);
+    assert.deepEqual(await failure(secrets.getSecret('@mindwtr_webdav_password')), { name: 'TypeError', message: 'Invalid secret key' });
+    assert.deepEqual(await failure(secrets.setSecret('mindwtr_cloud_token', 42)), { name: 'TypeError', message: 'A secret value must be a string' });
+    assert.equal(answers.length, 0);
+
+    // Review 1: text is fatal UTF-8. Core reads every response through `new TextDecoder()`: a malformed body throws, never
+    // decodes to other text (E2 alone once read as U+2000, a space, so a body trimmed to empty read as a missing remote).
+    // `fatal: false` gives the platform's replacement text, compared with Node's decoder.
+    const malformed = [[0xe2], [0x20, 0xc0, 0xa0, 0x20], [0x80], [0xc1, 0xbf], [0xe0, 0x80, 0x80], [0xed, 0xa0, 0x80], [0xf0, 0x80, 0x80, 0x80],
+        [0xf4, 0x90, 0x80, 0x80], [0xf5, 0x80], [0xff], [0xe2, 0x82], [0x61, 0xe2, 0x28, 0xa1], [0xf0, 0x9f, 0x98]];
+    net.cases = malformed.map((bytes) => new Uint8Array(bytes));
+    for (const [i, bytes] of malformed.entries()) {
+        assert.throws(() => run(`new TextDecoder().decode(cases[${i}])`), (error) => error.name === 'TypeError' && error.message === 'The encoded data was not valid for encoding utf-8', `fatal ${bytes}`);
+        assert.equal(run(`new TextDecoder('utf-8', { fatal: false }).decode(cases[${i}])`), new TextDecoder().decode(Uint8Array.from(bytes)), `replacement ${bytes}`);
+    }
+    // Well-formed text, and 300 random byte strings without `fatal`, decode exactly as the platform decodes them.
+    const random = Array.from({ length: 300 }, (_, i) => Uint8Array.from({ length: 1 + (i % 40) }, (_, j) => (i * 131 + j * 89 + ((i * j) % 7) * 37) & 0xff));
+    net.random = random.map((bytes) => new Uint8Array(bytes));
+    random.forEach((bytes, i) => assert.equal(run(`new TextDecoder('utf-8', { fatal: false }).decode(random[${i}])`), new TextDecoder().decode(bytes), `random ${i}`));
+    const wellFormed = ['', 'plain', text, '\u0000\u007f\u0080\u07ff\u0800\uffff', '\u{10000}\u{10ffff}', 'a\u00e9\u4e2d\u{1f600}z'];
+    net.wellFormed = wellFormed.map((value) => new TextEncoder().encode(value));
+    wellFormed.forEach((value, i) => assert.equal(run(`new TextDecoder().decode(wellFormed[${i}])`), value));
+    assert.equal(run('new TextDecoder().decode(new Uint8Array([0x78, 0x61, 0x62, 0x63, 0x78]).subarray(1, 4))'), 'abc', 'a view decodes from its offset');
+    // The encoder writes a lone surrogate as U+FFFD, as the platform does, so the fatal decoder reads back what it wrote.
+    for (const value of ['\ud800', 'a\udc00b', '\ud83d', '\udfff\ud800', '\ud83d\ude00']) {
+        net.value = value;
+        assert.deepEqual([...run('new TextEncoder().encode(value)')], [...new TextEncoder().encode(value)], JSON.stringify(value));
+        assert.equal(run('new TextDecoder().decode(new TextEncoder().encode(value))'), new TextDecoder().decode(new TextEncoder().encode(value)));
+    }
+    // Response.text() and json() reject a body that is not UTF-8; arrayBuffer() stays byte-exact.
+    const loose = run("fetch('https://dav.example/utf8')");
+    answer({ id: String(ids), status: 200, statusText: 'OK', url: 'https://dav.example/utf8', redirected: false, headers: [], base64: Buffer.from([0x20, 0xe2, 0x20]).toString('base64') });
+    net.__pumpTimers();
+    const looseResponse = await loose;
+    assert.deepEqual([...new Uint8Array(await looseResponse.clone().arrayBuffer())], [0x20, 0xe2, 0x20]);
+    assert.deepEqual(await failure(looseResponse.clone().text()), { name: 'TypeError', message: 'The encoded data was not valid for encoding utf-8' });
+    assert.deepEqual(await failure(looseResponse.json()), { name: 'TypeError', message: 'The encoded data was not valid for encoding utf-8' });
+
+    // Review 2: the host's deadline passed. Every open fetch rejects with an AbortError and is cancelled at the host, and a
+    // new fetch or secret call is refused (it never reaches the host) until the host resumes calls.
+    const open = run("fetch('https://dav.example/slow')");
+    const openId = String(ids);
+    net.__cancelHostCalls('The host operation timed out');
+    assert.deepEqual(await failure(open), { name: 'AbortError', message: 'The host operation timed out' });
+    assert.equal(aborted.at(-1), openId);
+    const refusedFrom = sent.length;
+    assert.deepEqual(await failure(run("fetch('https://dav.example/after', { method: 'PUT', body: '{}' })")), { name: 'AbortError', message: 'The host operation timed out' });
+    assert.deepEqual(await failure(secrets.setSecret('mindwtr_cloud_token', 'x')), { name: 'AbortError', message: 'The host operation timed out' });
+    assert.equal(sent.length, refusedFrom, 'no call reaches the host while the operation drains');
+    net.__resumeHostCalls();
+    run("fetch('https://dav.example/later')");
+    assert.equal(sent.at(-1).url, 'https://dav.example/later', 'calls reach the host again once it resumes them');
 }
 const coreHost = readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/core/CoreHost.kt'), 'utf8');
 const sqliteBridge = readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/core/SqliteBridge.kt'), 'utf8');
@@ -155,7 +380,7 @@ assert.match(model, /val owed = failedAction\?\.takeIf \{ action == null && it\.
 assert.match(owner, /if \(pending\.action\.kind == "storage" && failure\?\.action\?\.kind\.let \{ it != null && it != "storage" \}\) return/);
 // User actions go through perform: the three commands with their action, the reads the user asked for without one.
 assert.equal(code(model).match(/\bperform\(action\)/g).length, 14, 'complete, editor save, Reset checklist, task star, project star, status, project create, area filter, saved search, Process Inbox answer, the storage retry, and the capture popup\'s capture, lines and picker create');
-assert.equal(code(model).match(/\bperform\s*\{/g).length, 9, 'editor, reload, Try again, two More (Focus, a project), open project, open Process Inbox, open the capture popup, a Focus control\'s edit');
+assert.equal(code(model).match(/\bperform\s*\{/g).length, 10, 'editor, reload, Try again, two More (Focus, a project), open project, open Process Inbox, open the capture popup, a Focus control\'s edit, Import .txt');
 // Background reads (resume, each minute, after a command) never take busy, so they disable no control and never
 // turn a user's tap away: only perform sets busy, and its guard knows nothing of reads in flight.
 const backgroundFn = code(model.slice(model.indexOf('internal fun <T> background('), model.indexOf('internal fun perform(')));
@@ -228,7 +453,7 @@ const kotlinFiles = [activity, model, owner, editorUi, focusUi, projectsUi, labe
 assert.equal(kotlinFiles.join('\n').match(/(?<!class )CoreHost\(/g).length, 1);
 // The dev build keeps its own database. The upgradetest build gets the RN database and RN's state
 // only from the guard, before CoreHost exists: before any open of it, the checkpoint, and any core write.
-assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
+assert.match(owner, /val legacy = if \(BuildConfig\.RN_STORAGE\) \{\s*LegacyRnStoreGuard\.requireClear\(app\.dataDir, File\(app\.cacheDir, "legacy-rn-guard"\)\)\s*\} else \{\s*null\s*\}\s*val runtime = CoreHost\(legacy\?\.database \?: File\(app\.filesDir, "mindwtr-native-dev\.db"\), legacy\?\.let \{ app\.dataDir \}, HostIo\(app\)\)\s*try \{\s*runtime\.start\([^\n]*, legacy\?\.bootState \?: "", legacy\?\.backup \?: ""\)/);
 assert.match(coreHost, /callAsync\("boot", legacyState, legacyBackup\)/);
 assert.equal(kotlinFiles.join('\n').match(/LegacyRnStoreGuard\.requireClear\(/g).length, 1);
 assert.match(guard, /private const val DATABASE = "files\/SQLite\/mindwtr\.db"/);
@@ -326,8 +551,98 @@ assert.match(model, /ProcessCoreHost\.get\(/);
 // Storage exceptions never cross the QuickJS JNI boundary.
 assert.equal(coreHost.match(/JSCallFunction \{/g).length, 1, 'the only JS callback constructor is guarded');
 const bridgeCallbacks = coreHost.match(/bridge\.setProperty\([^\n]*/g);
-assert.equal(bridgeCallbacks.length, 8, 'the SQL calls, nowMs, randomBytes, rnStateCommit, collationKey and log: each guarded');
+assert.equal(bridgeCallbacks.length, 13, 'the SQL calls, nowMs, randomBytes, rnStateCommit, collationKey, log, and the fetch and secret calls: each guarded');
 for (const line of bridgeCallbacks) assert.match(line, /^bridge\.setProperty\("\w+", guarded \{/);
+// fetch and the secrets (HostIo.kt, SecretStore.kt): started on the engine thread, run off it, answered only through the pump.
+{
+    const core = (name) => readFileSync(resolve(app, 'android/app/src/main/java/tech/dongdongbh/mindwtr/pilot/core', name), 'utf8');
+    const hostIo = core('HostIo.kt');
+    const secretStore = core('SecretStore.kt');
+    for (const [name, call] of [['netFetch', 'args -> io.fetch(args[0] as String)'], ['netAbort', 'args -> io.abort(args[0] as String); null'],
+        ['secretCall', 'args -> io.secret(args[0] as String)'], ['ioNext', '_ -> io.next()'], ['ioBody', '_ -> io.body()']]) {
+        assert(bridgeCallbacks.includes(`bridge.setProperty("${name}", guarded { ${call} })`), `${name} starts or takes a call and nothing else`);
+    }
+    assert.doesNotMatch(hostIo + secretStore, /quickjs|JSFunction|JSObject|JSCallFunction/i, 'no host call touches the engine');
+    assert.match(hostIo, /calls\[id\] = call\s+call\.enqueue\(object : Callback \{/, 'a request runs on OkHttp\'s dispatcher');
+    assert.doesNotMatch(hostIo, /\.execute\(\)|runBlocking|Thread\.sleep/);
+    // Nothing throws on OkHttp's thread, and (review 3) a call stays cancellable until its body is read: it leaves [calls]
+    // only after the read, on a failure, or on an abort, so an abort or close after the headers still cancels it.
+    assert.match(hostIo, /override fun onResponse\(call: Call, response: Response\) \{[^{}]*?try \{\s*answers\.add\(runCatching \{ response\.use \{ read\(id, it, redirect\) \} \}\.getOrElse \{ failure\(id, call, it\) \}\)\s*\} finally \{\s*calls\.remove\(id\)\s*\}/);
+    assert.equal(hostIo.match(/calls\.remove\(id\)/g).length, 3);
+    assert.match(hostIo, /fun close\(\) \{\s*calls\.values\.forEach \{ it\.cancel\(\) \}/);
+    assert.match(hostIo, /secretThread\.execute \{\s*answers\.add\(runCatching \{/, 'a secret call runs on the secrets thread');
+    assert.equal(hostIo.match(/answers\.add\(/g).length, 3, 'the answer queue is the only way back');
+    // A body leaves apart from its answer's JSON (ioBody), and only for the answer just taken.
+    assert.match(hostIo, /taken = answer\.body\s+return answer\.json/);
+    assert.match(hostIo, /fun body\(\): String = \(taken \?: ""\)\.also \{ taken = null \}/);
+    // The whole body or a throw: the declared length and the running size are refused past the limit, and nothing in the
+    // read catches a failure (a cut, a reset, a broken gzip stream) into a short body.
+    const read = hostIo.slice(hostIo.indexOf('private fun read('), hostIo.indexOf('private fun failure('));
+    assert.match(read, /if \(body\.contentLength\(\) > maxResponseBytes\) throw Refused\(tooLarge\)/);
+    assert.match(read, /while \(source\.read\(bytes, 64 \* 1024L\) != -1L\) \{\s*if \(bytes\.size > maxResponseBytes\) throw Refused\(tooLarge\)\s*\}/);
+    assert.doesNotMatch(read, /catch|runCatching|getOrNull|getOrDefault|getOrElse|\?: ""|orEmpty/, 'HostIo.read swallows no IOException');
+    // The only places HostIo catches: each turns the failure into the call's error answer, so fetch rejects.
+    assert.doesNotMatch(hostIo, /catch \(|getOrNull|getOrDefault/);
+    assert.deepEqual(hostIo.match(/runCatching \{[\s\S]*?\}\.getOrElse \{ [^\n]*/g).map((line) => /getOrElse \{ (failure\(id, call, it\)|JSONObject\(\)\.put\("id", id\)\.put\("error")/.test(line)), [true, true]);
+    // Review 5: the ceiling is core's largest limit (a sync document), bounded by a fifth of the heap; core applies its
+    // smaller limits itself. The lower limit the net check uses exists only in a debug build (debugProperty is "" in release).
+    const coreHttp = readFileSync(resolve(app, '../../packages/core/src/http-utils.ts'), 'utf8');
+    const product = (text) => text.replace(/[L_]/g, '').split('*').reduce((total, part) => total * Number(part.trim()), 1);
+    assert.equal(product(/const val MAX_SYNC_DOCUMENT_BYTES = ([^\n]+)/.exec(hostIo)[1]), product(/export const MAX_SYNC_DOCUMENT_BYTES = ([^;]+);/.exec(coreHttp)[1]));
+    assert.match(hostIo, /private val ceiling = minOf\(MAX_SYNC_DOCUMENT_BYTES, Runtime\.getRuntime\(\)\.maxMemory\(\) \/ 5\)/);
+    assert.match(hostIo, /private val maxResponseBytes = debugProperty\("net_max_bytes"\)\.toLongOrNull\(\)\?\.takeIf \{ it > 0 \}\?\.let \{ minOf\(it, ceiling\) \} \?: ceiling/);
+    assert.match(hostIo, /Log\.i\(CoreHost\.TAG, "Native Android fetch limit bytes=\$maxResponseBytes ceiling=\$ceiling heap=/);
+    // Review 4: a response without a body keeps its gzip label and is never decoded (cloud's HEAD failed on it).
+    assert.match(read, /val bodiless = response\.request\.method == "HEAD" \|\| response\.code == 204 \|\| response\.code == 304 \|\| body\.contentLength\(\) == 0L/);
+    assert.match(read, /val gzip = !bodiless && response\.header\("Content-Encoding"\)\.equals\("gzip", ignoreCase = true\)\s+val source = if \(gzip\) GzipSource/);
+    // A network failure's text never carries core's invalid-JSON phrases (retry-utils.ts), which sync reads as a missing
+    // remote and writes over: the host's list is core's, and a matching detail is replaced by the exception's name.
+    const coreRetry = readFileSync(resolve(app, '../../packages/core/src/retry-utils.ts'), 'utf8');
+    const corePhrases = [...coreRetry.slice(coreRetry.indexOf('export const isWebdavInvalidJsonError'), coreRetry.indexOf('export const isRetryableWebdavReadError')).matchAll(/normalized\.includes\('([^']+)'\)/g)].map((m) => m[1]);
+    assert.deepEqual([.../INVALID_JSON_PHRASES = listOf\(([\s\S]*?)\)\n/.exec(hostIo)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]), corePhrases);
+    assert.match(hostIo, /detail\.isNotEmpty\(\) && INVALID_JSON_PHRASES\.none \{ detail\.lowercase\(\)\.contains\(it\) \}\s*\} \?: error\.javaClass\.simpleName/);
+    // Review 2: an operation's deadline is the longest core timeout it wraps (core's storage and request timeouts for a
+    // contract call; HostIo's request ceiling plus that for one that sends requests). Past it the operation is cancelled
+    // (JS cancel: its signal, its fetches) and drained; one that does not end stops the host, so it never resumes.
+    const coreStorage = readFileSync(resolve(app, '../../packages/core/src/store-settings.ts'), 'utf8');
+    const deadline = product(/const val OPERATION_DEADLINE_MS = ([^\n]+)/.exec(coreHost)[1]);
+    assert(deadline >= product(/export const DEFAULT_TIMEOUT_MS = ([^;]+);/.exec(coreHttp)[1]) && deadline >= product(/const STORAGE_TIMEOUT_MS = ([^;]+);/.exec(coreStorage)[1]));
+    assert.match(coreHost, /const val NETWORK_DEADLINE_MS = HostIo\.CALL_TIMEOUT_MS \+ OPERATION_DEADLINE_MS/);
+    assert.match(coreHost, /private fun callAsync\(method: String, vararg args: Any\?, deadlineMs: Long = OPERATION_DEADLINE_MS\): JSONObject = onEngine \{\s*stopped\?\.let \{ throw IllegalStateException\(it\) \}/);
+    assert.match(coreHost, /val answer = pumpUntil\(id, deadlineMs\) \?: run \{[^}]*?call\("cancel", id\)\s*if \(pumpUntil\(id, DRAIN_MS\) == null\) \{[^}]*?stopped = reason[^}]*?closeOnEngine\(\)\s*throw IllegalStateException\(reason\)\s*\}\s*checkNotNull\(context\)\.globalObject\.getJSFunction\("__resumeHostCalls"\)\.call\(\)\s*throw IllegalStateException\("Core \$method timed out"\)/);
+    assert.equal(coreHost.match(/pumpUntil\(/g).length, 3, 'callAsync pumps only through pumpUntil');
+    assert.match(coreHost, /callAsync\("netCheck", port, deadlineMs = NETWORK_DEADLINE_MS\)/);
+    assert.match(hostIo, /response\.use \{ read\(id, it, redirect\) \}/);
+    // RN's connect timeout (#1150).
+    const rnClient = readFileSync(resolve(app, '../mobile/modules/sync-file-lock/android/src/main/java/tech/dongdongbh/mindwtr/syncfilelock/SyncHttpClientPackage.kt'), 'utf8');
+    assert.equal(/CONNECT_TIMEOUT_MS = ([\d_]+L)/.exec(hostIo)[1], /CONNECT_TIMEOUT_MS = ([\d_]+L)/.exec(rnClient)[1]);
+    assert.match(hostIo, /\.connectTimeout\(CONNECT_TIMEOUT_MS, TimeUnit\.MILLISECONDS\)/);
+    assert.match(coreHost, /if \(io\.busy\(\)\) io\.await\(if \(delay < 0\) 25L else minOf\(delay, 25L\)\)\s+else if \(delay > 0\) Thread\.sleep\(minOf\(delay, 25L\)\)/);
+    assert.match(coreHost, /callAsync\("boot", legacyState, legacyBackup\)\.also \{ netCheck\(\) \}/);
+    assert.match(coreHost, /val port = debugFault\("net_check"\)\.ifEmpty \{ return \}/, 'the net check is debug-only');
+    // RN's network security config (cleartext as RN allows it, user CAs trusted), and the INTERNET permission.
+    const rnConfig = /NETWORK_SECURITY_CONFIG_XML = `([\s\S]*?)`;/.exec(readFileSync(resolve(app, '../mobile/plugins/android-network-security-config.js'), 'utf8'))[1];
+    assert.equal(readFileSync(resolve(app, 'android/app/src/main/res/xml/network_security_config.xml'), 'utf8'), rnConfig);
+    const manifest = readFileSync(resolve(app, 'android/app/src/main/AndroidManifest.xml'), 'utf8');
+    assert.match(manifest, /<uses-permission android:name="android\.permission\.INTERNET" \/>/);
+    assert.match(manifest, /<application\s+android:networkSecurityConfig="@xml\/network_security_config"/);
+    // expo-secure-store's own names, read from RN's copy: the file, the entry, the key alias, the item's fields.
+    const expo = (name) => readFileSync(resolve(app, '../../node_modules/expo-secure-store/android/src/main/java/expo/modules/securestore', name), 'utf8');
+    const expoSource = expo('SecureStoreModule.kt') + expo('encryptors/AESEncryptor.kt') + expo('AuthenticationHelper.kt');
+    for (const pin of ['SHARED_PREFERENCES_NAME = "SecureStore"', 'DEFAULT_KEYSTORE_ALIAS = "key_v1"', 'return "$keychainService-$key"',
+        'UNAUTHENTICATED_KEYSTORE_SUFFIX = "keystoreUnauthenticated"', 'AES_CIPHER = "AES/GCM/NoPadding"', 'return "$AES_CIPHER:$baseAlias"',
+        'return "${getKeyStoreAlias(options)}:$suffix"', 'AES_KEY_SIZE_BITS = 256', 'NAME = "aes"', 'CIPHERTEXT_PROPERTY = "ct"', 'IV_PROPERTY = "iv"',
+        'GCM_AUTHENTICATION_TAG_LENGTH_PROPERTY = "tlen"', 'SCHEME_PROPERTY = "scheme"', 'USES_KEYSTORE_SUFFIX_PROPERTY = "usesKeystoreSuffix"',
+        'KEYSTORE_ALIAS_PROPERTY = "keystoreAlias"', 'REQUIRE_AUTHENTICATION_PROPERTY = "requireAuthentication"', 'MIN_GCM_AUTHENTICATION_TAG_LENGTH = 96']) {
+        assert(expoSource.includes(pin), `expo-secure-store still has ${pin}`);
+    }
+    for (const pin of ['getSharedPreferences("SecureStore", Context.MODE_PRIVATE)', 'SERVICE = "key_v1"', 'entry(key: String) = "$SERVICE-$key"',
+        'ALIAS = "$CIPHER:$SERVICE:keystoreUnauthenticated"', 'LEGACY_ALIAS = "$CIPHER:$SERVICE"', 'CIPHER = "AES/GCM/NoPadding"', '.setKeySize(256)',
+        '.put("ct", ', '.put("iv", ', '.put("tlen", spec.tLen)', '.put("scheme", "aes")', '.put("usesKeystoreSuffix", true)', '.put("keystoreAlias", SERVICE)',
+        '.put("requireAuthentication", false)', 'check(tagBits >= 96)', 'Regex("^[\\\\w.-]+$")']) {
+        assert(secretStore.includes(pin), `SecretStore has RN's ${pin}`);
+    }
+}
 assert.match(coreHost, /setProperty\("log", guarded \{ args -> runCatching \{/);
 assert.match(coreHost, /try \{ work\(args\) \} catch \(error: Throwable\) \{ NATIVE_ERROR \+/);
 // Fault hooks exist only behind BuildConfig.DEBUG.
@@ -618,8 +933,14 @@ const kotlinPalette = (name) => hexes(new RegExp(`${name} palette\\(([^)]*)\\)`)
 const FIELDS = ['bg', 'cardBg', 'taskItemBg', 'text', 'secondaryText', 'icon', 'border', 'tint', 'onTint', 'tabIconDefault',
     'tabIconSelected', 'inputBg', 'danger', 'success', 'warning', 'filterBg'];
 assert.match(themeKt, new RegExp(`data class ThemeColors\\(\\s*${FIELDS.map((field) => `val ${field}: Color,`).join('\\s*')}\\s*\\)`), 'ThemeColors has RN\'s fields in order');
-const presetSource = readFileSync(resolve(mobile, 'constants/theme-presets.ts'), 'utf8');
-for (const [, preset, body] of presetSource.matchAll(/^ {4}'?([\w-]+)'?: \{\n([\s\S]*?)\n {4}\},/gm)) {
+// RN's constants/theme-presets.ts re-exports core's table.
+const presetSource = readFileSync(resolve(app, '../../packages/core/src/theme-presets.ts'), 'utf8');
+const presetBlocks = [...presetSource.matchAll(/^ {4}'?([\w-]+)'?: \{\n([\s\S]*?)\n {4}\},/gm)];
+// The table is Record<ThemeStatusPreset, …>: every name in that union must parse as a block.
+const statusPresetUnion = /export type ThemeStatusPreset = ([^;]+);/.exec(readFileSync(resolve(app, '../../packages/core/src/theme-scheme.ts'), 'utf8'))[1];
+assert.deepEqual(presetBlocks.map(([, preset]) => preset).sort(), [...statusPresetUnion.matchAll(/'([\w-]+)'/g)].map(([, preset]) => preset).sort(),
+    'every bespoke theme preset is read');
+for (const [, preset, body] of presetBlocks) {
     const values = Object.fromEntries([...body.matchAll(/(\w+): '(#[0-9A-Fa-f]{6})'/g)].map(([, field, hex]) => [field, hex.toUpperCase()]));
     assert.deepEqual(kotlinPalette(`"${preset}" to`), FIELDS.map((field) => values[field]), `preset ${preset} matches RN`);
 }
@@ -835,7 +1156,7 @@ for (const [kind, fn] of [['capture', 'sendCapture'], ['captureLines', 'sendLine
     assert.match(model, new RegExp(`keepCapture\\(current\\.copy\\(pending = action[^)]*\\)\\)\\s+${fn}\\(action\\)`), `${kind}: the request is persisted before the call`);
 }
 assert.match(model, /FailedAction\("capture", current\.captureId, current\.text, patch = mapOf\("options" to current\.options\.toString\(\), "openAfterSave" to "\$openAfterSave"\)\)/);
-assert.match(model, /FailedAction\("captureLines", current\.lineIds\.first\(\), current\.text,\s*patch = mapOf\("options" to current\.options\.toString\(\), "captureIds" to current\.lineIds\.joinToString\(","\)\)\)/);
+assert.match(model, /FailedAction\("captureLines", current\.lineIds\.first\(\), current\.linesText \?: current\.text,\s*patch = mapOf\("options" to current\.options\.toString\(\), "captureIds" to current\.lineIds\.joinToString\(","\)\)\)/);
 assert.match(model, /failedAction = action\s+when \(action\.kind\) \{ "capture" -> sendCapture\(action\); "captureLines" -> sendLines\(action\); else -> sendPicker\(action\) \}/,
     'after process death an uncertain capture is sent again with the same IDs');
 assert.match(model, /if \(action\.kind in CAPTURE_KINDS\) storedCapture\?\.let \{ keepCapture\(it\.copy\(pending = action\)\) \}/, 'a new screen reopens the popup on an owed capture, never re-sends it');
@@ -877,8 +1198,8 @@ assert.match(coreHost, /fun menuRead\(name: String, json: String\): JSONObject =
 assert.match(coreHost, /fun menuCommand\(name: String, json: String\): JSONObject = callAsync\("menuCommand", name, json\)/);
 {
     // Settings' commands (pass 10) join the Menu tab's: MENU_KINDS is its own set plus SettingsModel.kt's SETTINGS_KINDS.
-    // Pass 11's commands (Bulk organize's create, Mind Sweep's Add, a saved search's Delete, a Focus checklist edit) close the set.
-    assert.match(menuModel, /"focusChecklistEdit"\) \+ SETTINGS_KINDS/);
+    // Pass 11's commands (Bulk organize's create, Mind Sweep's Add, a saved search's Delete) close the set.
+    assert.match(menuModel, /"savedSearchDelete"\) \+ SETTINGS_KINDS/);
     const kinds = [...[...new RegExp('val MENU_KINDS = setOf\\(([^)]*)\\)').exec(menuModel)[1].matchAll(/"(\w+)"/g)].map(([, kind]) => kind),
         ...[...new RegExp('val SETTINGS_KINDS = setOf\\(([^)]*)\\)').exec(source('SettingsModel.kt'))[1].matchAll(/"(\w+)"/g)].map(([, kind]) => kind)];
     const hostKinds = [...hostEntry.slice(hostEntry.indexOf('const MENU_COMMANDS'), hostEntry.indexOf('};', hostEntry.indexOf('const MENU_COMMANDS'))).matchAll(/^\s+(\w+): \(input\) => contract\.\w+\(input\),$/gm)].map(([, kind]) => kind);
@@ -1011,7 +1332,7 @@ assert.match(reviewUi, /"delete" -> confirm\(bulk\.getJSONObject\("deleteConfirm
 assert.match(rowUi, /\.clickable\(enabled = enabled, role = Role\.Button\) \{ if \(!menu\.rowStatus\(task, status\)\) changeStatus\(task, status\) \}/);
 assert.match(menuModel, /private val ROW_KINDS = mapOf\("contexts" to "contextsAction", "review" to "reviewAction", "weekly" to "reviewAction", "daily" to "reviewAction"\)/);
 // The Weekly Review's project Add task creates a task: its exact request (the request UUID core makes the task's id) is on disk first.
-assert.match(menuModel, /private val CREATES = setOf\("somedayTask", "somedaySection", "reviewTask", "calendarCreate", "boardCreate", "focusSave", "manageEditor", "bulkCreate", "mindSweepAdd",\s+"focusChecklistEdit"\)/);
+assert.match(menuModel, /private val CREATES = setOf\("somedayTask", "somedaySection", "reviewTask", "calendarCreate", "boardCreate", "focusSave", "manageEditor", "bulkCreate", "mindSweepAdd"\)/);
 assert.match(menuModel, /"projectTask" -> FailedAction\("reviewTask", open\.getString\("requestId"\), addProjectTask\(open\.getString\("projectId"\), open\.optString\("text"\)\)\.toString\(\)\)/);
 assert.equal(code(weeklyUi).match(/saveCreate\(\)/g).length, 3, 'Return, Save & edit and Add all send the one persisted request');
 // A review's place is core's checkpoint, stored under core's key (RN's session keys) and sent back; Finish deletes it.
@@ -1404,45 +1725,127 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     assert(code(taskViewUi).match(/\.clearAndSetSemantics \{/g).length >= 6);
 }
 
-// Pass 11: Mind Sweep, a saved search's screen and the Focus checklist page on core's new contracts; the Focus filter pickers' search;
+// App lock: RN's MobileAppLockGate and General's switch on core's General row for it (`settings.security.mobileAppLockEnabled`,
+// per device), with RN's device lock prompt and lock screen.
+{
+    const lockKt = source('AppLock.kt');
+    const settingsUi = source('SettingsScreen.kt');
+    const settingsModel = source('SettingsModel.kt');
+    const manifest = readFileSync(resolve(app, 'android/app/src/main/AndroidManifest.xml'), 'utf8');
+    // The gate reads core's row through its own host call, which no failed save blocks: a lock turned on whose save is owed still locks.
+    assert.match(hostEntry, /appLock\(\): string \{\s*return submit\(async \(\) => unwrap\(contract\.getGeneralSettings\(\{\}\)\)\.privacy\.appLock\);/);
+    assert.doesNotMatch(hostEntry.slice(hostEntry.indexOf('appLock(): string {'), hostEntry.indexOf('    projects(): string {')), /requireSaved/);
+    assert.match(coreHost, /fun appLock\(\): JSONObject = callAsync\("appLock"\)/);
+    // At boot, before any screen reads data (the owed-retry restore included), the app opens locked while core says on.
+    assert.match(model, /applyDeviceChoices\(runtime, prefs\)\s+\/\/[^\n]*\n\s+lock\.boot\(runtime\)\s+ProcessCoreHost\.failure\?\.let/);
+    assert.match(lockKt, /val on = runtime\.appLock\(\)\.getBoolean\("value"\)\s+shell\.ui \{ enabled = on; locked = on \}/);
+    // The gate wraps every screen inside the one theme; while locked the lock screen replaces them (RN's gate renders it instead of
+    // its children), and the screens' saved state waits for the unlock.
+    assert.match(activity, /MindwtrTheme\(if \(model\.loading\) null else ThemeChoice\.current\) \{ AppLockGate\(model\) \{ with\(model\) \{/);
+    assert.match(lockKt, /if \(model\.lock\.locked && !model\.loading\) AppLockScreen\(model\) else screens\.SaveableStateProvider\("app", content\)/);
+    // RN locks when AppState leaves active (Android's onPause), not for a rotation, not while its own prompt is up; each lock
+    // prompts by itself once, 250 ms after the app is active.
+    assert.match(lockKt, /if \(event == Lifecycle\.Event\.ON_PAUSE\) model\.lock\.paused\(activity\?\.isChangingConfigurations == true\)/);
+    assert.match(lockKt, /if \(!enabled \|\| authenticating \|\| rotating\) return\s+locked = true\s+failure = null\s+locks \+= 1/);
+    assert.match(lockKt, /fun shouldPrompt\(resumed: Boolean\) = enabled && locked && !authenticating && resumed && prompted != locks/);
+    assert.match(lockKt, /private const val PROMPT_DELAY_MS = 250L/);
+    // The device lock as expo-local-authentication asks it (correction pass, finding 4): AndroidX BiometricPrompt at Expo's version on
+    // a FragmentActivity, weak biometrics or the device credential, confirmation required, no cancel button (Android refuses one
+    // beside the credential); no secure screen lock, or no Activity, is "unavailable".
+    const gradle = readFileSync(resolve(app, 'android/app/build.gradle.kts'), 'utf8');
+    assert.match(gradle, /implementation\("androidx\.biometric:biometric:1\.2\.0-alpha04"\)/, 'expo-local-authentication\'s androidx.biometric');
+    assert.match(gradle, /implementation\("androidx\.fragment:fragment:1\.8\.\d+"\)/, 'a fragment that knows activity 1.10\'s result registry');
+    assert.match(activity, /class MainActivity : FragmentActivity\(\) \{/);
+    assert.match(lockKt, /^import androidx\.biometric\.BiometricPrompt$/m);
+    assert.doesNotMatch(lockKt, /android\.hardware\.biometrics/, 'no platform prompt beside AndroidX\'s');
+    assert.match(lockKt, /prompt\(title, Authenticators\.BIOMETRIC_WEAK or Authenticators\.DEVICE_CREDENTIAL\)/);
+    assert.match(lockKt, /val activity = host\?\.get\(\) \?: return answered\("unavailable"\)\s+try \{\s+if \(!activity\.getSystemService\(KeyguardManager::class\.java\)\.isDeviceSecure\) return answered\("unavailable"\)\s+if \(activity\.supportFragmentManager\.isStateSaved\) return answered\("cancelled"\)/);
+    assert.match(lockKt, /BiometricPrompt\.PromptInfo\.Builder\(\)\.setTitle\(title\)\.setAllowedAuthenticators\(authenticators\)\.setConfirmationRequired\(true\)\.build\(\)/);
+    assert.match(lockKt, /BiometricPrompt\(activity, ContextCompat\.getMainExecutor\(activity\), object : BiometricPrompt\.AuthenticationCallback\(\) \{\s+override fun onAuthenticationSucceeded\(result: BiometricPrompt\.AuthenticationResult\) = answered\(null\)\s+override fun onAuthenticationError\(code: Int, message: CharSequence\) = failed\(title, code\)/);
+    // The Activity on screen is the gate's, weakly held and let go with its composition.
+    assert.match(lockKt, /main\?\.let\(model\.lock::attach\)[\s\S]{0,400}?onDispose \{\s+owner\.lifecycle\.removeObserver\(observer\)\s+main\?\.let\(model\.lock::detach\)/);
+    assert.match(lockKt, /private var host: WeakReference<MainActivity>\? = null/);
+    // Expo's bounded fallback (finding 3): a biometric that cannot be used, on a secure device, asks once for the credential alone:
+    // Android's credential screen before Android 11 (MainActivity.credential answers), a credential-only prompt from 11.
+    assert.match(lockKt, /private val BIOMETRIC_UNUSABLE = setOf\(BiometricPrompt\.ERROR_HW_NOT_PRESENT, BiometricPrompt\.ERROR_HW_UNAVAILABLE, BiometricPrompt\.ERROR_NO_BIOMETRICS,\s+BiometricPrompt\.ERROR_UNABLE_TO_PROCESS, BiometricPrompt\.ERROR_NO_SPACE\)/);
+    assert.match(lockKt, /if \(code !in BIOMETRIC_UNUSABLE \|\| fallback\) return answered\(reason\(code\)\)[\s\S]{0,300}?if \(!keyguard\.isDeviceSecure\) return answered\(reason\(code\)\)\s+fallback = true\s+if \(Build\.VERSION\.SDK_INT < Build\.VERSION_CODES\.R\) activity\.credential\.launch\(keyguard\.createConfirmDeviceCredentialIntent\(title, null\)\)\s+else prompt\(title, Authenticators\.DEVICE_CREDENTIAL\)/);
+    assert.match(lockKt, /internal fun answered\(reason: String\?\) \{\s+authenticating = false\s+fallback = false/);
+    assert.match(activity, /internal val credential = registerForActivityResult\(ActivityResultContracts\.StartActivityForResult\(\)\) \{\s+model\.lock\.answered\(if \(it\.resultCode == RESULT_OK\) null else "cancelled"\)/);
+    assert.match(lockKt, /BiometricPrompt\.ERROR_CANCELED, BiometricPrompt\.ERROR_NEGATIVE_BUTTON, BiometricPrompt\.ERROR_USER_CANCELED -> "cancelled"/);
+    assert.doesNotMatch(code(lockKt), /setNegativeButton|mobileAppLockEnabled|menuCommand\(/, 'no cancel button, and Kotlin never writes the setting itself');
+    assert.match(manifest, /<uses-permission android:name="android\.permission\.USE_BIOMETRIC" \/>/);
+    // Recents keep no picture while App lock is on (finding 2, stronger than RN by ruling): recents screenshots off from Android 13,
+    // FLAG_SECURE before, following core's value on every Activity.
+    assert.match(lockKt, /if \(Build\.VERSION\.SDK_INT >= Build\.VERSION_CODES\.TIRAMISU\) activity\.setRecentsScreenshotEnabled\(!on\)\s+else if \(on\) activity\.window\.addFlags\(WindowManager\.LayoutParams\.FLAG_SECURE\)\s+else activity\.window\.clearFlags\(WindowManager\.LayoutParams\.FLAG_SECURE\)/);
+    assert.match(lockKt, /val on = model\.lock\.enabled\s+LaunchedEffect\(activity, on\) \{ activity\?\.let \{ protectRecents\(it, on\) \} \}/);
+    // A lock turned on whose save failed (finding 1): core applied it in memory, so the gate follows core's value at once while the
+    // exact retry stays owed (the failure is rethrown to perform, which keeps it).
+    assert.match(menuModel, /if \(!refused && action\.kind == "generalSetting"\) settings\.unsettled\(runtime, action\)\s+throw failure/);
+    assert.match(settingsModel, /internal fun unsettled\(runtime: CoreHost, action: FailedAction\) \{\s+if \(JSONObject\(action\.title\)\.getJSONObject\("edit"\)\.getString\("type"\) != "appLock"\) return\s+runCatching \{ runtime\.appLock\(\)\.getBoolean\("value"\) \}\.onSuccess \{ on -> shell\.ui \{ shell\.lock\.stored\(on\) \} \}/);
+    // The lock screen stays centered and scrolls when large text does not fit a short landscape window (finding 5).
+    assert.match(lockKt, /BoxWithConstraints\(Modifier\.fillMaxSize\(\)[^\n]*\.testTag\("app-lock"\)\) \{\s+Column\(Modifier\.fillMaxWidth\(\)\.verticalScroll\(rememberScrollState\(\)\)\.heightIn\(min = maxHeight\)/);
+    // A failed prompt's line is RN's (getMobileAppLockErrorKey) in core's words.
+    for (const reason of ['unavailable', 'cancelled', 'failed']) assert.match(lockKt, new RegExp(`"${reason}" -> t\\("appLock\\.${reason}"\\)`));
+    // General's switch: off sends core's edit at once; on only after the device lock's yes; a no shows core's errors[reason] under the row.
+    assert.match(lockKt, /if \(!edit\.getBoolean\("value"\)\) return settings\.general\(edit\)\s+ask\(row\.getJSONObject\("enablePrompt"\)\.getString\("promptMessage"\)\) \{ reason ->\s+if \(reason == null\) shell\.menu\.whenIdle \{ settings\.general\(edit\) \} else settings\.editLocal \{ put\(SWITCH_FAILURE, reason\) \}/);
+    assert.match(lockKt, /row\.getJSONObject\("errors"\)\.getString\(it\)/);
+    assert.match(settingsUi, /RnSwitch\(lock\.getBoolean\("value"\), model\.failedAction == null && !model\.lock\.authenticating, lock\.getString\("label"\)\) \{ model\.lock\.toggle\(lock\) \}/);
+    assert.match(settingsModel, /"appLock" -> shell\.lock\.stored\(input\.getJSONObject\("edit"\)\.getBoolean\("value"\)\)/);
+    // The phone check (findings 6 and 7): each database change happens with the app's process gone, from an untouched pulled copy,
+    // staged and size-checked beside the database, the old WAL and SHM removed, then renamed over it; the restore proves core's value,
+    // goes back to the tabs, and a failed restore exits 1.
+    const lockCheck = readFileSync(resolve(app, 'scripts/check-app-lock-device.mjs'), 'utf8');
+    assert.match(lockCheck, /sh\(`am force-stop \$\{PKG\}`\);\s+await waitFor\('the app process to end', \(\) => pid\(\) === '', 10_000\);\s+changes \+= 1;\s+const original = pullDatabase\(`original-\$\{changes\}`\);/);
+    assert.match(lockCheck, /const staged = Number\(runAs\(`stat -c %s \$\{next\}`\)\);\s+if \(staged !== statSync\(db\)\.size\) fail\([^\n]*\n\s+if \(pid\(\) !== ''\) fail\([^\n]*\n\s+runAs\(`rm -f files\/\$\{DB\}-wal files\/\$\{DB\}-shm`\);\s+runAs\(`mv -f \$\{next\} files\/\$\{DB\}`\);/);
+    assert.doesNotMatch(lockCheck, /runAs\(`cp \$\{STAGED\} files\/\$\{DB\}`\)/, 'never copy over the live database in place');
+    assert.match(lockCheck, /const now = core\('read'\)\.stored === true;\s+if \(now !== original\) fail\(/);
+    assert.match(lockCheck, /await toInbox\(\);[\s\S]{0,200}?RESTORE FAILED[^\n]*\n\s+process\.exitCode = 1;/);
+    // No Kotlin policy, dates, colors or literal text; every key a label key; one semantics block per control.
+    assert.doesNotMatch(code(lockKt), /\.(sort\w*|sorted\w*|filter(?!Bg\b)\w*|groupBy)\b|SimpleDateFormat|java\.time|\bColor\(|"#[0-9A-Fa-f]{3,8}"/);
+    for (const [, key] of code(lockKt).matchAll(/"([a-z][A-Za-z]*(?:\.[A-Za-z]+)+)"/g)) assert(labelKeys.includes(key), `AppLock.kt: ${key} is not in LABEL_KEYS`);
+    for (const [, rest] of code(lockKt).matchAll(/(?:\bText\(|contentDescription = |onClickLabel = )([^\n]*)/g)) {
+        for (const [, literal] of rest.replace(/\b(t|testTag|getString|optString|text|getJSONObject|optJSONObject|getBoolean|optBoolean|getInt|menuText|menuObjects)\("[^"]*"\)/g, '').replace(/\btestTag = "[^"]*"/g, '').matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+            if (labelKeys.includes(literal)) continue;
+            assert.doesNotMatch(literal.replace(/\$\{[^}]*\}|\$\w+/g, ''), /\p{L}/u, `AppLock.kt: hard-coded UI text "${literal}"`);
+        }
+    }
+    assert.match(lockKt, /\.testTag\("app-lock-unlock"\)\s+\.clearAndSetSemantics \{ contentDescription = label; role = Role\.Button; if \(enabled\) onClick \{ lock\.unlock\(\); true \} else disabled\(\) \}/);
+}
+
+// Pass 11: Mind Sweep and a saved search's screen on core's new contracts; the Focus filter pickers' search;
 // Bulk organize's project and area pickers that create one.
 {
     const sweepKt = source('MindSweep.kt');
-    const checklistKt = source('FocusChecklist.kt');
-    const pass11 = { sweepKt, checklistKt, savedSearchUi };
+    const pass11 = { sweepKt, savedSearchUi };
     // Reads pass Kotlin's input to core unchanged; writes are core's commands, each logged as its operation.
-    for (const [name, method] of [['mindSweep', 'getMindSweep'], ['savedSearch', 'getSavedSearchView'], ['focusChecklist', 'getFocusChecklist']]) {
+    for (const [name, method] of [['mindSweep', 'getMindSweep'], ['savedSearch', 'getSavedSearchView']]) {
         assert.match(hostEntry, new RegExp(`^\\s+${name}: \\(input\\) => contract\\.${method}\\(input\\),$`, 'm'), `menuRead ${name} is core's ${method}`);
     }
-    for (const [name, method] of [['bulkCreate', 'createBulkOrganizeDestination'], ['mindSweepAdd', 'addMindSweepItem'], ['savedSearchDelete', 'deleteSavedSearch'],
-        ['focusChecklistEdit', 'editFocusChecklist']]) {
+    for (const [name, method] of [['bulkCreate', 'createBulkOrganizeDestination'], ['mindSweepAdd', 'addMindSweepItem'], ['savedSearchDelete', 'deleteSavedSearch']]) {
         assert.match(hostEntry, new RegExp(`^\\s+${name}: \\(input\\) => contract\\.${method}\\(input\\),$`, 'm'), `menuCommand ${name} is core's ${method}`);
     }
     // Every write is MenuModel's send -> perform(action) with its exact FailedAction: core's whole input with the request UUID. The two
     // creates (a Mind Sweep capture, Bulk organize's project or area) are on disk before the call and sent again first after process death.
-    assert.match(menuModel, /"bulkCreate", "mindSweepAdd", "savedSearchDelete", "focusChecklistEdit" -> JSONObject\(action\.title\)\.put\("requestId", action\.id\)/);
+    assert.match(menuModel, /"bulkCreate", "mindSweepAdd", "savedSearchDelete" -> JSONObject\(action\.title\)\.put\("requestId", action\.id\)/);
     assert.match(sweepKt, /menu\.create\(addAction\(group\.getString\("id"\)\)\)/, 'a Mind Sweep Add is a create: on disk first');
     assert.match(menuModel, /create\(FailedAction\("bulkCreate", UUID\.randomUUID\(\)\.toString\(\), JSONObject\(\)\.put\("list", list\)\.put\("kind", kind\)\.put\("name", name\)/, 'Bulk organize\'s create is a create: on disk first');
     assert.match(menuModel, /shell\.failedAction\?\.takeIf \{ it\.kind == "bulkCreate" \}\?\.let \{ return retry\(it\) \}/, 'an owed create is sent again exactly');
     for (const [name, text] of Object.entries(pass11)) {
-        assert.doesNotMatch(code(text), /menuCommand\(|\bsend\(|shell\.perform\(action|FailedAction\((?!"mindSweepAdd"|"focusChecklistEdit")/, `${name}: writes only through MenuModel.command, act or create`);
+        assert.doesNotMatch(code(text), /menuCommand\(|\bsend\(|shell\.perform\(action|FailedAction\((?!"mindSweepAdd")/, `${name}: writes only through MenuModel.command, act or create`);
     }
-    // A write core refused, or whose write did not land (ACTION_FAILED, as core's contracts say for these three), owes nothing: Mind Sweep's
-    // failure line, the checklist's toast and core's list, or the picker's line show instead of the failure message.
-    assert.match(menuModel, /private val LANDLESS = setOf\("mindSweepAdd", "focusChecklistEdit", "bulkCreate"\)/);
+    // A write core refused, or whose write did not land (ACTION_FAILED, as core's contracts say for these two), owes nothing: Mind Sweep's
+    // failure line or the picker's line shows instead of the failure message.
+    assert.match(menuModel, /private val LANDLESS = setOf\("mindSweepAdd", "bulkCreate"\)/);
     assert.match(menuModel, /\|\| \(action\.kind in LANDLESS && failure\.message\?\.startsWith\("ACTION_FAILED"\) == true\)/);
-    assert.match(menuModel, /if \(refused && action\.kind in LANDLESS\) \{\s+shell\.acknowledged\(action\)\s+shell\.ui \{ landless\(action, failure\) \}\s+return@perform/);
+    assert.match(menuModel, /if \(refused && action\.kind in LANDLESS\) \{\s+shell\.acknowledged\(action\)\s+shell\.ui \{ landless\(action\) \}\s+return@perform/);
     // Navigation: the Inbox's Mind Sweep (its pill and its empty-Inbox button) and the Weekly Review's open it; the More sheet's saved
-    // searches open their screen; Mind Sweep and the checklist page go back to the screen they opened over; the checklist page opens
-    // only from its route (RN's editor never calls onFocusMode), which a debug build takes from a launch extra.
+    // searches open their screen; Mind Sweep goes back to the screen it opened over.
     assert.equal(code(inboxUi).match(/openMindSweep\(\)/g).length, 2);
     assert.equal(code(weeklyUi).match(/openMindSweep\(\)/g).length, 2);
     assert.match(menuModel, /private fun isSavedSearch\(id: String\) = more\?\.collection\("savedSearches"\)\?\.any \{ it\.getString\("id"\) == id && it\.getString\("route"\)\.startsWith\("\/saved-search\/"\) \} == true/);
     assert.match(menuModel, /else -> if \(isSavedSearch\(id\)\) openSavedSearch\(id\)/);
     assert.match(menuModel, /leave\(if \(flow \|\| over\) MenuScreen\.entries\.firstOrNull \{ it\.name == saved\.get<String>\(if \(over\) "screenFrom" else "reviewFrom"\) \} else null\)/);
-    assert.match(activity, /if \(BuildConfig\.DEBUG && savedInstanceState == null\) intent\.getStringExtra\(FOCUS_CHECKLIST_EXTRA\)\?\.let\(model\.menu::openFocusChecklist\)/);
-    assert.equal(code(kotlinFiles.concat([sweepKt, checklistKt]).join('\n')).match(/openFocusChecklist\(|::openFocusChecklist/g).length, 2, 'the checklist page opens only from its route');
-    assert.match(menuUi, /MenuScreen\.MindSweep -> MindSweepScreen\(model\)\s+MenuScreen\.FocusChecklist -> FocusChecklistPage\(model\)/);
+    assert.match(menuUi, /MenuScreen\.MindSweep -> MindSweepScreen\(model\)/);
     assert.match(menuUi, /"savedSearch" -> SavedSearchList\(model\)/);
     // Mind Sweep: RN's React state in a synced file while the screen is open (the Bundle names the screen), so rotation and process death
     // keep it; the controls carry core's scope and steps; Add waits for core's view of the text as typed; an answer counts once, for its sweep.
@@ -1458,48 +1861,20 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
     assert.match(savedSearchUi, /confirm\(delete\.getJSONObject\("confirm"\), JSONObject\(\)\.put\("id", view\.getString\("id"\)\), "savedSearchDelete"\)/);
     assert.match(menuModel, /"savedSearchDelete" -> if \(screen == MenuScreen\.SavedSearch && own\("savedSearch"\)\.optString\("id"\) == JSONObject\(action\.title\)\.getString\("id"\)\) closeScreen\(\)/);
     assert.match(savedSearchUi, /TaskRowItem\(model, it, status = RowStatus\.Badge\)/, 'rows keep the lists\' own commands and editor');
-    // The Focus checklist page: every edit is core's (the item's toggle and remove, a rename with the typed text, an add with a new item
-    // UUID), named by the item's id and placed right before it is sent, with the task revision core gave last; a refusal reads core's list.
-    assert.match(checklistKt, /val action = FailedAction\("focusChecklistEdit", UUID\.randomUUID\(\)\.toString\(\),\s+JSONObject\(\)\.put\("id", task\)\.put\("taskRevision", made\.getString\("revision"\)\)\.put\("edit", edit\)\.toString\(\)\)/);
-    assert.match(checklistKt, /made\.getJSONArray\("order"\)\.ids\(\)\.indexOf\(next\.getString\("itemId"\)\)\.takeIf \{ it >= 0 \}\?\.let \{ JSONObject\(next\.toString\(\)\)\.put\("index", it\) \}/);
-    assert.equal(code(checklistKt).match(/put\("index"/g).length, 1, 'a position is set in one place, right before the send');
-    assert.match(checklistKt, /known\.put\(task, JSONObject\(\)\.put\("revision", reply\.getString\("taskRevision"\)\)/);
-    assert.match(checklistKt, /item\.getJSONObject\("edits"\)\.getJSONObject\("toggle"\)/);
-    assert.match(checklistKt, /enqueue\(item\.getJSONObject\("edits"\)\.getJSONObject\("remove"\)\)/);
-    assert.deepEqual([...code(checklistKt).matchAll(/put\("kind", "(\w+)"\)/g)].map(([, kind]) => kind).sort(), ['add', 'rename', 'toggle'], 'only core\'s edit kinds');
-    assert.match(checklistKt, /if \(message\.startsWith\("ACTION_FAILED"\)\) page\?\.getJSONObject\("error"\)/);
-    // Correction pass 1 (review finding 1): a checklist edit has every native write's durability. The queue (each edit with its task),
-    // the request UUID with core and the revisions are in a synced file, written before the request goes; the request itself is on
-    // disk first (MenuModel's create path, so after process death it is sent again first with its original revision, and a failed
-    // save keeps its exact retry); the queue is read back at boot and goes on once that request is settled.
-    assert.match(checklistKt, /FileOutputStream\(partial\)\.use \{ out -> out\.write\(state\.toString\(\)\.toByteArray\(\)\); out\.fd\.sync\(\) \}\s+check\(partial\.renameTo\(file\)\)/);
-    assert.match(checklistKt, /sending = true\s+sent = action\.id\s+keep\(\)\s+menu\.create\(action\)/, 'the queue and the request UUID are on disk before the request goes');
-    assert.match(checklistKt, /queue = stored\.menuObjects\("queue"\)\s+sent = stored\.menuText\("sent"\)\s+known = stored\.getJSONObject\("known"\)/);
-    assert.match(menuModel, /val focusChecklist = FocusChecklistModel\(this, saved, File\(dir, "focus-checklist"\)\)/);
-    assert.match(menuModel, /refresh\(\)\s+\/\/[^\n]*\s+focusChecklist\.resume\(\)\s+\}/, 'after boot the waiting edits go on, after a request left on disk');
-    assert.equal(code(checklistKt).match(/if \(action\.id != sent\) return/g).length, 2, 'an answer counts only for the exact request with core');
-    assert.equal(code(checklistKt).match(/(?<!fun )\bkeep\(\)/g).length, 8, 'every change of the queue is on disk');
-    // Correction pass 1 (finding 2): the queue belongs to the task, not the page: an answer moves it on whether the page is open or not,
-    // a page read gives any task's revision, and a waiting edit for a task not read yet reads that task first.
-    assert.match(checklistKt, /keep\(\)\s+pump\(\)\s+if \(menu\.list == "focusChecklist" && task == taskId\) reload\(\)/);
-    assert.match(checklistKt, /val made = known\.optJSONObject\(task\) \?: return reload\(task\)/);
-    assert.doesNotMatch(code(checklistKt.slice(checklistKt.indexOf('private fun pump()'), checklistKt.indexOf('fun done('))), /menu\.list/, 'the next edit goes whatever page is open');
-    assert.match(checklistKt, /if \(menu\.list == "focusChecklist" && id == taskId\) \{\s+shell\.readSucceeded\(\)\s+page = next/);
     // Correction pass 1 (finding 3): a later window that went stale drops the partial view and reads the whole view again from
-    // offset 0, a bounded number of times (then core's failure shows), on the checklist page and in Mind Sweep.
-    assert.match(checklistKt, /internal fun <T> wholeView\(read: \(\) -> T\): T \{\s+repeat\(STALE_READS - 1\) \{\s+try \{\s+return read\(\)\s+\} catch \(failure: Exception\) \{\s+if \(failure\.message\?\.startsWith\("STALE_REVISION"\) != true\) throw failure\s+\}\s+\}\s+return read\(\)/);
-    assert.match(checklistKt, /private const val STALE_READS = 3/);
-    assert.match(checklistKt, /private fun read\(runtime: CoreHost, id: String\): JSONObject = wholeView \{/);
+    // offset 0, a bounded number of times (then core's failure shows), in Mind Sweep.
+    assert.match(sweepKt, /private fun <T> wholeView\(read: \(\) -> T\): T \{\s+repeat\(STALE_READS - 1\) \{\s+try \{\s+return read\(\)\s+\} catch \(failure: Exception\) \{\s+if \(failure\.message\?\.startsWith\("STALE_REVISION"\) != true\) throw failure\s+\}\s+\}\s+return read\(\)/);
+    assert.match(sweepKt, /private const val STALE_READS = 3/);
     assert.match(sweepKt, /private fun read\(runtime: CoreHost, sent: JSONObject\): JSONObject = wholeView \{/);
-    assert.equal(code(checklistKt + sweepKt).match(/startsWith\("STALE_REVISION"\)/g).length, 1, 'no reader keeps a partial view: only wholeView catches a stale window');
+    assert.equal(code(sweepKt).match(/startsWith\("STALE_REVISION"\)/g).length, 1, 'no reader keeps a partial view: only wholeView catches a stale window');
     // Correction pass 1 (finding 4): the device check settles an injected failure it left owed (the exact request, through the app's
     // Try again), waits until the retry lock and the request on disk are gone, and fails loudly when it cannot.
     const sweepCheck = readFileSync(resolve(app, 'scripts/check-sweep-saved-device.mjs'), 'utf8');
     assert.match(sweepCheck, /const restore = async \(\) => \{\s+for \(const name of PROPS\) \{ try \{ setProp\(name, ''\); \} catch \{ \/\* device gone \*\/ \} \}\s+await settleOwed\(\);/);
     assert.match(sweepCheck, /if \(!retry && !pendingOnDisk\(\)\) \{/);
     assert.match(sweepCheck, /RESTORE FAILED: \$\{owed\} is still owed[^\n]*\n\s+process\.exitCode = 1;/);
-    assert.equal(sweepCheck.match(/owed = '/g).length, 2, 'each injected failure is named while its retry is owed');
-    assert.equal(sweepCheck.match(/(?<!let )owed = null;/g).length, 3, 'and cleared once settled');
+    assert.equal(sweepCheck.match(/owed = '/g).length, 1, 'the injected failure is named while its retry is owed');
+    assert.equal(sweepCheck.match(/(?<!let )owed = null;/g).length, 2, 'and cleared once settled');
     // Focus's filter pickers search as the Inbox's: core's matches from offset zero at Focus's revision; a changed Focus is read again.
     assert.match(focusModelKt, /runtime\.menuRead\("focusList", JSONObject\(\)\.put\("controls", JSONObject\(sent\)\)\.put\("list", name\)\.put\("offset", items\.length\(\)\)\s+\.put\("limit", WINDOW\)\.put\("revision", revision\)\.put\("query", query\)\.toString\(\)\)/);
     assert.match(focusModelKt, /else if \(found == null\) shell\.refreshFocus\(\)/);
@@ -1529,8 +1904,136 @@ assert.match(model, /val sheet = runCatching \{ menu\.readSheet\(runtime\) \}\.g
         assert.doesNotMatch(code(text), /\.clickable\(enabled = [^\n]*\.semantics \{ contentDescription|\.semantics \{ contentDescription[^\n]*\}\s*\.clickable\(enabled/, `${name}: no control with a clickable and a separate semantics block`);
     }
     assert(code(sweepKt).match(/\.clearAndSetSemantics \{/g).length >= 3);
-    assert(code(checklistKt).match(/\.clearAndSetSemantics \{/g).length >= 4);
     assert(code(savedSearchUi).match(/\.clearAndSetSemantics \{/g).length >= 2);
+}
+
+// Pass B1 (entry points): RN's activity name as an alias with RN's link, share and assistant intents and RN's app shortcuts, the
+// development build's own scheme, and a router that opens what core's resolveNativeEntryPoint names; Import .txt in the popup.
+{
+    const entryKt = source('EntryPoints.kt');
+    const manifest = readFileSync(resolve(app, 'android/app/src/main/AndroidManifest.xml'), 'utf8');
+    const gradle = readFileSync(resolve(app, 'android/app/build.gradle.kts'), 'utf8');
+    // The alias is RN's component name (widgets, icons and pinned shortcuts launch it) and carries every public entry point; the
+    // activity itself (singleTask, as RN's) has no filter, and nothing runs in another process (one engine, one writer).
+    const alias = manifest.match(/<activity-alias\s[\s\S]*?<\/activity-alias>/g) ?? [];
+    assert.equal(alias.length, 1, 'one activity alias');
+    assert.match(alias[0], /android:name="\$\{applicationId\}\.MainActivity"/);
+    assert.match(alias[0], /android:targetActivity="\.MainActivity"/);
+    assert.match(alias[0], /android:exported="true"/);
+    const filters = alias[0].match(/<intent-filter>[\s\S]*?<\/intent-filter>/g);
+    const filter = (action) => filters.find((entry) => entry.includes(`android:name="${action}"`));
+    assert.match(filter('android.intent.action.MAIN'), /android\.intent\.category\.LAUNCHER/);
+    assert.match(filter('android.intent.action.VIEW'), /category\.DEFAULT[\s\S]*category\.BROWSABLE[\s\S]*<data android:scheme="\$\{urlScheme\}" \/>/);
+    assert.match(filter('android.intent.action.SEND'), /category\.DEFAULT[\s\S]*<data android:mimeType="text\/plain" \/>/);
+    assert.doesNotMatch(filter('android.intent.action.SEND'), /image|audio|video|application|SEND_MULTIPLE/, 'files wait for the attachments pass');
+    assert.match(filter('com.google.android.gms.actions.CREATE_NOTE'), /category\.DEFAULT[\s\S]*category\.VOICE[\s\S]*mimeType="text\/plain"[\s\S]*mimeType="\*\/\*"/);
+    assert.match(alias[0], /android:name="android\.app\.shortcuts"\s+android:resource="@xml\/mindwtr_shortcuts"/);
+    assert.equal(manifest.match(/category\.LAUNCHER/g).length, 1, 'one launcher entry: the alias');
+    const mainActivity = manifest.match(/<activity\s[^>]*android:name="\.MainActivity"[^>]*\/>/)?.[0] ?? assert.fail('MainActivity has no filter of its own');
+    assert.match(mainActivity, /android:launchMode="singleTask"/);
+    // The activity is not exported: only the alias, with its filters, can start it from another app or the shell, so the
+    // device checks launch the alias (RN's component name), never the class.
+    assert.match(mainActivity, /android:exported="false"/);
+    {
+        const { readdirSync } = await import('node:fs');
+        for (const name of readdirSync(resolve(app, 'scripts')).filter((file) => file.endsWith('.mjs'))) {
+            assert.doesNotMatch(readFileSync(resolve(app, 'scripts', name), 'utf8'), /\/tech\.dongdongbh\.mindwtr\.pilot\.MainActivity/, `${name} launches the unexported class`);
+        }
+    }
+    assert.doesNotMatch(manifest, /android:process=/);
+    // D6: each build type's scheme, and the scheme reaches the manifest, the shortcuts and BuildConfig from one map.
+    assert.match(gradle, /val urlSchemes = mapOf\("debug" to "mindwtr-native-dev", "upgradetest" to "mindwtr-upgradetest", "release" to "mindwtr"\)/);
+    assert.match(gradle, /buildConfigField\("String", "URL_SCHEME", "\\"\$scheme\\""\)\s+manifestPlaceholders\["urlScheme"\] = scheme/);
+    for (const type of ['debug', 'release']) assert.match(gradle, new RegExp(`getByName\\("${type}"\\) \\{ urlScheme\\(\\) \\}`));
+    assert.match(gradle, /create\("upgradetest"\) \{[^}]*urlScheme\(\)\s+\}/);
+    assert.match(gradle, /tasks\.named\("preBuild"\) \{ dependsOn\(buildCoreBundle, buildShortcuts\) \}/);
+    // RN's shortcuts from RN's own builder: the same ids, capabilities, labels and links, on the build's scheme; Add task opens
+    // the capture popup through RN's system capture link until the widget pass brings QuickCaptureActivity.
+    const { createRequire } = await import('node:module');
+    const rnShortcuts = createRequire(import.meta.url)('../../mobile/plugins/android-app-shortcuts.js').__testables;
+    const { buildShortcuts } = await import('./build-shortcuts.mjs');
+    const rnXml = rnShortcuts.buildShortcutsXml('tech.dongdongbh.mindwtr');
+    const ids = (xml) => [...xml.matchAll(/android:shortcutId="([^"]+)"/g)].map(([, id]) => id);
+    const capabilities = (xml) => [...xml.matchAll(/<capability android:name="([^"]+)"/g)].map(([, id]) => id);
+    for (const scheme of ['mindwtr-native-dev', 'mindwtr-upgradetest', 'mindwtr']) {
+        const { xml, strings } = buildShortcuts(scheme);
+        assert.deepEqual(ids(xml), ['capture', 'inbox', 'focus', 'waiting', 'someday', 'projects', 'review', 'calendar', 'add_task_inbox', 'open_focus', 'open_calendar']);
+        assert.deepEqual(ids(xml), ids(rnXml));
+        assert.deepEqual(capabilities(xml), capabilities(rnXml));
+        assert.equal(strings, rnShortcuts.SHORTCUTS_STRINGS_XML);
+        assert.equal(xml.replaceAll(`${scheme}:///`, 'mindwtr:///').replace(/android:data="mindwtr:\/\/\/capture-quick" \/>/,
+            'android:targetPackage="tech.dongdongbh.mindwtr"\n      android:targetClass="tech.dongdongbh.mindwtr.androidwidget.QuickCaptureActivity" />'), rnXml);
+        assert.doesNotMatch(xml, /QuickCaptureActivity|targetPackage/);
+    }
+    // Core's buildCreateNoteCapture mirrors RN's MainActivity (the name, else the Assistant's text, else EXTRA_TEXT; the note when
+    // it differs): if RN's rule changes, this fails, and core's mirror must change with it.
+    const startupTrace = readFileSync(resolve(app, '../mobile/plugins/android-startup-trace.js'), 'utf8');
+    assert.match(startupTrace, /val rawTitle = intent\.getStringExtra\("com\.google\.android\.gms\.actions\.extra\.NAME"\)\?\.trim\(\)\.orEmpty\(\)\s+val rawText = \(\s+intent\.getStringExtra\("com\.google\.android\.gms\.actions\.extra\.TEXT"\)\s+\?: intent\.getStringExtra\(Intent\.EXTRA_TEXT\)\s+\)\?\.trim\(\)\.orEmpty\(\)\s+val title = when \{\s+rawTitle\.isNotBlank\(\) -> rawTitle\s+rawText\.isNotBlank\(\) -> rawText\s+else -> return\s+\}/);
+    assert.match(startupTrace, /if \(rawText\.isNotBlank\(\) && rawText != title\) \{\s+builder\.appendQueryParameter\("note", rawText\)/);
+    // Kotlin reads the intent's data and text extras as strings only (no stream, no parcel), inside runCatching, and sends them to
+    // core unchanged with the build's scheme; the Assistant's extras are RN's.
+    const intentRead = code(entryKt.slice(entryKt.indexOf('fun Intent.entryInput()'), entryKt.indexOf('fun Context.readPickedText')));
+    assert.match(intentRead, /= runCatching \{/);
+    assert.match(intentRead, /Intent\.ACTION_VIEW -> dataString\?\.let \{ JSONObject\(\)\.put\("kind", "link"\)\.put\("url", it\)\.put\("scheme", BuildConfig\.URL_SCHEME\) \}/);
+    assert.match(intentRead, /Intent\.ACTION_SEND -> if \(type\?\.startsWith\("text\/plain"\) != true\) null else/);
+    assert.match(intentRead, /\.extra\("text", getStringExtra\(Intent\.EXTRA_TEXT\)\)\.extra\("title", getCharSequenceExtra\(Intent\.EXTRA_TITLE\)\?\.toString\(\)\)\s+\.extra\("subject", getStringExtra\(Intent\.EXTRA_SUBJECT\)\)/);
+    assert.match(intentRead, /\.extra\("text", getStringExtra\(NOTE_TEXT\)\)\.extra\("extraText", getStringExtra\(Intent\.EXTRA_TEXT\)\)/);
+    assert.match(entryKt, /private const val NOTE_NAME = "com\.google\.android\.gms\.actions\.extra\.NAME"\s+private const val NOTE_TEXT = "com\.google\.android\.gms\.actions\.extra\.TEXT"/);
+    assert.doesNotMatch(code(entryKt), /EXTRA_STREAM|getParcelable|getSerializable|getBundleExtra/);
+    // Entries wait in the persisted FIFO queue (EntryQueue.kt, JVM-tested) from the intent's arrival; the oldest opens only while
+    // the app is free, is read in one perform (a capture's popup view too), and opens once the action ends; the editor opens
+    // through whenIdle, as it refuses while busy.
+    const queueKt = source('EntryQueue.kt');
+    assert.match(entryKt, /private val queue = EntryQueue\(dir\)/);
+    assert.match(model, /val entries = EntryRouter\(this, File\(app\.noBackupFilesDir, "entries"\)\)/);
+    assert.doesNotMatch(code(entryKt), /saved\[|SavedStateHandle/, 'the queue lives on disk, not in the saved state');
+    assert.match(entryKt, /if \(!queue\.add\(input\.toString\(\)\)\)/);
+    // Any open unsaved work holds the entry back (the capture popup and its draft included): a share never replaces it.
+    assert.match(entryKt, /!writable \|\| busy \|\| failedAction != null \|\| editor != null \|\| processing\?\.hidden == false \|\| capture != null\s+\|\| menu\.dialog != null \|\| menu\.focusControls\.dialog != null \|\| menu\.calendar\.composer != null \|\| search\?\.saveName != null\s+\|\| menu\.screen == MenuScreen\.MindSweep/);
+    // Typed text not yet sent holds entries back too: the Add new project field while the Projects list shows it, and a
+    // Settings field before its commit (a GTD text field, a Someday section's inline rename).
+    assert.match(entryKt, /\|\| \(menu\.screen == MenuScreen\.Settings && menu\.settings\.uncommitted\)\s+\|\| \(projectDraft\.isNotBlank\(\) && openProjectId == null && \(menu\.screen == MenuScreen\.Projects\s+\|\| \(menu\.screen == null && screen == Screen\.Projects && menu\.quickView == "projects"\)\)\)/);
+    assert.match(source('SettingsModel.kt'), /val uncommitted: Boolean get\(\) = local\.has\("renaming"\) \|\| local\.keys\(\)\.asSequence\(\)\.any \{ it\.startsWith\("typed:"\) \}/);
+    assert.match(entryKt, /val reply = runtime\.menuRead\("entryPoint", entry\.input\)/);
+    assert.match(entryKt, /runtime\.openQuickCapture\(\)\s+runtime\.quickCaptureView\(JSONObject\(\)\.put\("text", open\.getString\("text"\)\)\.put\("options", open\.getJSONObject\("options"\)\)\.toString\(\)\)/);
+    // An entry leaves the queue only after it opened, or when core refused its input; a failed read keeps it for a later try.
+    assert.match(entryKt, /private val lifecycle = EntryLifecycle\(queue\) \{ SystemClock\.uptimeMillis\(\) \}/);
+    assert.match(entryKt, /val entry = lifecycle\.next\(blocked\) \?: return/);
+    assert.match(entryKt, /\} catch \(failure: Throwable\) \{\s+ui \{ failed\(entry, failure\.message\) \}\s+\/\/[^\n]*\s+if \(!entryRetryable\(failure\.message\)\) return@perform\s+throw failure\s+\}\s+ui \{ menu\.whenIdle \{ opened\(entry, reply, view\) \} \}/);
+    assert.match(entryKt, /is EntryLifecycle\.Failure\.Retry -> main\.postDelayed\(\{ pump\(\) \}, outcome\.delayMs\)\s+is EntryLifecycle\.Failure\.Refused -> \{\s+shell\.showToast\(null, outcome\.notice, \"warning\"\)\s+lifecycle\.dismissed\(entry\)/, 'a refused entry shows its notice before it leaves');
+    assert.match(entryKt, /if \(blocked\) \{\s+lifecycle\.deferred\(entry\)\s+return\s+\}\s+open\(reply, view\)\s+lifecycle\.opened\(entry\)/);
+    assert.doesNotMatch(code(entryKt), /queue\.remove\(/, 'only EntryLifecycle takes an entry out of the queue');
+    assert.equal(code(source('EntryLifecycle.kt')).match(/queue\.remove\(/g).length, 2, 'an entry leaves only after it opened, or when core refused its input');
+    assert.match(readFileSync(resolve(app, 'android/app/src/test/java/tech/dongdongbh/mindwtr/pilot/EntryLifecycleTest.kt'), 'utf8'), /fun severalQueuedEntriesOpenInOrderAcrossARestart\(\)/);
+    assert.match(queueKt, /fun entryRetryable\(message: String\?\): Boolean = message\?\.startsWith\("INVALID_INPUT"\) != true/);
+    assert.match(queueKt, /out\.fd\.sync\(\)\s+\}\s+check\(partial\.renameTo\(file\)\)/);
+    assert.match(readFileSync(resolve(app, 'android/app/src/test/java/tech/dongdongbh/mindwtr/pilot/EntryQueueTest.kt'), 'utf8'), /fun aSecondEntryNeverReplacesTheFirst\(\)/);
+    assert.match(entryKt, /highlight\(id\); menu\.whenIdle \{ openEditor\(id, "view"\) \}/);
+    assert.match(activity, /if \(savedInstanceState == null\) model\.entries\.receive\(intent\)/);
+    assert.match(activity, /override fun onNewIntent\(intent: Intent\) \{\s+super\.onNewIntent\(intent\)\s+setIntent\(intent\)\s+model\.entries\.receive\(intent\)/);
+    assert.match(activity, /LaunchedEffect\(entries\.head, entries\.blocked\) \{ entries\.pump\(\) \}/);
+    assert.match(activity, /LaunchedEffect\(leaveApp\) \{ if \(leaveApp\) \{ leftApp\(\); moveTaskToBack\(true\) \} \}/);
+    assert.match(hostEntry, /^\s+entryPoint: \(input\) => logEntryPoint\(input, contract\.resolveNativeEntryPoint\(input\)\),$/m);
+    assert.match(hostEntry, /^\s+captureImport: \(input\) => contract\.planQuickCaptureImport\(input\),$/m);
+    assert.ok(hostEntry.includes("releaseCheck: 'v1.3.3/native-android-entry-point', kind, outcome }"));
+    // A system capture (RN's origin=system) puts the app behind the previous one when the popup closes; Save and edit stays.
+    assert.match(model, /private fun endCapture\(\) \{\s+val back = capture\?\.returnToPreviousApp == true\s+keepCapture\(null\)\s+if \(back\) leaveApp = true/);
+    assert.equal(code(model).match(/endCapture\(\)/g).length, 4, 'Close, a saved capture that closes, and saved lines end the popup');
+    assert.match(captureUi, /\.put\("linesText", linesText \?: JSONObject\.NULL\)\.put\("returnToPreviousApp", returnToPreviousApp\)/);
+    // Import .txt: RN's text/plain picker; the file is read inside the action (off the main thread) and core plans it; Create tasks
+    // sends the file's text, on disk with the question.
+    assert.match(captureUi, /rememberLauncherForActivityResult\(ActivityResultContracts\.OpenDocument\(\)\) \{ uri -> uri\?\.let\(::importCaptureText\) \}/);
+    assert.match(captureUi, /ImportTextButton\(!locked\) \{ importText\.launch\(arrayOf\("text\/plain"\)\) \}/);
+    assert.match(captureUi, /\.clearAndSetSemantics \{ contentDescription = label; role = Role\.Button; testTag = "capture-import-text"; if \(enabled\) onClick \{ pick\(\); true \} else disabled\(\) \}/);
+    assert.match(model, /perform \{ runtime ->\s+val text = getApplication<Application>\(\)\.readPickedText\(uri\)\s+val plan = runtime\.menuRead\("captureImport"/);
+    assert.match(model, /FailedAction\("captureLines", current\.lineIds\.first\(\), current\.linesText \?: current\.text,/);
+    for (const key of ['quickAdd.bulkImportTextFile', 'quickAdd.bulkImportTextFileLabel']) assert(labelKeys.includes(key), `LABEL_KEYS lacks ${key}`);
+    // No Kotlin policy, dates, colors or literal text in the new file; RN's route names map to this app's screens only.
+    const entryCode = code(entryKt).replace(/private const val \w+ = "[^"]*"/g, '');
+    assert.doesNotMatch(entryCode, /\.(sort\w*|sorted\w*|filter\w*|groupBy|reversed|distinct\w*|partition)\b/, 'EntryPoints.kt: no Kotlin sorting, filtering, or grouping');
+    assert.doesNotMatch(entryCode, /SimpleDateFormat|DateTimeFormatter|java\.time|Calendar\.getInstance|currentTimeMillis|\bDate\(|\bColor\(|"#[0-9A-Fa-f]{3,8}"/);
+    for (const [, key] of entryCode.matchAll(/"([a-z][A-Za-z]*(?:\.[A-Za-z]+)+)"/g)) assert(labelKeys.includes(key), `EntryPoints.kt: ${key} is not in LABEL_KEYS`);
+    assert.doesNotMatch(entryCode, /\bText\(|contentDescription|showToast\("/, 'EntryPoints.kt: every word is core\'s');
 }
 
 const fakeCore = `
@@ -1552,11 +2055,14 @@ export function planLegacyJsonImport(state, current, sqliteHasData) {
   return globalThis.plan;
 }
 export async function sqliteHasAnyData() { return globalThis.sqliteHasData; }
+export function assertNativeLegacyBackupSafe() { globalThis.events.push('legacyCheck'); }
 // Core compares every persisted field; the fake compares the whole snapshot.
 export function legacyImportMismatch(merged, saved) { return JSON.stringify(merged) === JSON.stringify(saved) ? null : 'tasks'; }
 export function splitSqlStatements(sql) { return [sql]; }
 export function setStorageAdapter(adapter) { globalThis.adapter = adapter; }
 export async function flushPendingSave() { globalThis.events.push('flush'); }
+// The debug net check's WebDAV calls: bundled, never run here.
+export const [cloudHeadJson, webdavDeleteFile, webdavGetFile, webdavGetJson, webdavGetSyncDocument, webdavHeadFile, webdavMakeDirectory, webdavPutFile, webdavPutJson] = Array(9).fill(async () => null);
 export function createNativeHostContract() {
   return {
     async activate() {
@@ -1677,6 +2183,7 @@ export const TASK_PRIORITY_COLORS = { urgent: '#dc2626', low: '#3b82f6' };
 export function themeDescriptor(theme) {
   return { nord: { scheme: 'dark', statusPreset: 'nord' }, 'material3-light': { scheme: 'light', statusPreset: null } }[theme];
 }
+export function resolveThemeStatusPreset(theme) { return themeDescriptor(theme)?.statusPreset ?? null; }
 export const useTaskStore = { getState: () => ({
   settings: globalThis.settings,
   _allTasks: globalThis.lastLoaded ? globalThis.lastLoaded.tasks : [],
@@ -1700,6 +2207,8 @@ const makeState = (taskCount, fakeDataSequence = []) => {
         events: [], planInputs: [], plan: null, sqliteHasData: true, saveError: null, afterSave: null, lastLoaded: null, commitResult: null,
         createCount: 0, completeCount: 0, persistenceFailure: null, captureInputs: [],
         snapshotResult: { ok: true, value: { fileName: 'data.2026-09-24T10-00-00.000.snapshot.json', contents: '{}' } }, editorInputs: [], updateInputs: [], focusInputs: [],
+        // host-polyfills.js gives QuickJS these; the harness runs host-entry alone.
+        AbortController, setTimeout,
         languageInputs: [], projectInputs: [], settings: undefined, newInputs: [], menuInputs: [],
         menuReadResult: { ok: false, error: { code: 'STALE_REVISION', message: 'Someday changed; restart paging from offset zero' } },
         menuCommandResult: { ok: false, error: { code: 'SAVE_FAILED', message: 'disk full' } },
@@ -1830,12 +2339,12 @@ assert.deepEqual(ready.languageInputs, ['{"storedLanguage":null,"systemLocale":"
 // Theme: the synced setting wins over RN's device-local choice, then the system; core classifies it and sends its hues.
 {
     const theme = async (stored) => (await poll(ready, ready.MindwtrHost.theme(stored))).value;
-    assert.deepEqual(await theme(''), { mode: 'system', preset: 'default', material: false, scheme: null,
+    assert.deepEqual(await theme(''), { mode: 'system', preset: 'default', presets: { light: 'default', dark: 'default' }, material: false, scheme: null,
         status: { light: { done: { bg: '#22C55E20', text: '#22C55E', border: '#22C55E' } }, dark: { done: { bg: '#4ADE8026', text: '#4ADE80', border: '#4ADE80' } } }, priority: { urgent: '#dc2626', low: '#3b82f6' } });
-    assert.deepEqual(await theme('material3-light'), { mode: 'material3-light', preset: 'default', material: true, scheme: 'light',
+    assert.deepEqual(await theme('material3-light'), { mode: 'material3-light', preset: 'default', presets: { light: 'default', dark: 'default' }, material: true, scheme: 'light',
         status: { light: { done: { bg: '#22C55E20', text: '#22C55E', border: '#22C55E' } }, dark: { done: { bg: '#4ADE8026', text: '#4ADE80', border: '#4ADE80' } } }, priority: { urgent: '#dc2626', low: '#3b82f6' } });
     ready.settings = { theme: 'nord' };
-    assert.deepEqual(await theme('material3-light'), { mode: 'nord', preset: 'nord', material: false, scheme: 'dark',
+    assert.deepEqual(await theme('material3-light'), { mode: 'nord', preset: 'nord', presets: { light: 'nord', dark: 'nord' }, material: false, scheme: 'dark',
         status: { light: { done: { bg: '#A3BE8C26', text: '#A3BE8C', border: '#A3BE8C' } }, dark: { done: { bg: '#A3BE8C26', text: '#A3BE8C', border: '#A3BE8C' } } }, priority: { urgent: '#dc2626', low: '#3b82f6' } });
     ready.settings = undefined;
 }
@@ -1986,9 +2495,10 @@ assert.equal((await poll(ready, ready.MindwtrHost.language('', 'zh-CN'))).ok, tr
 assert.equal((await poll(ready, ready.MindwtrHost.strings('["tab.inbox"]'))).ok, true);
 // The RN legacy import runs after the validated load and before activation. RN state changes only
 // after the saved import is read back, and a failed RN state change never fails the boot.
-const bootBody = hostEntry.slice(hostEntry.indexOf('boot(legacyState: string, legacyBackup: string): string {'), hostEntry.indexOf('    window('));
-const bootOrder = ['await adapter.getData();', 'await importLegacyJson(adapter,', 'contract.activate('].map((text) => bootBody.indexOf(text));
+const bootBody = hostEntry.slice(hostEntry.indexOf('const boot = '), hostEntry.indexOf('globalThis.MindwtrHost ='));
+const bootOrder = ['await adapter.getData();', 'await importLegacyJson(adapter,', 'await activateAndVerify(adapter, recoveryLoad)'].map((text) => bootBody.indexOf(text));
 assert(bootOrder.every((index, i) => index > (i ? bootOrder[i - 1] : -1)), `boot order ${bootOrder}`);
+assert.match(hostEntry, /boot\(legacyState: string, legacyBackup: string\): string \{\s*return boot\(legacyState, legacyBackup\);/);
 const importBody = hostEntry.slice(hostEntry.indexOf('const importLegacyJson'), hostEntry.indexOf('// After a failed save'));
 const importOrder = ['adapter.latestData', 'planLegacyJsonImport(', 'legacyImportMismatch(plan.merged, loaded)', 'await adapter.saveData(plan.merged)',
     'legacyImportMismatch(plan.merged, await adapter.getData())', 'Legacy import not confirmed', 'native().rnStateCommit(',
@@ -2000,7 +2510,7 @@ assert.equal(importBody.match(/rnState = 'failed'/g).length, 1);
 assert.equal(hostEntry.match(/saveData\(/g).length, 1, 'the import is the host\'s only direct save');
 assert.equal(hostEntry.match(/rnStateCommit\(/g).length, 2, 'bridge type and one call');
 const legacyLine = /extra: Record<string, string> = \{([\s\S]*?)\};/.exec(importBody)?.[1] ?? '';
-assert(legacyLine.includes("releaseCheck: 'v1.3.3/native-android-legacy-json-import'"));
+assert(legacyLine.includes("releaseCheck: ios ? 'v1.3.3/native-ios-legacy-json-import' : 'v1.3.3/native-android-legacy-json-import'"));
 // Field names (the counts come from core's plan) are listed in packages/core/src/release-diagnostics-fields.test.ts.
 for (const [, name] of legacyLine.matchAll(/(\w+):/g)) assert.doesNotMatch(name, /key|pass|user/i);
 
@@ -2085,6 +2595,41 @@ const brokenBoot = await poll(brokenStorage, brokenStorage.MindwtrHost.boot());
 assert.equal(brokenBoot.ok, false);
 assert.match(brokenBoot.error, /disk I\/O error/);
 assert.equal(brokenStorage.activationCount, 0);
+// Review 2: MindwtrHost.cancel, as CoreHost calls it past a deadline, cancels the host's calls and fires the operation's
+// signal, so the operation ends at once (here runNetDeadline in "drain" mode): its fetch rejects and its write is refused.
+{
+    const deadlineState = makeState(0);
+    const fetches = [];
+    deadlineState.__mindwtrNative.log = (line) => fetches.push(line);
+    deadlineState.fetch = (url, init) => new Promise((_, reject) => {
+        const refuse = () => reject(Object.assign(new Error(deadlineState.cancelled), { name: 'AbortError' }));
+        fetches.push(`${init?.method ?? 'GET'} ${url}`);
+        if (deadlineState.cancelled) refuse(); else deadlineState.cancelFetch = refuse;
+    });
+    deadlineState.__cancelHostCalls = (message) => { deadlineState.cancelled = message; deadlineState.cancelFetch(); };
+    const id = deadlineState.MindwtrHost.netDeadline('18765', 'drain');
+    await new Promise((resolveTick) => setImmediate(resolveTick));
+    assert.equal(deadlineState.MindwtrHost.poll(id), null, 'the operation waits on its unanswered request');
+    assert.equal(deadlineState.MindwtrHost.cancel(id), null);
+    const drained = await poll(deadlineState, id);
+    assert.deepEqual(drained, { ok: true, value: ['signal', 'fetch:AbortError', 'write:AbortError'] });
+    assert.deepEqual(fetches, ['GET http://127.0.0.1:18765/slow/deadline-drain', 'PUT http://127.0.0.1:18765/dav/after-drain.json',
+        'Native Android net deadline drain events=["signal","fetch:AbortError","write:AbortError"]']);
+    assert.equal(deadlineState.cancelled, 'The host operation timed out');
+}
+// Review 6: check-net-device.mjs cleans up once, whether it ends, is interrupted (Ctrl-C) or is terminated, and a signal
+// exits with 128 + its number. A failing step (the phone gone) does not stop the steps after it.
+{
+    const { spawnSync } = await import('node:child_process');
+    const script = (ending) => `import { cleanupOnExit } from ${JSON.stringify(resolve(app, 'scripts/check-net-device.mjs'))};
+        const cleanup = cleanupOnExit([() => console.log('props'), () => { throw new Error('phone gone'); }, () => console.log('reverse')]);
+        setTimeout(() => {}, 10000);
+        ${ending}`;
+    for (const [ending, status] of [["process.kill(process.pid, 'SIGINT');", 130], ["process.kill(process.pid, 'SIGTERM');", 143], ['cleanup(); cleanup(); process.exit(0);', 0]]) {
+        const child = spawnSync(process.execPath, ['--input-type=module', '-e', script(ending)], { encoding: 'utf8', timeout: 20_000 });
+        assert.deepEqual([child.status, child.stdout], [status, 'props\nreverse\n'], ending);
+    }
+}
 console.log('Storage exception rethrown in JS;', 'lifecycle ownership and debug-only fault hooks checked');
 console.log('RN legacy guard runs before the RN database opens and reads RKStorage and the database only as byte copies');
 console.log('Editor: core\'s model and suggestions in, saveTaskDraft out through perform with an exact retry, changed fields only, no Kotlin date parsing');
@@ -2102,5 +2647,11 @@ console.log('Calendar and Board: core\'s views under one revision, core\'s actio
 console.log('Toolbars and bulk: the Inbox on core\'s view, core\'s bulk bar and Focus controls through perform with exact requests, a saved Focus filter on disk first, stateless Select all, no deprecated Archive fields, no Kotlin policy');
 console.log('Review organize and picker search: row and batch Mark reviewed and Organize\'s Apply carry core\'s task revisions, a stale refusal rereads core\'s view, the Organize sheet is the lists\' dialog on Review\'s bar, the token and Board pickers search through core, and a search hit is highlighted on the list it opened on');
 console.log('Settings and the editor\'s View tab: core\'s settings and task views through CoreHost, writes through perform with exact requests, device writes under RN\'s keys, checklist edits as core\'s edits in the one save');
-console.log('Mind Sweep, saved searches and the Focus checklist page: core\'s views through CoreHost, captures and Bulk organize creates on disk first, checklist edits compare-and-set on core\'s task revision, on disk before they go and moved on whatever page is open, stale windows read again whole, Focus picker search, no Kotlin policy');
+console.log('Mind Sweep and saved searches: core\'s views through CoreHost, captures and Bulk organize creates on disk first, stale windows read again whole, Focus picker search, no Kotlin policy');
+console.log('App lock: core\'s General row read at boot and after a failed save, locked on each leave but a rotation, no recents picture while on, AndroidX BiometricPrompt with Expo\'s credential fallback, General\'s switch on only after a yes, a scrolling lock screen in core\'s words, and a phone check that swaps the database atomically and restores loudly');
+// One run per phone: every device check waits for its phone's lock before anything else (device-lock.mjs).
+for (const file of ['device.mjs', 'check-net-device.mjs']) {
+    assert.match(readFileSync(resolve(app, `scripts/${file}`), 'utf8'), /^import '\.\/device-lock\.mjs';$/m, `${file} waits for the phone's lock first`);
+}
+console.log('Entry points: RN\'s alias, links on the build\'s scheme, text shares and Assistant notes read as strings into core\'s resolveNativeEntryPoint, RN\'s shortcuts from RN\'s builder, Import .txt through core');
 console.log('Boot gates, second-read failure, failed-save refresh and editor read, and diagnostic acknowledgment passed');

@@ -15,7 +15,7 @@ import java.util.Collections
  */
 val LABEL_KEYS = listOf(
     "tab.inbox", "tab.next", "nav.projects",
-    "nav.addTask", "quickAdd.inputLabel", "common.more", "common.retry", "common.done", "common.edit", "common.back",
+    "nav.addTask", "quickAdd.inputLabel", "quickAdd.bulkImportTextFile", "quickAdd.bulkImportTextFileLabel", "common.more", "common.retry", "common.done", "common.edit", "common.back",
     "agenda.laterToday",
     "common.cancel", "common.close", "common.save", "common.ok", "common.clear", "common.discard",
     "common.none", "common.notSet", "taskEdit.titleLabel", "taskEdit.descriptionLabel", "taskEdit.statusLabel",
@@ -43,7 +43,7 @@ val LABEL_KEYS = listOf(
     "common.tasks", "filters.starred", "projects.availableNextAction", "projects.laterInSequence",
     "markdown.expand", "markdown.collapse",
     "inbox.empty", "inbox.emptyAddHint", "agenda.allClear", "agenda.noTasks", "projects.empty",
-    "agenda.addToFocus", "agenda.removeFromFocus", "projects.addToFocus", "projects.removeFromFocus",
+    "agenda.addToFocus", "agenda.removeFromFocus", "agenda.focusWhenAvailable", "projects.addToFocus", "projects.removeFromFocus",
     "taskStatus.changeStatus", "task.aria.changeStatus", "task.aria.changeStatusHint",
     "projects.addPlaceholder", "projects.add", "projects.areaFilter", "agenda.reviewDueProjects", "common.open",
     "agenda.collapseOtherSections", "agenda.expandOtherSections", "status.active", "status.archived",
@@ -66,6 +66,9 @@ val LABEL_KEYS = listOf(
     "markdown.edit", "markdown.preview", "settings.title",
     // Mind Sweep's screen name (its words are core's view).
     "mindSweep.title",
+    // RN's app lock screen (AppLock.kt); General's switch and its failure lines are core's view.
+    "appLock.title", "appLock.description", "appLock.prompt", "appLock.unlock", "appLock.authenticating",
+    "appLock.unavailable", "appLock.cancelled", "appLock.failed",
 )
 
 /** The label map: core's text for each of [LABEL_KEYS]. It has no fallback text; a key core lacks shows as the key. */

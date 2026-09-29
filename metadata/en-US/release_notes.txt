@@ -1,5 +1,6 @@
-- Task screens are cleaner, and Focus grouping is faster.
-- Apple Reminders can import automatically without creating duplicate tasks.
-- iCloud changes arrive by silent push, and stalled background sync ends sooner.
-- Widgets follow your date format, and recurring calendar exceptions work reliably.
-- Search accepts @context, #tag, and %person shorthand, with stronger sync and attachment handling.
+- Waiting tasks show assigned people, and Focus planning is clearer.
+- Monthly repeats support positioned weekdays and skipping one fixed occurrence.
+- Calendar views gain Area filters and more accurate time lines.
+- Widgets follow your language and 12/24-hour setting.
+- Shortcuts can open saved lists and start Focus audio capture.
+- Saved filters, sync, storage, and recovery preserve newer edits more reliably.

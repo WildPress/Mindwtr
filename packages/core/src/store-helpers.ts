@@ -1,4 +1,5 @@
-import { createNextRecurringTask, normalizeRecurrenceForLoad } from './recurrence';
+import type { ProjectTaskSummary } from './project-row-meta';
+import { buildNextRecurringTask, canonicalRecurringFollowUp, createNextRecurringTask, normalizeRecurrenceForLoad, type RecurrenceProjection } from './recurrence';
 import { getTaskDateCoherenceIssues } from './task-date-coherence';
 import {
     createTaskTokenUsageAccumulator,
@@ -6,7 +7,7 @@ import {
     getUsedTaskTokensFromUsage,
 } from './task-token-usage';
 import { resolveRelativeStartUpdates } from './task-relative-start';
-import { compareTasksByProjectOrder, isTaskFocusedNow, isTaskFutureFocusCandidate, isTaskFutureStart, rescheduleTask, shouldAutoArchiveCompletedTask, baseTextCollator } from './task-utils';
+import { compareTasksByProjectOrder, isTaskFocusedNow, isTaskFutureFocusCandidate, isTaskFutureFocusCandidateBeforeBoundary, isTaskFutureStart, isTaskFutureStartBeforeBoundary, rescheduleTask, shouldAutoArchiveCompletedTask, baseTextCollator } from './task-utils';
 import {
     isTaskActionable,
     isTaskFinished,
@@ -103,7 +104,13 @@ export const getReferenceTaskFieldClears = (): Partial<Task> => ({
     pushCount: 0,
 });
 
-export function applyTaskUpdates(oldTask: Task, updates: Partial<Task>, now: string): { updatedTask: Task; nextRecurringTask: Task | null } {
+export function applyTaskUpdates(
+    oldTask: Task,
+    updates: Partial<Task>,
+    now: string,
+    createId?: () => string,
+    recurrenceProjection?: RecurrenceProjection | null,
+): { updatedTask: Task; nextRecurringTask: Task | null } {
     let normalizedUpdates = updates;
     if (Object.prototype.hasOwnProperty.call(updates, 'textDirection') && updates.textDirection === undefined) {
         normalizedUpdates = { ...updates };
@@ -149,7 +156,9 @@ export function applyTaskUpdates(oldTask: Task, updates: Partial<Task>, now: str
         // timestamp and do not create a duplicate recurring occurrence.
         nextRecurringTask = isReturningFromArchive
             ? null
-            : createNextRecurringTask(oldTask, completedAt, oldTask.status);
+            : recurrenceProjection === undefined
+                ? createNextRecurringTask(oldTask, completedAt, oldTask.status, createId ? { createId } : undefined)
+                : buildNextRecurringTask(oldTask, completedAt, oldTask.status, recurrenceProjection, createId);
     } else if (statusChanged && incomingStatus === 'archived') {
         finalUpdates = {
             ...updatesToApply,
@@ -203,6 +212,64 @@ export function applyTaskUpdates(oldTask: Task, updates: Partial<Task>, now: str
     };
 }
 
+const normalizeOptionalTaskField = (value: string | undefined): string => value ?? '';
+
+const recurrenceKeyForDuplicateCheck = (task: Task): string => (
+    JSON.stringify(normalizeRecurrenceForLoad(task.recurrence) ?? null)
+);
+
+const isExistingRecurringFollowUp = (existing: Task, candidate: Task): boolean => {
+    if (existing.id === candidate.id) return false;
+    if (existing.deletedAt) return false;
+    if (isTaskFinished(existing)) return false;
+    if (existing.status !== candidate.status) return false;
+    if (existing.title.trim() !== candidate.title.trim()) return false;
+    if (normalizeOptionalTaskField(existing.projectId) !== normalizeOptionalTaskField(candidate.projectId)) return false;
+    if (normalizeOptionalTaskField(existing.sectionId) !== normalizeOptionalTaskField(candidate.sectionId)) return false;
+    if (normalizeOptionalTaskField(existing.areaId) !== normalizeOptionalTaskField(candidate.areaId)) return false;
+    if (normalizeOptionalTaskField(existing.startTime) !== normalizeOptionalTaskField(candidate.startTime)) return false;
+    if (normalizeOptionalTaskField(existing.dueDate) !== normalizeOptionalTaskField(candidate.dueDate)) return false;
+    if (normalizeOptionalTaskField(existing.reviewAt) !== normalizeOptionalTaskField(candidate.reviewAt)) return false;
+    return recurrenceKeyForDuplicateCheck(existing) === recurrenceKeyForDuplicateCheck(candidate);
+};
+
+// excludeId is the task being completed in this same update. The snapshot being
+// scanned is taken before the update lands, so that task still reads as live and
+// would match its own follow-up: completing an occurrence and then the one it just
+// spawned, on the same day, made the second candidate look like a duplicate of the
+// first and silently ended the series (#867).
+export const findExistingRecurringFollowUp = (
+    tasks: readonly Task[],
+    candidate: Task | null,
+    excludeId?: string,
+): Task | null => {
+    if (!candidate) return null;
+    return tasks.find((task) => task.id !== excludeId && isExistingRecurringFollowUp(task, candidate)) ?? null;
+};
+
+// The follow-up is a fresh task, so it needs what every other creation path
+// stamps: a project order (missing sorts as +Infinity in
+// compareTasksByProjectOrder, dumping the next occurrence below its siblings)
+// and a zeroed push count. It inherits the completed instance's place — that
+// instance leaves the active list and a series only ever has one active
+// instance, so there is nothing to collide with — and only falls back to a
+// fresh reservation when the completed task had no order to inherit.
+export const stampNewRecurringFollowUp = (
+    task: Task | null,
+    deviceId: string,
+    sourceOrder: number | undefined,
+    reserveProjectOrder: ProjectOrderReserver,
+): Task | null => {
+    if (!task) return null;
+    const order = sourceOrder ?? reserveProjectOrder(task.projectId);
+    return {
+        ...canonicalRecurringFollowUp(task),
+        rev: nextRevision(undefined),
+        revBy: deviceId,
+        ...(order !== undefined ? { order, orderNum: order } : {}),
+    };
+};
+
 /**
  * Applies the store's task-update invariants (schedule-edit unstar, star/status
  * promotion and demotion, boardOrder reset on status change, focusOrder clear on
@@ -217,7 +284,7 @@ export const normalizeTaskUpdate = (
      * Settings enable the rules that depend on them; without them the update is
      * normalized exactly as before (the cloud PATCH path passes none).
      */
-    context?: { settings?: AppData['settings']; nowMs?: number },
+    context?: { settings?: AppData['settings']; nowMs?: number; futureBoundary?: string },
 ): Partial<Task> => {
     let adjustedUpdates = updates;
     if (hasOwnField(updates, 'cancelledAt')) {
@@ -318,9 +385,13 @@ export const normalizeTaskUpdate = (
     // Resolve Inbox promotion first: adding a start and star together queues
     // a Next action. Other deferred statuses still lose their stars.
     const scheduledTask = { ...task, ...adjustedUpdates };
+    const futureStart = (candidate: Task) => context?.futureBoundary
+        ? isTaskFutureStartBeforeBoundary(candidate, context.futureBoundary) : isTaskFutureStart(candidate);
+    const futureFocusCandidate = (candidate: Task) => context?.futureBoundary
+        ? isTaskFutureFocusCandidateBeforeBoundary(candidate, context.futureBoundary) : isTaskFutureFocusCandidate(candidate);
     if ((editsSchedule || hasOwnField(updates, 'status'))
-        && isTaskFutureStart(scheduledTask)
-        && !isTaskFutureFocusCandidate(scheduledTask)) {
+        && futureStart(scheduledTask)
+        && !futureFocusCandidate(scheduledTask)) {
         adjustedUpdates = { ...adjustedUpdates, isFocusedToday: false };
     }
     if (
@@ -341,7 +412,7 @@ export const normalizeTaskUpdate = (
         : task.isFocusedToday;
     if (
         ((task.isFocusedToday === true && resolvedIsFocusedToday !== true)
-            || (resolvedIsFocusedToday === true && isTaskFutureFocusCandidate({ ...task, ...adjustedUpdates })))
+        || (resolvedIsFocusedToday === true && futureFocusCandidate({ ...task, ...adjustedUpdates })))
         && !hasOwnField(updates, 'focusOrder')
     ) {
         adjustedUpdates = {
@@ -1095,7 +1166,7 @@ export const computeProjectDerivedState = (
 // their historical focus flag but should not consume today's focus limit —
 // the Focus views never show them, so a counted-but-invisible star would eat
 // a slot the user cannot free.
-const isTaskCountedAsFocused = (task: Task, now: Date): boolean => (
+export const isTaskCountedAsFocused = (task: Task, now: Date): boolean => (
     !task.deletedAt
     && isTaskFocusedNow(task, now)
     && task.status !== 'done' && task.status !== 'reference' && task.status !== 'archived'
@@ -1135,7 +1206,7 @@ export const computeTaskDerivedState = (
     const tasksByContext = new Map<string, Task[]>();
     const tasksByTag = new Map<string, Task[]>();
     const focusedTasks: Task[] = [];
-    const projectTaskSummaryById = new Map<string, { activeTaskCount: number; nextAction?: Task }>();
+    const projectTaskSummaryById = new Map<string, ProjectTaskSummary>();
     const dateCoherenceIssuesByTaskId = new Map<string, ReturnType<typeof getTaskDateCoherenceIssues>>();
     // Accumulated in the main loop below rather than in two extra full passes over `tasks`
     // (A-04). The accumulator carries collectTaskTokenUsage's own inclusion rule, so the
@@ -1160,6 +1231,7 @@ export const computeTaskDerivedState = (
             if (isTaskActionable(task)) {
                 const summary = projectTaskSummaryById.get(task.projectId) ?? { activeTaskCount: 0 };
                 summary.activeTaskCount += 1;
+                if (task.status === 'waiting') summary.hasWaitingAction = true;
                 if (task.status === 'next' && (!summary.nextAction || compareTasksByProjectOrder(task, summary.nextAction) < 0)) {
                     summary.nextAction = task;
                 }

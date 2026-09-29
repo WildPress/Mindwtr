@@ -1,0 +1,5 @@
+- Las tareas en espera muestran la persona asignada y Enfoque es más claro.
+- Las repeticiones mensuales admiten días posicionados y omitir una fecha.
+- El calendario añade filtros por Área y líneas de tiempo más precisas.
+- Los widgets siguen el idioma y el formato de 12/24 horas.
+- Capturas, filtros, sincronización y recuperación conservan mejor los cambios nuevos.

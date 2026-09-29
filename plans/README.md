@@ -1,5 +1,37 @@
 # Plans index
 
+## Release review from v1.3.0 — September 28, 2026
+
+Planned at `285b922ab` after four comprehensive fixes. Astra reviews only shipping
+React Native/desktop/core/cloud/MCP/automation/release surfaces; native mobile
+migration is excluded. Selection is automatic under review-improve-loop. Sol
+implements bounded code changes; root integrates one commit per finding.
+
+| Plan | Finding | Priority | Effort | Dependencies | Status |
+| --- | --- | --- | --- | --- | --- |
+| [132](132-editor-focus-draft-recurrence.md) | Editor Focus ignores draft recurrence | P2 | S | None | DONE |
+| [133](133-shared-token-grouping.md) | Four duplicate context/tag grouping loops | P3 | S | None | DONE |
+| [134](134-image-size-exception-rationale.md) | Stale image-size exception rationale | P3 | S | None | DONE |
+
+132 reuses the existing draft serializer;133 is the sole selected architecture
+candidate (Worth exploring, selected because two shipping adapters repeat the
+same domain decisions). It must delete duplicate loops in the existing module.
+No Strong architecture candidate or measured performance regression was found.
+134 corrects documentation only; it does not remove the dependency vulnerability.
+
+Deferred: image-size now has patched 2.x releases, but the Expo54-pinned Metro
+0.83.3 asset reader uses the old filename interface. Replacing it or overriding
+the Metro family needs Android/iOS asset-bundling validation in a separate
+maintenance change. Existing build-time-only exceptions and topology checks
+remain unchanged. Rust quick-xml/rkyv exceptions remain as previously recorded;
+the fresh configured audits passed and rkyv is inactive in the locked feature graph.
+
+Rejected: whole calendar/sync adapter rewrites, new task-row caches, all-axis
+registries, speculative product direction, size-only module splits, and reopening
+settled snapshot/CRDT/MCP/native-migration decisions without new evidence.
+No public-doc change selected. Audit sampling and host tests do not prove device,
+background, signing or production backend behavior.
+
 ## Review loop from v1.3.0 — September 22, 2026
 
 Planned against `59d0e575e` (public docs `89ac579b`). GPT-6 Astra reviewed all nine improve categories; GPT-5.6 Sol implements the selected findings. Automatic selection under review-improve-loop includes all three high-confidence actionable plans. The comprehensive fixes are separate commits; their evidence is in the local task report. Existing plan128 is an unrelated native experiment and is preserved.
@@ -232,7 +264,7 @@ Architecture deepening (Phase 3, from the architecture audit): DEBT-01 editor fi
 
 ### Deferred (this run)
 - **DEPS-R1** quick-xml 0.39.4 (RUSTSEC-2026-0194/0195) and rkyv 0.7.46 (RUSTSEC-2026-0235): `cargo update --precise` refuses both (wayland-scanner/ashpd/rfd/tauri-plugin-dialog pin quick-xml ^0.39; rust_decimal/byte-unit/tauri-plugin-log pin rkyv 0.7). Wait for the parents; a `[patch.crates-io]` override is not worth the risk for build-time XML and an unreached deserializer.
-- **DEPS-R2** image-size (Metro build-time transitive, no fixed release): monitor.
+- **DEPS-R2** image-size (Metro build-time transitive): patched 2.0.3 exists, but its API differs from the filename API used by Expo's pinned Metro. Defer replacement pending compatible Metro/image-size integration and Android/iOS asset-bundling validation; existing audit exceptions remain unchanged.
 - **B12** ~75 call-site keys still missing from en.ts (Obsidian view 38, People manager, Saved filters, Pomodoro phases, mobile context-automation): allowlisted shrink-only in `apps/desktop/src/test/i18n-missing-keys.test.ts` and `apps/mobile/tests/i18n-missing-keys.test.ts`; ~375-525 translations = own task.
 - `formatFocusTaskLimitText`'s literal-`3` fallback (`packages/core/src/focus-utils.ts:12-18`) is dead now that every locale carries `{{count}}` (guarded); delete with its test in a follow-up.
 

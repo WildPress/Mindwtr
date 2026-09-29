@@ -4,6 +4,7 @@ import {
     hasExplicitExternalCalendarColor,
     themeExternalCalendarDisplayColor,
     type ExternalCalendarSubscription,
+    useTaskStore,
 } from '@mindwtr/core';
 import { Ban, ExternalLink } from 'lucide-react';
 import { getDocsGuideUrl } from '@mindwtr/core';
@@ -22,6 +23,8 @@ type Labels = {
     calendarChooseLocalFile: string;
     calendarRemove: string;
     calendarColorAuto: string;
+    calendarShowInAreas: string;
+    calendarAllAreas: string;
     externalCalendars: string;
     calendarSystemTitle: string;
     calendarSystemDesc: string;
@@ -97,6 +100,15 @@ export function SettingsCalendarPage({
     maskCalendarUrl,
 }: SettingsCalendarPageProps) {
     const language = useDocumentationLanguage();
+    const areas = useTaskStore((state) => state.areas).filter((area) => !area.deletedAt);
+    const updateSettings = useTaskStore((state) => state.updateSettings);
+    const toggleArea = (calendar: ExternalCalendarSubscription, areaId: string) => {
+        const current = calendar.areaIds ?? [];
+        const next = current.includes(areaId) ? current.filter((id) => id !== areaId) : [...current, areaId];
+        void updateSettings({ externalCalendars: externalCalendars.map((entry) => (
+            entry.id === calendar.id ? { ...entry, areaIds: next } : entry
+        )) });
+    };
     const permissionLabel = (() => {
         if (systemCalendarPermission === 'granted') return t.calendarSystemPermissionGranted;
         if (systemCalendarPermission === 'undetermined') return t.calendarSystemPermissionUndetermined;
@@ -297,6 +309,14 @@ export function SettingsCalendarPage({
                                                     );
                                                 })()}
                                             </div>
+                                            {areas.length > 0 && (
+                                                <details className="mt-3 text-xs">
+                                                    <summary className="cursor-pointer">{t.calendarShowInAreas}: {(calendar.areaIds ?? []).length === 0 ? t.calendarAllAreas : areas.filter((area) => calendar.areaIds?.includes(area.id)).map((area) => area.name).join(', ') || t.calendarAllAreas}</summary>
+                                                    <div className="mt-2 flex flex-wrap gap-2">
+                                                        {areas.map((area) => <label key={area.id} className="flex items-center gap-1"><input type="checkbox" checked={calendar.areaIds?.includes(area.id) ?? false} onChange={() => toggleArea(calendar, area.id)} />{area.name}</label>)}
+                                                    </div>
+                                                </details>
+                                            )}
                                 </div>
                                 <div className="flex items-center gap-3">
                                     <input

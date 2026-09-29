@@ -1,6 +1,11 @@
-import { getTaskOrder } from '../store-helpers';
+import { getTaskOrder, getNextDataChangeAt, nextRevision, persist } from '../store-helpers';
+import { getProjectSectionsForView } from '../project-utils';
+import { sameSectionDeleteJson, sameSectionSqliteRow } from './section-actions';
+import { sameProjectSqliteRow } from './project-actions';
+import type { PreparedProjectSectionOrder, PreparedTaskEditResult } from '../store-types';
 import { compareTasksByProjectOrder, sortTasksByBoardOrder } from '../task-utils';
 import { mutateTasks } from '../store-tasks';
+import { logInfo } from '../logger';
 import type { OrderingActions, Project, ProjectActionContext, Section, Task, TaskStatus } from './shared';
 import { mutateEntities } from './shared';
 
@@ -106,10 +111,13 @@ const createSparseOrderPlan = (
     currentIds: string[],
     nextIds: string[],
     orderById: Map<string, number | undefined>,
+    movedTaskId?: string,
 ): SparseOrderPlan | null => {
     if (sameOrder(currentIds, nextIds)) return null;
 
-    const movedId = findSingleMovedId(currentIds, nextIds);
+    const movedId = movedTaskId && currentIds.includes(movedTaskId) && nextIds.includes(movedTaskId)
+        && sameOrder(currentIds.filter((id) => id !== movedTaskId), nextIds.filter((id) => id !== movedTaskId))
+        ? movedTaskId : findSingleMovedId(currentIds, nextIds);
     if (movedId) {
         const order = sparseOrderForMove(nextIds, movedId, orderById);
         if (order !== null && Number.isFinite(order)) {
@@ -128,10 +136,90 @@ const orderFromPlan = (plan: SparseOrderPlan, id: string): number | undefined =>
     plan.kind === 'single' ? (plan.id === id ? plan.order : undefined) : plan.orderById.get(id)
 );
 
+/** The same sparse Section plan used by RN and native prepared writes. */
+export const projectSectionOrderUpdates = (sections: readonly Section[], orderedIds: string[]): Map<string, number> => {
+    const sorted = [...sections].sort((a, b) => {
+        const aOrder = Number.isFinite(a.order) ? a.order : Number.POSITIVE_INFINITY;
+        const bOrder = Number.isFinite(b.order) ? b.order : Number.POSITIVE_INFINITY;
+        if (aOrder !== bOrder) return aOrder - bOrder;
+        return a.title.localeCompare(b.title);
+    });
+    const currentIds = sorted.map((section) => section.id);
+    const validIds = uniqueValidIds(orderedIds, new Set(currentIds));
+    if (validIds.length === 0) return new Map();
+    const nextIds = finalOrderedIds(currentIds, validIds);
+    const orderById = new Map(sorted.map((section) => [section.id, finiteOrder(section.order)]));
+    const plan = createSparseOrderPlan(currentIds, nextIds, orderById);
+    const updates = new Map<string, number>();
+    if (plan) for (const section of sorted) {
+        const nextOrder = orderFromPlan(plan, section.id);
+        if (Number.isFinite(nextOrder) && section.order !== nextOrder) updates.set(section.id, nextOrder!);
+    }
+    return updates;
+};
+
+export const projectSectionOrderEffect = (sections: readonly Section[], orderedIds: string[],
+    deviceId: string, now: string): PreparedProjectSectionOrder['effect'] => {
+    const updates = projectSectionOrderUpdates(sections, orderedIds);
+    return { sections: sections.filter((row) => updates.has(row.id)).map((before) => ({
+        before, after: { ...before, order: updates.get(before.id)!, updatedAt: now,
+            rev: nextRevision(before.rev), revBy: deviceId },
+    })) };
+};
+
 export const createOrderingActions = ({
     set,
     debouncedSave,
 }: ProjectActionContext): OrderingActions => ({
+    commitPreparedProjectSectionOrder: async (input: PreparedProjectSectionOrder): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project Section order conflicts with current data' };
+        set((state) => {
+            const pairs = input.effect.sections;
+            const affectedIds = new Set(pairs.map(({ after }) => after.id));
+            const allById = new Map<string, Section>();
+            const duplicateIds = new Set<string>();
+            for (const row of state._allSections) {
+                if (allById.has(row.id)) duplicateIds.add(row.id);
+                allById.set(row.id, row);
+            }
+            // A complete affected-row receipt wins before mutable parent and scope checks.
+            if (pairs.length > 0 && affectedIds.size === pairs.length
+                && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && pairs.every(({ after }) => {
+                    const current = allById.get(after.id);
+                    return current && !duplicateIds.has(after.id) && sameSectionSqliteRow(current, after);
+                })) {
+                result = { success: true, id: input.request.projectId, outcome: 'replayed' };
+                return state;
+            }
+            const parent = state._projectsById.get(input.request.projectId);
+            if (!parent || parent.deletedAt || parent.purgedAt || parent.status === 'archived'
+                || !sameProjectSqliteRow(parent, input.scope.project)
+                || !sameSectionDeleteJson(parent, input.scope.project)
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null))
+                return state;
+            const live = getProjectSectionsForView(parent,
+                state._allSections.filter((row) => !row.deletedAt), state._allSections);
+            if (live.length !== input.scope.sections.length || live.some((row, index) =>
+                duplicateIds.has(row.id) || !sameSectionDeleteJson(row, input.scope.sections[index])
+                || !sameSectionSqliteRow(row, input.scope.sections[index]))) return state;
+            const effect = projectSectionOrderEffect(live, input.result.orderedIds,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.preparedAt);
+            if (effect.sections.length === 0 || !sameSectionDeleteJson(effect, input.effect)) return state;
+            const replacements = new Map(effect.sections.map(({ after }) => [after.id, after]));
+            const sections = state._allSections.map((row) => replacements.get(row.id) ?? row);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { sections,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: input.request.projectId, outcome: 'applied' };
+            return { _allSections: sections, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
     reorderProjects: async (orderedIds: string[], areaId?: string) => {
         if (orderedIds.length === 0) return;
         const targetAreaId = areaId ?? undefined;
@@ -166,43 +254,27 @@ export const createOrderingActions = ({
 
     reorderSections: async (projectId: string, orderedIds: string[]) => {
         if (!projectId || orderedIds.length === 0) return;
-        let orderPlan: SparseOrderPlan | null = null;
+        let updates = new Map<string, number>();
         await mutateEntities({ set, debouncedSave }, {
             collection: 'sections',
             select: (state) => {
                 if (!state._allProjects.some((project) => project.id === projectId && !project.deletedAt)) return [];
                 const isInProject = (section: Section) => section.projectId === projectId && !section.deletedAt;
                 const projectSections = state._allSections.filter(isInProject);
-                const projectSectionIds = new Set(projectSections.map((section) => section.id));
-                const validOrderedIds = orderedIds.filter((id) => projectSectionIds.has(id));
-                if (validOrderedIds.length === 0) return [];
-                const currentIds = projectSections
-                    .sort((a, b) => {
-                        const aOrder = Number.isFinite(a.order) ? a.order : Number.POSITIVE_INFINITY;
-                        const bOrder = Number.isFinite(b.order) ? b.order : Number.POSITIVE_INFINITY;
-                        if (aOrder !== bOrder) return aOrder - bOrder;
-                        return a.title.localeCompare(b.title);
-                    })
-                    .map((section) => section.id);
-                const nextIds = finalOrderedIds(currentIds, uniqueValidIds(validOrderedIds, projectSectionIds));
-                const orderById = new Map(projectSections.map((section) => [section.id, finiteOrder(section.order)]));
-                orderPlan = createSparseOrderPlan(currentIds, nextIds, orderById);
-                if (!orderPlan) return [];
-                return projectSections.filter((section) => {
-                    const nextOrder = orderFromPlan(orderPlan!, section.id);
-                    return Number.isFinite(nextOrder) && section.order !== nextOrder;
-                });
+                updates = projectSectionOrderUpdates(projectSections, orderedIds);
+                return projectSections.filter((section) => updates.has(section.id));
             },
             buildUpdates: (section) => {
-                const nextOrder = orderFromPlan(orderPlan!, section.id);
-                return Number.isFinite(nextOrder) ? { order: nextOrder as number } : null;
+                const nextOrder = updates.get(section.id);
+                return nextOrder !== undefined ? { order: nextOrder } : null;
             },
         });
     },
 
-    reorderProjectTasks: async (projectId: string, orderedIds: string[], sectionId?: string | null) => {
+    reorderProjectTasks: async (projectId: string, orderedIds: string[], sectionId?: string | null, movedTaskId?: string) => {
         if (!projectId || orderedIds.length === 0) return;
         let orderPlan: SparseOrderPlan | null = null;
+        let changedCount = 0;
         await mutateTasks({ set, debouncedSave }, {
             selectTasks: (state) => {
                 const hasSectionFilter = sectionId !== undefined;
@@ -222,15 +294,17 @@ export const createOrderingActions = ({
                 const currentIds = projectTasks
                     .sort(compareTasksByProjectOrder)
                     .map((task) => task.id);
-                const nextIds = finalOrderedIds(currentIds, validOrderedIds);
+                const nextIds = boardOrderedIds(currentIds, validOrderedIds, movedTaskId);
                 const orderById = new Map(projectTasks.map((task) => [task.id, getTaskOrder(task)]));
-                orderPlan = createSparseOrderPlan(currentIds, nextIds, orderById);
+                orderPlan = createSparseOrderPlan(currentIds, nextIds, orderById, movedTaskId);
                 if (!orderPlan) return [];
-                return projectTasks.filter((task) => {
+                const changed = projectTasks.filter((task) => {
                     const nextOrder = orderFromPlan(orderPlan!, task.id);
                     return Number.isFinite(nextOrder)
                         && !(getTaskOrder(task) === nextOrder && task.order === nextOrder && task.orderNum === nextOrder);
                 });
+                changedCount = changed.length;
+                return changed;
             },
             buildUpdates: (task) => {
                 const nextOrder = orderFromPlan(orderPlan!, task.id);
@@ -239,6 +313,10 @@ export const createOrderingActions = ({
                     orderNum: nextOrder as number,
                 };
             },
+        });
+        if (changedCount > 0) logInfo('Project task order applied', {
+            scope: 'store', category: 'storage',
+            context: { releaseCheck: 'v1.3.3/project-filtered-task-order', count: changedCount },
         });
     },
 

@@ -4,7 +4,7 @@ import path from "node:path";
 
 const root = path.resolve(import.meta.dir, "../..");
 const skippedDirectories = new Set([
-  "node_modules", "dist", ".worktrees", "test", "tests", "__tests__", "__mocks__",
+  "node_modules", "dist", "build", ".worktrees", "test", "tests", "__tests__", "__mocks__",
 ]);
 const sourceExtension = /\.(?:[cm]?[jt]sx?|rs|swift|kt|kts|java)$/;
 
@@ -60,6 +60,14 @@ function collectCodeSlugs({ file, source }) {
   // an android.util.Log info/warn call; unused string constants do not count.
   if (file.endsWith(".kt")) {
     for (const message of source.matchAll(/\bLog\.(?:i|w)\([^,()]+,\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
+      for (const match of message[1].matchAll(/\breleaseCheck=([\w./-]+)/g)) {
+        sites.push({ file, slug: match[1] });
+      }
+    }
+  }
+  // Native Swift diagnostics use NSLog; unused string constants do not count.
+  if (file.endsWith(".swift")) {
+    for (const message of source.matchAll(/\bNSLog\(\s*"((?:\\[\s\S]|[^"\\])*)"/g)) {
       for (const match of message[1].matchAll(/\breleaseCheck=([\w./-]+)/g)) {
         sites.push({ file, slug: match[1] });
       }
@@ -162,6 +170,18 @@ describe("release diagnostics ledger", () => {
     ` })).toEqual([
       { file, slug: "v1.3.0/android-reuse" },
       { file, slug: "v1.3.0/android-guard" },
+    ]);
+  });
+
+  it("resolves native Swift diagnostic fields only inside NSLog calls", () => {
+    const file = "apps/ios-native/Sources/MindwtrNativeCore/Example.swift";
+    expect(collectCodeSlugs({ file, source: `
+      let unused = "releaseCheck=v1.3.3/unused-swift"
+      NSLog("Native save releaseCheck=v1.3.3/native-swift-save outcome=%@", outcome)
+      NSLog("Native retry releaseCheck=v1.3.3/native-swift-retry")
+    ` })).toEqual([
+      { file, slug: "v1.3.3/native-swift-save" },
+      { file, slug: "v1.3.3/native-swift-retry" },
     ]);
   });
 

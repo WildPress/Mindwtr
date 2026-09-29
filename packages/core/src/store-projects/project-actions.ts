@@ -4,6 +4,7 @@ import {
     getNextDataChangeAt,
     nextRevision,
     persist,
+    replaceEntitiesInArray,
 } from '../store-helpers';
 import {
     isProjectCancelled,
@@ -15,10 +16,13 @@ import { logInfo, logWarn } from '../logger';
 import { clearDerivedCache } from '../store-settings';
 import { generateUUID as uuidv4 } from '../uuid';
 import { DEFAULT_PROJECT_COLOR } from '../color-constants';
-import { findSelectableProjectByTitleAndArea } from '../project-utils';
-import type { Area } from '../types';
+import { findSelectableProjectByTitleAndArea, normalizeProjectTaskSortBy } from '../project-utils';
+import { PROJECT_SQLITE_COLUMNS, projectToSqliteRow } from '../project-sync-schema';
+import { taskEditValuesEqual } from '../json-value-equality';
+import type { Area, TaskSortBy } from '../types';
 import type { Project, ProjectCoreActions, ProjectActionContext, Task, TaskStatus } from './shared';
-import type { TaskStore } from '../store-types';
+import type { PreparedProjectArea, PreparedProjectCreate, PreparedProjectDate, PreparedProjectFlow, PreparedProjectTaskSort, PreparedProjectFocus, PreparedProjectNotesWrite, PreparedProjectTagsWrite, PreparedProjectRename, PreparedProjectStatus, PreparedTaskEditResult, ProjectFlowAction, TaskStore } from '../store-types';
+import { projectTagsForIntent, type ProjectTagsIntent } from '../project-tags';
 import type { PendingRemoteAttachmentDelete } from '../types';
 import {
     compactPurgedProjectForLocalStorage,
@@ -123,6 +127,160 @@ type BuildNewProjectParams = {
 
 /** At most this many projects can be starred (focused) at once. */
 export const MAX_FOCUSED_PROJECTS = 5;
+
+/** RN's existing toggle policy, shared with the prepared native writer. */
+export const projectFocusToggleUpdate = (project: Project, focusedProjectCount: number): { isFocused: boolean } | null => {
+    if (project.status !== 'active' && !project.isFocused) return null;
+    if (!project.isFocused && focusedProjectCount >= MAX_FOCUSED_PROJECTS) return null;
+    return { isFocused: !project.isFocused };
+};
+
+export const countFocusedLiveProjects = (projects: readonly Project[]): number =>
+    projects.filter((project) => !project.deletedAt && project.isFocused).length;
+
+const projectJsonColumns = new Set(['tagIds', 'attachments']);
+/** Compare the complete persisted Project, tolerating only JSON object-member key order. */
+export const sameProjectSqliteRow = (left: Project, right: Project): boolean => {
+    const before = projectToSqliteRow(left);
+    const after = projectToSqliteRow(right);
+    return before.length === after.length && before.every((value, index) => {
+        const other = after[index];
+        return projectJsonColumns.has(PROJECT_SQLITE_COLUMNS[index]) && typeof value === 'string'
+            && typeof other === 'string' ? taskEditValuesEqual(JSON.parse(value), JSON.parse(other))
+                : Object.is(value, other);
+    });
+};
+
+export const projectFocusEffect = (project: Project, focusedProjectCount: number, focused: boolean,
+    deviceId: string, now: string): PreparedProjectFocus['effect'] | null => {
+    const update = projectFocusToggleUpdate(project, focusedProjectCount);
+    return update?.isFocused === focused ? { project: { before: project, after: {
+        ...project, ...update, updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    } } } : null;
+};
+
+export const normalizeProjectRenameTitle = (title: string): string => title.trim();
+
+/** RN updateProject's nonarchived title-only lifecycle result, without child writes. */
+export const projectRenameEffect = (project: Project, title: string, deviceId: string,
+    now: string): PreparedProjectRename['effect'] => {
+    const normalizedTitle = normalizeProjectRenameTitle(title);
+    const transition = applyProjectLifecycleTransition(project, { title: normalizedTitle }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN updateProject's nonstatus flow-field lifecycle result, without child writes. */
+export const projectFlowEffect = (project: Project, action: ProjectFlowAction, deviceId: string,
+    now: string): PreparedProjectFlow['effect'] | null => {
+    if (action.kind === 'setScope' && (!project.isSequential || project.sequentialScope === action.scope)) return null;
+    const patch: Partial<Project> = action.kind === 'toggleType'
+        ? { isSequential: !project.isSequential } : { sequentialScope: action.scope };
+    const transition = applyProjectLifecycleTransition(project, patch, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN updateProject's Project-only sort result, normalized for synced storage. */
+export const projectTaskSortEffect = (project: Project, sortBy: TaskSortBy, deviceId: string,
+    now: string): PreparedProjectTaskSort['effect'] | null => {
+    const desired = normalizeProjectTaskSortBy(sortBy);
+    if (normalizeProjectTaskSortBy(project.taskSortBy) === desired) return null;
+    const transition = applyProjectLifecycleTransition(project, { taskSortBy: desired }, [], [], now, deviceId);
+    const after = normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    });
+    if (!desired) delete after.taskSortBy;
+    return { project: { before: project, after } };
+};
+
+/** Empty against absent or empty Notes is a no-op; every other character is raw data. */
+export const isProjectNotesWriteNoop = (project: Project, text: string): boolean =>
+    project.supportNotes === text || (text === '' && !project.supportNotes);
+
+/** RN updateProject's raw supportNotes-only lifecycle result, without child writes. */
+export const projectNotesWriteEffect = (project: Project, text: string, deviceId: string,
+    now: string): PreparedProjectNotesWrite['effect'] => {
+    const transition = applyProjectLifecycleTransition(project, { supportNotes: text }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN updateProject's tagIds-only lifecycle result, preserving unrelated raw columns. */
+export const projectTagsWriteEffect = (project: Project, intent: ProjectTagsIntent, deviceId: string,
+    now: string): PreparedProjectTagsWrite['effect'] | null => {
+    const tagIds = projectTagsForIntent(project.tagIds ?? [], intent);
+    if (taskEditValuesEqual(project.tagIds ?? [], tagIds)) return null;
+    const transition = applyProjectLifecycleTransition(project, { tagIds }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN updateProject's Active/Waiting/Someday lifecycle result, without child writes. */
+export const projectStatusEffect = (project: Project, status: 'active' | 'waiting' | 'someday',
+    deviceId: string, now: string): PreparedProjectStatus['effect'] => {
+    const transition = applyProjectLifecycleTransition(project, { status }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** RN updateProject's Project date lifecycle result, with no child writes. */
+export const projectDateEffect = (project: Project, field: 'startDate' | 'dueDate' | 'reviewAt', value: string | null,
+    deviceId: string, now: string): PreparedProjectDate['effect'] => {
+    const transition = applyProjectLifecycleTransition(project, { [field]: value ?? undefined }, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
+
+/** Clearing absent/null/empty preserves the original raw representation. */
+export const isProjectDateNoop = (project: Project, field: 'startDate' | 'dueDate' | 'reviewAt', value: string | null): boolean =>
+    value === null ? !project[field] : project[field] === value;
+
+/** RN's destination-tail max includes tombstones and ignores nonfinite orders. */
+export const projectAreaOrderMax = (projects: readonly Project[], areaId: string | null): number => projects
+    .filter((project) => (project.areaId ?? null) === areaId)
+    .reduce((max, project) => Math.max(max, Number.isFinite(project.order) ? project.order : -1), -1);
+
+/** Own `areaId` is a selection; omission must leave Area metadata untouched. */
+export const projectAreaSelection = (project: Project, updates: Partial<Project>,
+    projects: readonly Project[], areas: readonly Area[]) => {
+    const selected = Object.prototype.hasOwnProperty.call(updates, 'areaId');
+    const areaId = selected ? updates.areaId ?? undefined : project.areaId;
+    const changed = selected && (areaId ?? undefined) !== (project.areaId ?? undefined);
+    const areaTitle = selected
+        ? (areaId ? areas.find((area) => area.id === areaId && !area.deletedAt)?.name?.trim() || undefined : undefined)
+        : project.areaTitle;
+    const metadataChanged = selected && (changed || areaTitle !== project.areaTitle);
+    const order = changed && !Number.isFinite(updates.order)
+        ? projectAreaOrderMax(projects, areaId ?? null) + 1 : updates.order;
+    return { selected, metadataChanged, fields: selected ? { areaId, areaTitle } : {}, order };
+};
+
+/** The same Area/title/order transition as RN updateProject, with one Project row only. */
+export const projectAreaEffect = (project: Project, areaId: string | null,
+    projects: readonly Project[], areas: readonly Area[], deviceId: string,
+    now: string): PreparedProjectArea['effect'] => {
+    const area = projectAreaSelection(project, { areaId: areaId ?? undefined }, projects, areas);
+    const patch = { ...area.fields, ...(Number.isFinite(area.order) ? { order: area.order } : {}) };
+    const transition = applyProjectLifecycleTransition(project, patch, [], [], now, deviceId);
+    return { project: { before: project, after: normalizeProjectLifecycleFields({
+        ...project, ...transition.projectUpdates,
+        updatedAt: now, rev: nextRevision(project.rev), revBy: deviceId,
+    }) } };
+};
 
 export const buildNewProject = ({
     title,
@@ -243,6 +401,318 @@ export const createProjectCoreActions = ({
         return createdProject;
     },
 
+    /** Apply exactly one validated native project row; never re-run title or area selection on receipt replay. */
+    commitPreparedProjectCreate: async (input: PreparedProjectCreate): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict', error: 'Prepared project creation conflicts with current data' };
+        set((state) => {
+            const existing = state._projectsById.get(input.project.id);
+            const sameRow = existing && JSON.stringify(projectToSqliteRow(existing)) === JSON.stringify(projectToSqliteRow(input.project));
+            // The complete target is durable authority even if its area, order, or settings changed afterward.
+            if (sameRow) {
+                result = { success: true, id: input.project.id, outcome: 'replayed' };
+                return state;
+            }
+            if (existing || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || (state.settings.gtd?.defaultProjectFlowMode ?? null) !== input.defaultProjectFlowMode) return state;
+            const area = input.selectedArea;
+            if (area) {
+                const current = state._areasById.get(area.id);
+                if (!current || current.deletedAt || current.name !== area.name
+                    || (current.color ?? null) !== area.color) return state;
+            }
+            const max = projectAreaOrderMax(state._allProjects, area?.id ?? null);
+            if (max !== input.orderMax
+                || findSelectableProjectByTitleAndArea(state._allProjects, input.project.title, area?.id)) return state;
+            const projects = [...state._allProjects, input.project];
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: input.project.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectFocus: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project Focus conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectFocusEffect(current, countFocusedLiveProjects(state._allProjects), input.request.focused,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectRename: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project rename conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const normalized = normalizeProjectRenameTitle(input.request.title);
+            if (!normalized || normalized === current.title) return state;
+            const planned = projectRenameEffect(current, normalized,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectFlow: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project flow conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // Complete after-row receipt precedes mutable status, token, and device guards.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectFlowEffect(current, input.request.action,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectTaskSort: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project task sort conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectTaskSortEffect(current, input.request.sortBy,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectNotesWrite: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project Notes edit conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // A complete after-row receipt precedes mutable status, token, and device guards.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)
+                || isProjectNotesWriteNoop(current, input.request.text)) return state;
+            const planned = projectNotesWriteEffect(current, input.request.text,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectTagsWrite: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project Tags edit conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // A complete after-row receipt precedes mutable status, token, and device guards.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectTagsWriteEffect(current, input.request.intent,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!planned || !taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectStatus: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project status conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // A complete after-row receipt precedes mutable status, token, and device guards.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || current.status === input.request.status
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectStatusEffect(current, input.request.status,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectDate: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project date conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // A complete after-row receipt precedes mutable date, token, and device guards.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || isProjectDateNoop(current, input.request.field, input.request.value)
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const planned = projectDateEffect(current, input.request.field, input.request.value,
+                input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
+    commitPreparedProjectArea: async (input): Promise<PreparedTaskEditResult> => {
+        let result: PreparedTaskEditResult = { success: false, reason: 'conflict',
+            error: 'Prepared Project Area conflicts with current data' };
+        set((state) => {
+            const current = state._projectsById.get(input.request.projectId);
+            // The full after-row receipt precedes all mutable Project, Area and order checks.
+            if (current && (!input.deviceIdToInitialize || state.settings.deviceId === input.deviceIdToInitialize)
+                && sameProjectSqliteRow(current, input.effect.project.after)) {
+                result = { success: true, id: current.id, outcome: 'replayed' };
+                return state;
+            }
+            if (!current || current.deletedAt || current.purgedAt || current.status === 'archived'
+                || (state.settings.deviceId ?? null) !== input.deviceIdBefore
+                || (input.deviceIdBefore === null ? !input.deviceIdToInitialize : input.deviceIdToInitialize !== null)
+                || !sameProjectSqliteRow(current, input.scope.project)) return state;
+            const selected = input.scope.selectedArea;
+            const area = selected ? state._areasById.get(selected.id) : null;
+            if (selected && (!area || area.deletedAt || area.name !== selected.name)) return state;
+            if (projectAreaOrderMax(state._allProjects, input.request.areaId) !== input.scope.orderMax) return state;
+            if ((current.areaId ?? null) === input.request.areaId
+                && (current.areaTitle ?? null) === (selected?.name.trim() || null)) return state;
+            const planned = projectAreaEffect(current, input.request.areaId, state._allProjects,
+                state._allAreas, input.deviceIdBefore ?? input.deviceIdToInitialize!, input.updateAt);
+            if (!taskEditValuesEqual(planned, input.effect)) return state;
+            const projects = replaceEntitiesInArray(state._allProjects, [planned.project.after]);
+            const settings = input.deviceIdToInitialize
+                ? { ...state.settings, deviceId: input.deviceIdToInitialize } : state.settings;
+            persist(set, debouncedSave, state, { projects,
+                ...(settings !== state.settings ? { settings } : {}) });
+            result = { success: true, id: current.id, outcome: 'applied' };
+            return { _allProjects: projects, settings,
+                lastDataChangeAt: getNextDataChangeAt(state.lastDataChangeAt) };
+        });
+        return result;
+    },
+
     cancelProject: async (id: string) => {
         const project = get()._projectsById.get(id);
         if (!project || project.deletedAt || project.purgedAt) {
@@ -291,6 +761,7 @@ export const createProjectCoreActions = ({
         const changeAt = Date.now();
         const now = new Date().toISOString();
         let missingProject = false;
+        let selectedAreaMetadataChanged = false;
         if (
             Object.prototype.hasOwnProperty.call(updates, 'cancelledAt')
             && updates.cancelledAt != null
@@ -323,17 +794,15 @@ export const createProjectCoreActions = ({
             const statusChanged = incomingStatus !== oldProject.status;
 
             let adjustedOrder = updates.order;
-            const nextAreaId = updates.areaId ?? oldProject.areaId;
-            const areaChanged = updates.areaId !== undefined && updates.areaId !== oldProject.areaId;
-            if (areaChanged && !Number.isFinite(adjustedOrder)) {
-                const maxOrder = allProjects
-                    .filter((project) => (project.areaId ?? undefined) === (nextAreaId ?? undefined))
-                    .reduce((max, project) => Math.max(max, Number.isFinite(project.order) ? project.order : -1), -1);
-                adjustedOrder = maxOrder + 1;
-            }
+            // The picker supplies an own areaId key even for No Area (undefined).
+            // Omission is an unrelated Project edit and must preserve area metadata.
+            const area = projectAreaSelection(oldProject, updates, allProjects, state._allAreas);
+            selectedAreaMetadataChanged = area.metadataChanged;
+            if (Number.isFinite(area.order)) adjustedOrder = area.order;
 
             const finalProjectUpdates: Partial<Project> = {
                 ...lifecycle.projectUpdates,
+                ...area.fields,
                 ...(Number.isFinite(adjustedOrder) ? { order: adjustedOrder } : {}),
                 ...(statusChanged && incomingStatus !== 'active'
                     ? { isFocused: false }
@@ -378,6 +847,12 @@ export const createProjectCoreActions = ({
             });
             set({ error: message });
             return actionFail(message);
+        }
+        if (selectedAreaMetadataChanged) {
+            logInfo('Project Area selection synchronized metadata', {
+                scope: 'store', category: 'storage',
+                context: { releaseCheck: 'v1.3.3/rn-project-area-selection-metadata' },
+            });
         }
 
         return actionOk();
@@ -828,11 +1303,8 @@ export const createProjectCoreActions = ({
         await mutateEntities({ set, debouncedSave }, {
             collection: 'projects',
             select: (state) => state._allProjects.filter((project) => project.id === id),
-            buildUpdates: (project) => {
-                if (project.status !== 'active' && !project.isFocused) return null;
-                if (!project.isFocused && get().getDerivedState().focusedProjectCount >= MAX_FOCUSED_PROJECTS) return null;
-                return { isFocused: !project.isFocused };
-            },
+            buildUpdates: (project) => projectFocusToggleUpdate(project,
+                get().getDerivedState().focusedProjectCount),
         });
     },
 });

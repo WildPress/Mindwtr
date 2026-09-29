@@ -9,7 +9,6 @@ import {
     useTaskStore,
 } from '@mindwtr/core';
 
-import { logInfo } from './app-log';
 import { documentDirectory, getInfoAsync, readDirectoryAsync } from './file-system';
 import { flushPendingTaskActionSave } from './pending-capture-persistence';
 import { ingestPendingCaptures, PENDING_CAPTURES_DIRECTORY } from './pending-captures';
@@ -36,6 +35,7 @@ export function drainPendingCapturesFromStore(extras: DrainExtras = {}): Promise
             people,
             settings,
             getTasks: () => useTaskStore.getState()._allTasks,
+            getProjects: () => useTaskStore.getState()._allProjects,
             flushPendingSave: flushPendingTaskActionSave,
             ...extras,
         });
@@ -77,9 +77,5 @@ export async function drainPendingCapturesInBackground(trigger: 'scheduled' | 'c
     if (useTaskStore.getState().error || isSandboxMode()) return 0;
 
     const count = await drainPendingCapturesFromStore();
-    void logInfo('Queued captures imported in the background', {
-        scope: 'capture',
-        extra: { releaseCheck: 'v1.3.2/background-capture-drain', trigger, count },
-    });
     return count;
 }

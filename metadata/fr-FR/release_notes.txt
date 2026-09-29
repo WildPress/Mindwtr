@@ -1,5 +1,6 @@
-- Les écrans de tâches sont plus clairs et le regroupement Focus est plus rapide.
-- Les Rappels Apple peuvent être importés automatiquement sans tâches en double.
-- Les changements iCloud arrivent par push silencieux et la sync bloquée finit plus tôt.
-- Les widgets suivent le format de date et les exceptions de calendrier sont fiables.
-- Recherche avec @contexte, #tag et %personne ; sync et pièces jointes sont renforcées.
+- Les tâches en attente montrent la personne assignée et Focus est plus clair.
+- Les répétitions mensuelles gèrent les jours positionnés et le saut d'une occurrence.
+- Le calendrier ajoute les filtres par Domaine et des lignes de temps plus précises.
+- Les widgets suivent la langue et le format 12/24 h.
+- Les Raccourcis peuvent ouvrir les listes enregistrées et lancer la capture audio dans Focus.
+- Filtres, sync, stockage et récupération protègent mieux les changements récents.

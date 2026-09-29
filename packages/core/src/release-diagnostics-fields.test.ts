@@ -88,6 +88,7 @@ const RELEASE_CHECK_FIELD_NAMES = [
     // someday-sections-keep-others reuses releaseCheck and count: stored entries this build cannot show, kept.
     'hiddenCount',
     // saved-filters-kept-as-stored reuses releaseCheck, count and hiddenCount: whose list order the merge kept.
+    // local-api-scheduled-focus reuses releaseCheck, operation, outcome, and count below.
     'order',
     // android-http-connect-timeout (apps/mobile/hooks/root-layout/use-root-layout-startup.ts)
     'connectTimeoutMs',
@@ -111,6 +112,8 @@ const RELEASE_CHECK_FIELD_NAMES = [
     'operation',
     // cloudkit-retry-hint (desktop and mobile cloudkit-sync.ts)
     'retryAfterMs',
+    // fetch-redirect-refused (core http-utils.ts) reuses method above: the refused redirect's HTTP status.
+    'status',
     // font-family-applied (apps/desktop/src/App.tsx, #1244) — the chosen font's name, and
     // whether the renderer found a real bold face for it or is faking one.
     'family', 'boldFace',
